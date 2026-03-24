@@ -86,8 +86,22 @@ Always collapse to a single FirstOrDefault() — two queries where one is enough
 
 ```
 .Entry().Reference().Load() or .Entry().Collection().Load():
-Inside a loop → always replace with batch query.
+Inside a loop → BLOCK — replace with Include() chain (Eager Graph Loading, Pattern #11).
 Outside a loop (single entity) → acceptable.
+```
+
+```
+Shared context resolution (e.g. IsExistOrderReference, order header lookup):
+Called once for a single request → OK.
+Called N times for the same ID in the same request → BLOCK — resolve once at coordinator level, pass result down.
+Rule: if two sibling calls resolve the same ID independently, the coordinator must own that resolution.
+```
+
+```
+Include() chain depth:
+1–2 levels         → OK, no split query needed
+3+ levels or 2+ collections → AsSplitQuery() required to avoid cartesian explosion
+5+ levels and data sparse   → switch to projection (Select DTO) instead of deep Include()
 ```
 
 ---
@@ -330,6 +344,31 @@ Always log:
 ```
 
 ```
+Before/after measurement — required for hot-path changes:
+Before touching any code on a hot path → capture baseline: ElapsedMs, DB query count, MemAllocatedKB, GC.Gen0 delta
+After each fix phase → re-measure and record delta
+A fix without a baseline is anecdotal — it cannot be logged as a real incident result
+
+Minimum instrumentation for a .NET hot-path method:
+  var sw = Stopwatch.StartNew();
+  var memBefore = GC.GetTotalMemory(false);
+  var gen0Before = GC.CollectionCount(0);
+  // ... method body ...
+  _logger.LogInformation("Method | ElapsedMs: {Ms} | MemKB: {Kb} | Gen0: {Gen0}",
+      sw.ElapsedMilliseconds,
+      (GC.GetTotalMemory(false) - memBefore) / 1024,
+      GC.CollectionCount(0) - gen0Before);
+```
+
+```
+GC pressure indicators:
+GC.Gen0 delta > 0 per request   → short-lived object churn (EF proxy objects, tracking overhead)
+GC.Gen1 delta > 0 per request   → memory pressure — objects surviving Gen0, investigate
+GC.Gen2 delta > 0 per request   → serious — large or long-lived allocations, treat as incident
+AsNoTracking() on read path      → reduces Gen0 pressure by eliminating EF change tracking objects
+```
+
+```
 Never log:
 - PII (name, email, phone, address) in plain text
 - Passwords, tokens, API keys
@@ -370,6 +409,8 @@ Kafka consumer lag > 10000         → critical
 [ ] Hardcoded connection string, API key, or secret
 [ ] Exception swallowed silently (catch with no log, no rethrow)
 [ ] Infinite retry without max attempts
+[ ] Same reference resolver (e.g. IsExistOrderReference) called 2+ times for the same ID in one request
+[ ] Hot-path change merged without before/after query count or latency measurement
 ```
 
 **Questions to always ask in review:**
@@ -380,4 +421,6 @@ Kafka consumer lag > 10000         → critical
 - Is the caller expected to retry? Is this operation safe to retry?
 - What does the caller see if the dependency is down?
 - How will we know in production if this breaks?
+- Does any sub-call resolve data the parent already knows? (shared context leak)
+- Is there a baseline measurement to compare this change against?
 ```

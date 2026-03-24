@@ -19,6 +19,7 @@
 | 8 | [Repository](#8-repository) | Architecture | Isolate data access from business logic |
 | 9 | [Circuit Breaker](#9-circuit-breaker) | Resilience | Protect against failing dependencies |
 | 10 | [Competing Consumers](#10-competing-consumers) | Messaging | Scale Kafka consumers horizontally |
+| 11 | [Eager Graph Loading](#11-eager-graph-loading) | Performance | Load full entity graph in one shot via Include() chain |
 
 ---
 
@@ -72,7 +73,7 @@ foreach (var item in items)
 - N > 100 → use batch
 - N > 1000 → batch + chunk (500 per query)
 
-**Real Incident**: GetSubOrderMessage — 289 queries → 10 queries, 900ms → 40ms
+**Real Incident**: GetSubOrder hot path — ~564 queries → ~30 queries on large orders (10 sub-orders × 5 items). Combined with Eager Graph Loading (Pattern #11) for item navigation properties.
 
 ---
 
@@ -439,3 +440,75 @@ var policy = Policy
 - Lag growing and CPU/IO bound? → Add consumer instances
 - Need order across all messages? → Single consumer (accept the bottleneck)
 - Need order per entity (e.g., per OrderId)? → Partition by key, multiple consumers safe
+
+---
+
+## 11. Eager Graph Loading
+
+**Problem**: EF Core navigation properties loaded lazily inside a loop cause one DB round-trip per property per entity — query count grows as O(n × relations). This is invisible at low volume and catastrophic at scale.
+
+**Solution**: Move all navigation property loads into the `Include()` / `ThenInclude()` chain on the root query. EF Core (with `AsSplitQuery()`) fetches the full object graph in a fixed number of queries regardless of entity count.
+
+**When to USE**:
+- A method loops over a collection and accesses navigation properties per item
+- The number of entities is unbounded or can grow with order/request size
+- Hot-path read methods where latency matters
+- Any `Entry().Reference().Load()` or `Entry().Collection().Load()` currently inside a loop
+
+**When NOT to USE**:
+- Navigation property is rarely needed (< 10% of calls) — lazy or conditional load is cheaper
+- Graph is extremely deep (5+ levels) and most branches are unused — consider projection instead
+- Single entity lookup where the property is only sometimes needed
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Fixed query count regardless of N | Loads data you may not always need |
+| Works with AsSplitQuery() to avoid cartesian explosion | Deep Include() chains can be hard to read |
+| Eliminates all loop-based lazy loads in one change | Must also add AsNoTracking() or tracking overhead increases |
+
+**Your Stack (.NET + EF Core)**:
+```csharp
+// BEFORE: bare load + lazy loads per item inside loop
+SubOrderModel subOrderModel = _context.SubOrder
+    .Include(s => s.Items).ThenInclude(i => i.Amount)
+    .AsSplitQuery()
+    .Where(...).FirstOrDefault();
+
+foreach (var item in subOrderModel.Items)
+{
+    // Each line = 1 DB call × N items
+    _context.Entry(item.Amount).Reference(p => p.Normal).Query().Include(i => i.Taxes).Load();
+    _context.Entry(item.Amount).Reference(p => p.Paid).Query().Include(i => i.Taxes).Load();
+    _context.Entry(item).Reference(p => p.Promotion).Load();
+    _context.Entry(item).Collection(p => p.Promotions).Load();
+}
+
+// AFTER: full graph in one query set — delete all Entry().Load() calls
+SubOrderModel subOrderModel = _context.SubOrder
+    .Include(s => s.Items)
+        .ThenInclude(i => i.Amount)
+            .ThenInclude(a => a.Normal).ThenInclude(n => n.Taxes)
+    .Include(s => s.Items)
+        .ThenInclude(i => i.Amount)
+            .ThenInclude(a => a.Paid).ThenInclude(p => p.Taxes)
+    .Include(s => s.Items).ThenInclude(i => i.Promotion)
+    .Include(s => s.Items).ThenInclude(i => i.Promotions)
+    .AsSplitQuery()
+    .AsNoTracking()
+    .Where(...).FirstOrDefault();
+// Loop now reads from in-memory graph — zero DB calls
+```
+
+**Decision Rule**:
+```
+Entry().Load() inside a loop            → BLOCK — replace with Include() chain
+Include() with 1 collection             → OK, no split query needed
+Include() with 2+ collections           → AsSplitQuery() required
+Include() chains > 4 levels deep        → consider projection to DTO instead
+Eager load + read-only method           → always add AsNoTracking()
+```
+
+**Real Incident**: GetSubOrder hot path — 7 × `Entry().Load()` calls per item × N items = 350+ queries from item loop alone. Moving to Include() chain eliminated all of them. Combined with Batch Query (Pattern #1) for `ItemOtherInfo`, total queries dropped from ~564 to ~30.
