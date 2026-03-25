@@ -108,6 +108,15 @@ SUGGEST — Synchronous DB calls in async context
   Why: Blocks the thread pool under concurrent load
   Option: Use async variants consistently throughout the call chain
 
+BLOCK — Same reference resolver called 2+ times for same ID in one request
+  Pattern: Multiple sibling methods each calling IsExistOrderReference() or similar lookup
+    for the same SourceOrderId within one parent method
+  Risk: Each call fires 2-3 queries independently — pure redundancy that compounds under concurrency.
+  Fix: Resolve once at the coordinator (parent method), pass resolved ID to sub-calls.
+  See: patterns.md #12 Coordinator-Level Resolution
+  Real example (target.cs:55-57): GetOrderHeader, GetOrderMessagePayments, GetOrderPromotion
+    each call IsExistOrderReference independently = 6-9 redundant queries per request.
+
 SUGGEST — Magic string comparisons on OrderId / SubOrderId
   Pattern: .Where(w => w.SourceOrderId.Equals(OrderId)) (case-sensitive string compare)
   Why: Locale and case sensitivity bugs — OrdinalIgnoreCase is safer

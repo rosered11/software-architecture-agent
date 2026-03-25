@@ -20,6 +20,7 @@
 | 9 | [Circuit Breaker](#9-circuit-breaker) | Resilience | Protect against failing dependencies |
 | 10 | [Competing Consumers](#10-competing-consumers) | Messaging | Scale Kafka consumers horizontally |
 | 11 | [Eager Graph Loading](#11-eager-graph-loading) | Performance | Load full entity graph in one shot via Include() chain |
+| 12 | [Coordinator-Level Resolution](#12-coordinator-level-resolution) | Performance | Resolve shared context once at parent, pass down |
 
 ---
 
@@ -73,7 +74,25 @@ foreach (var item in items)
 - N > 100 → use batch
 - N > 1000 → batch + chunk (500 per query)
 
-**Real Incident**: GetSubOrder hot path — ~564 queries → ~30 queries on large orders (10 sub-orders × 5 items). Combined with Eager Graph Loading (Pattern #11) for item navigation properties.
+**Real Incident (target.cs)**: GetSubOrder hot path — `GetRewardItem` called per sub-order in a loop (lines 69-77), `GetSubOrderMessage` called per sub-order (lines 518-540). For N=10 sub-orders, these two loops alone produce 20 sequential DB queries. Fix: batch with `Contains()`:
+
+```csharp
+// BEFORE (target.cs:69-77): N queries in loop
+for (int i = 0; i < results.SourceSubOrderIdList.Count; i++)
+{
+    GetRewardItem(SourceOrderId, results.SourceSubOrderIdList[i], ref rewardItemMessageTmp);
+}
+
+// AFTER: 1 query
+var allRewardItems = _context.PromotionItemTb
+    .AsNoTracking()
+    .Where(p => p.SourceOrderId == SourceOrderId
+        && results.SourceSubOrderIdList.Contains(p.SourceSubOrderId)
+        && !p.IsDelete)
+    .ToList();
+```
+
+Combined with Eager Graph Loading (Pattern #11) for promotion Amount and Coordinator-Level Resolution (Pattern #12) for reference lookups.
 
 ---
 
@@ -511,4 +530,85 @@ Include() chains > 4 levels deep        → consider projection to DTO instead
 Eager load + read-only method           → always add AsNoTracking()
 ```
 
-**Real Incident**: GetSubOrder hot path — 7 × `Entry().Load()` calls per item × N items = 350+ queries from item loop alone. Moving to Include() chain eliminated all of them. Combined with Batch Query (Pattern #1) for `ItemOtherInfo`, total queries dropped from ~564 to ~30.
+**Real Incident (target.cs)**: `GetOrderPromotion` (line 209) — `_context.Entry(datalist[i]).Reference(x => x.Amount).Load()` called per promotion inside a for loop. For P=3 promotions, that's 3 extra round-trips. Fix: add `.Include(op => op.Amount)` to the initial query (line 194):
+
+```csharp
+// BEFORE (target.cs:194-209): load then lazy-load Amount per item
+OrderPromotionModel[] datalist = (from op in _context.OrderPromotion
+    where op.SourceOrderId == SourceOrderId select op).ToArray();
+for (int i = 0; i < datalist.Length; i++)
+{
+    _context.Entry(datalist[i]).Reference(x => x.Amount).Load(); // N+1
+}
+
+// AFTER: eager load in initial query
+OrderPromotionModel[] datalist = _context.OrderPromotion
+    .Include(op => op.Amount)
+    .AsNoTracking()
+    .Where(op => op.SourceOrderId == SourceOrderId)
+    .ToArray();
+// No loop load needed — Amount is already populated
+```
+
+Combined with Batch Query (Pattern #1) for reward items and Coordinator-Level Resolution (Pattern #12) for reference lookups.
+
+---
+
+## 12. Coordinator-Level Resolution
+
+**Problem**: Multiple sibling methods independently resolve the same shared context (e.g., looking up a canonical ID, resolving a reference mapping) — each one hits the DB separately for the same answer.
+
+**Solution**: Resolve the shared context once at the coordinator (parent method) level and pass the resolved value down to all sub-calls.
+
+**When to USE**:
+- Two or more sibling methods resolve the same ID / reference / lookup
+- The resolution is deterministic and doesn't change within the request scope
+- The coordinator already has the input needed to perform the resolution
+
+**When NOT to USE**:
+- Each sub-call genuinely needs a different resolution (different input)
+- The resolved value changes between calls (e.g., updated by a concurrent write)
+- The sub-call is used independently in other contexts where the coordinator doesn't exist
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Eliminates redundant DB queries | Slightly changes method signatures (pass resolved ID) |
+| Makes the data flow explicit | Sub-methods may need two modes (with/without internal resolution) |
+| Easy to audit — resolution happens in one place | Callers outside the coordinator must still resolve independently |
+
+**Your Stack (.NET + EF Core)**:
+```csharp
+// BEFORE (target.cs:55-57): each sub-call resolves IsExistOrderReference independently
+// GetOrderHeader calls IsExistOrderReference internally (line 479)
+// GetOrderMessagePayments calls IsExistOrderReference internally (line 131)
+// GetOrderPromotion calls IsExistOrderReference internally (line 185)
+// = 3 calls × 2-3 queries each = 6-9 redundant queries
+
+var orderHeader = GetOrderHeader(SourceOrderId);
+var orderPayments = GetOrderMessagePayments(SourceOrderId);
+results.OrderPromotion = GetOrderPromotion(SourceOrderId);
+
+// AFTER: resolve once at coordinator, pass resolved ID down
+string resolvedOrderId = SourceOrderId;
+string refSourceOrderId = string.Empty;
+if (IsExistOrderReference(SourceOrderId, ref refSourceOrderId))
+    resolvedOrderId = refSourceOrderId;
+
+var orderHeader = GetOrderHeader(resolvedOrderId, skipRefCheck: true);
+var orderPayments = GetOrderMessagePayments(resolvedOrderId, skipRefCheck: true);
+results.OrderPromotion = GetOrderPromotion(resolvedOrderId, skipRefCheck: true);
+// = 1 query total instead of 6-9
+```
+
+**Decision Rule**:
+```
+Same resolver called 2+ times for same ID in one request → BLOCK
+  Fix: hoist to coordinator, pass result down
+Same resolver called by independent entry points         → OK, each resolves for itself
+Resolver result could change mid-request (race condition) → do NOT cache, resolve per call
+```
+
+**Real Incident (target.cs)**: `IsExistOrderReference` called independently by `GetOrderHeader` (line 479), `GetOrderMessagePayments` (line 131), and `GetOrderPromotion` (line 185) — all for the same `SourceOrderId`. Each call performs 2-3 DB queries (`.Any()` + `.Where().FirstOrDefault()`). Hoisting to `GetSubOrder` (the coordinator) eliminates 4-8 redundant queries per request.

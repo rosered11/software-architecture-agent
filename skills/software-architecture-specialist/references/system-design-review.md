@@ -389,56 +389,114 @@ Additional checks:
 
 ---
 
-## Worked Example — SubOrder Processing Review
+## Worked Example — SubOrder Processing Review (from target.cs)
 
-**System**: SubOrder Processing
-**Type**: API / Service Layer + Event-Driven
+**System**: SubOrder Processing — `GetSubOrder()` method
+**Type**: API / Service Layer
+**Source**: `target.cs` (lines 1-125 coordinator, lines 126-600+ supporting methods)
+**Date**: 2026-03-25
 
-### Key findings (pre-GetSubOrder incident)
+### Key findings
 
 ```
-🔴 CRITICAL — N+1 query pattern in GetSubOrder
-   Where: GetSubOrderMessage() — item foreach loop
-   What could go wrong: Latency scales O(n) with item count. At 50+ items → >500ms.
-   Likelihood: High (already occurred)
-   Impact: API latency spike, fulfillment team unable to process orders
-   Fix: Batch load with IN clause + Dictionary<id,entity>
+🔴 CRITICAL — N+1 query pattern: GetSubOrderMessage loop (target.cs:518-540)
+   Where: GetSubOrderMessage() foreach — 1 DB query per sub-order
+   What could go wrong: 10 sub-orders = 10 sequential queries. Under 100 concurrent
+     requests = 1,000 DB calls competing for pool → timeout cascade.
+   Likelihood: High (already occurred under production concurrency)
+   Impact: API timeout, connection pool exhaustion, cascading failure
+   Fix: Batch load all sub-orders in one query with Contains()
+
+🔴 CRITICAL — N+1 query pattern: GetRewardItem loop (target.cs:69-77)
+   Where: GetRewardItem() for loop — 1 DB query per SourceSubOrderId
+   What could go wrong: Same as above — O(n) queries for n sub-orders
+   Likelihood: High (triggered when SourceSubOrderId == "All")
+   Impact: Compounds with GetSubOrderMessage N+1 — doubles the query count
+   Fix: Single batch query with Contains() on SourceSubOrderIdList
+
+🔴 CRITICAL — Lazy load inside loop: GetOrderPromotion (target.cs:209)
+   Where: Entry(datalist[i]).Reference(x => x.Amount).Load() per promotion
+   What could go wrong: 1 extra DB query per promotion row
+   Likelihood: High
+   Impact: Adds P queries (P = promotion count) on top of existing N+1
+   Fix: Add .Include(op => op.Amount) to initial query
+
+🔴 CRITICAL — Duplicate reference resolution 3× per request (target.cs:55-57)
+   Where: GetOrderHeader, GetOrderMessagePayments, GetOrderPromotion each call
+     IsExistOrderReference independently for the same SourceOrderId
+   What could go wrong: 6-9 redundant queries per request — pure waste
+   Likelihood: Certain (fires on every request)
+   Impact: Connection pool pressure under concurrency
+   Fix: Resolve once at coordinator (GetSubOrder), pass resolved ID down
+   See: Pattern #12 Coordinator-Level Resolution
+
+🔴 CRITICAL — Any() + FirstOrDefault() double queries (target.cs:483-494, 497-510)
+   Where: GetOrderHeader, IsExistOrderReference (both overloads)
+   What could go wrong: 2 queries where 1 is enough — on every call
+   Likelihood: Certain
+   Impact: Doubles query count for these lookups
+   Fix: Collapse to single FirstOrDefault() — null check replaces Any()
 
 🔴 CRITICAL — No query count observability
-   Where: All API endpoints
+   Where: All methods in target.cs — no EF logging, no query counter
    What could go wrong: N+1 is undetectable until latency spikes in production
    Likelihood: High
    Impact: Silent degradation, discovered by users not monitoring
    Fix: Add EF Core query count metric per request to Prometheus
 
-🟡 MEDIUM — Redundant Any() + FirstOrDefault() pattern
-   Where: GetOrderHeader(), GetOrderMessagePayments(), GetOrderPromotion()
-   What could go wrong: Double DB queries on every call — unnecessary load
-   Fix: Collapse to single FirstOrDefault() call
-
-🟡 MEDIUM — No AsNoTracking() on read endpoints
-   Where: All GET paths using EF Core
-   What could go wrong: Change tracker overhead accumulates — memory and CPU waste
+🟡 MEDIUM — Missing AsNoTracking() on all read queries
+   Where: Every _context query in target.cs (lines 136, 194, 366, 488, 518)
+   What could go wrong: EF change tracker overhead: memory + CPU waste on pure reads
    Fix: Add AsNoTracking() to all read-only queries
+
+🟡 MEDIUM — Weak error logging (target.cs:44-48, 116-122)
+   Where: catch blocks use LogInformation instead of LogError, no stack trace,
+     no SourceOrderId/SubOrderId context
+   What could go wrong: Production errors invisible or untraceable
+   Fix: LogError with structured parameters + stack trace
+
+🟡 MEDIUM — No request/trace ID in any log line
+   Where: All _logger calls throughout target.cs
+   What could go wrong: Under concurrency, logs interleave — can't trace one request
+   Fix: Add correlation ID via middleware or structured logging scope
+
+🟢 LOW — Synchronous DB calls (entire file)
+   Where: All queries use .FirstOrDefault(), .ToList() — no async variants
+   What could go wrong: Thread pool thread blocked during each DB round-trip
+   Fix: Convert to async/await (Phase 4 follow-up)
 ```
 
-### Scorecard (pre-fix)
+### Query Count Analysis (target.cs, N=10 sub-orders, P=3 promotions)
+
+| Source | Location | Queries |
+|--------|----------|---------|
+| IsExistOrderReference × 3 callers | lines 55-57 → 497-510 | 6-9 |
+| GetOrderHeader (Any + FirstOrDefault) | lines 483-494 | 2 |
+| GetOrderMessagePayments | lines 136-139 | 1 |
+| GetSubOrderMessage loop | lines 518-540 | 10 |
+| GetOrderPromotion + Amount lazy loads | lines 194, 209 | 1 + 3 |
+| GetRewardItem loop | lines 69-77 → 366-369 | 10 |
+| **Total** | | **~33** |
+| **After all fixes (target)** | | **~7** |
+
+### Scorecard (pre-fix, based on target.cs review)
 
 | Dimension           | Score | Notes |
 |---------------------|-------|-------|
 | Flow Completeness   | 4/5 | Happy path well-defined, edge cases mostly covered |
-| Failure Handling    | 3/5 | Basic error handling, no circuit breaker on DB |
-| Data Consistency    | 4/5 | Transactions used correctly |
-| Retry & Idempotency | 3/5 | No explicit retry on reads |
-| Observability       | 2/5 | No query count metrics, minimal structured logging |
-| Scalability         | 1/5 | N+1 pattern — critical gap |
-| Security Boundary   | 4/5 | Input validated, no sensitive data in logs |
-**Overall: 21/35**
+| Failure Handling    | 2/5 | Errors swallowed with LogInformation, no circuit breaker, no timeout on DB |
+| Data Consistency    | 4/5 | No concurrent write risk on this read path |
+| Retry & Idempotency | 3/5 | Read-only method — no retry needed, but no timeout protection |
+| Observability       | 1/5 | No query count metrics, no trace ID, errors logged at wrong level |
+| Scalability         | 1/5 | N+1 × 3 loops, duplicate queries, no AsNoTracking — connection pool bomb |
+| Security Boundary   | 4/5 | No sensitive data in logs (but no structured logging either) |
+**Overall: 19/35**
 
 ### Action Plan
 
-1. **Immediate**: Batch all `.Load()` calls in item loop — fix N+1
-2. **Short-term**: Add `AsNoTracking()` to all GET queries
-3. **Short-term**: Add query count metric per endpoint to Prometheus
-4. **Follow-up**: Collapse all `Any() + FirstOrDefault()` patterns
-5. **ADR needed**: Document the decision to use batch IN query over Include() eager load
+1. **Immediate (Phase 1)**: Collapse Any()+FirstOrDefault(), add AsNoTracking(), eager-load Amount — reduces ~33 to ~15 queries
+2. **Day 2 (Phase 2)**: Hoist IsExistOrderReference to coordinator — reduces ~15 to ~10 queries
+3. **Day 3 (Phase 3)**: Batch GetRewardItem and GetSubOrderMessage with Contains() — reduces ~10 to ~7 queries
+4. **Follow-up (Phase 4)**: Async migration with IDbContextFactory + Task.WhenAll for parallel independent calls
+5. **Monitoring**: Add EF Core query count metric + Stopwatch baseline before any code changes
+6. **ADR created**: `architecture-decision.md` — Option A (Batch Refactor) now, Option B (Async) follow-up, Option C (CQRS) deferred

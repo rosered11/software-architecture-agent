@@ -50,6 +50,16 @@ Response latency target (read APIs):
 ```
 
 ```
+Connection pool math (concurrency ceiling):
+Formula: concurrent_requests × queries_per_request × avg_hold_time_seconds < pool_size
+Example (target.cs GetSubOrder before fix):
+  100 concurrent × 33 queries × 0.01s = 33s total hold → pool exhaustion (default pool=100)
+Example (after fix):
+  100 concurrent × 7 queries × 0.01s = 7s → well within pool capacity
+Rule: if formula result > 80% of pool size → investigate query count reduction first
+```
+
+```
 Batch vs chunking:
 Batch query  → optimizes average latency (fewer roundtrips)
 Chunking     → optimizes tail latency and memory (controls max RAM per operation)
@@ -95,6 +105,12 @@ Shared context resolution (e.g. IsExistOrderReference, order header lookup):
 Called once for a single request → OK.
 Called N times for the same ID in the same request → BLOCK — resolve once at coordinator level, pass result down.
 Rule: if two sibling calls resolve the same ID independently, the coordinator must own that resolution.
+See patterns.md #12: Coordinator-Level Resolution.
+
+Real example (target.cs):
+  GetOrderHeader (line 479), GetOrderMessagePayments (line 131), GetOrderPromotion (line 185)
+  each call IsExistOrderReference independently for the same SourceOrderId = 6-9 redundant queries.
+  Fix: resolve once in GetSubOrder (coordinator), pass resolved ID to all three.
 ```
 
 ```
@@ -411,6 +427,7 @@ Kafka consumer lag > 10000         → critical
 [ ] Infinite retry without max attempts
 [ ] Same reference resolver (e.g. IsExistOrderReference) called 2+ times for the same ID in one request
 [ ] Hot-path change merged without before/after query count or latency measurement
+[ ] Connection pool math not validated for expected concurrency level
 ```
 
 **Questions to always ask in review:**
@@ -423,4 +440,5 @@ Kafka consumer lag > 10000         → critical
 - How will we know in production if this breaks?
 - Does any sub-call resolve data the parent already knows? (shared context leak)
 - Is there a baseline measurement to compare this change against?
+- What is the connection pool math at expected peak concurrency?
 ```

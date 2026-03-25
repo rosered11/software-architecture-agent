@@ -218,7 +218,7 @@ When the user asks about growth, progress, or what to focus on next:
 
 ## 📎 Common Patterns Reference
 
-Available patterns: Batch Query, Outbox, CQRS, Saga, Retry + DLQ, Idempotency Key, Staging → Validate → Apply, Repository, Circuit Breaker, Competing Consumers.
+Available patterns: Batch Query, Outbox, CQRS, Saga, Retry + DLQ, Idempotency Key, Staging → Validate → Apply, Repository, Circuit Breaker, Competing Consumers, Eager Graph Loading, Coordinator-Level Resolution.
 
 > 📖 When Pattern Guidance mode is triggered, read `references/patterns.md` for full detail:
 > problem, solution, when to use / not use, trade-offs, code examples for .NET / Go / Kafka / PostgreSQL, and decision rules.

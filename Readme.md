@@ -4,7 +4,6 @@
 
 ```
 claude --resume 5b0f1798-ddfa-4ecc-a871-5fcf4cd298c4
-claude --resume 5b0f1798-ddfa-4ecc-a871-5fcf4cd298c4
 ```
 
 ### Option 1 — Install the .skill file (Recommended)

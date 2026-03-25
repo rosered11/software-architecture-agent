@@ -19,192 +19,281 @@
 
 | Field | Value |
 |-------|-------|
-| **Title** | GetSubOrder API Latency Spike |
+| **Title** | GetSubOrder API Latency Spike — Timeout Under High Concurrency |
 | **Severity** | High |
 | **System** | SubOrder Processing |
-| **Status** | Resolved |
+| **Status** | Analysed — Fix Pending |
+| **Source File** | `target.cs` — `GetSubOrder()` (line 1) |
+| **Date Identified** | 2026-03-25 |
 
 ---
 
 ### Symptoms
 
-- API response time: timeout on large requests (orders with many sub-orders × items)
-- Estimated ~560 DB queries per call on a realistic order (10 sub-orders × 5 items, 3 promotions)
-- Latency scaled as O(n×m) — sub-orders × items, not O(1)
+- API response time: **timeout** under high concurrent request load
+- Estimated **~30 DB queries** per call for an order with 10 sub-orders (coordinator-level methods only)
+- Under 100 concurrent requests × 30 queries each = **3,000 DB round-trips** competing for the connection pool
+- Connection pool exhaustion → new requests queue → cascading timeouts
+- Latency scaled as O(n) with sub-order count, not O(1)
 - No infrastructure issue — problem is entirely in the data access layer
-- Hot path: called from large batch requests, so any per-request cost is multiplied
 
 ---
 
 ### Root Cause
 
-**N+1 query pattern stacked 7 levels deep across EF Core lazy loads, redundant reference resolution, and double-query patterns.**
+**N+1 query patterns across 3 loops, redundant reference resolution called 3× per request, duplicate Any()+FirstOrDefault() queries, and lazy loading inside a loop — all without AsNoTracking() on a pure read path.**
 
-Query count breakdown for 10 sub-orders × 5 items:
+Query count breakdown for 10 sub-orders, 3 promotions (`target.cs`):
 
-| Source | Pattern | Queries |
-|--------|---------|---------|
-| `IsExistOrderReference` — called once per sub-order | `.Any()` + `.FirstOrDefault()` — 2 hits per call | 20 |
-| `GetLatestOrder` — called per sub-order | `.Any()` + `.FirstOrDefault()` | 20 |
-| SubOrder EF `AsSplitQuery` per sub-order | 4–5 round-trips × 10 sub-orders | ~50 |
-| `GetOrderItemOtherInfo` per item (line 805) | `.Count()` + `.FirstOrDefault()` = 2 queries per item | 100 |
-| Amount lazy loads per item (Normal, Paid, RetailPrice + Taxes) | 4 × `Entry.Reference/Collection.Load()` per item | 200 |
-| FulFillment.DeliveryWindow + Promotion + Promotions per item | 3 × `Entry.Collection/Reference.Load()` per item | 150 |
-| `GetOrderPromotion` N+1 on Amount (line 167) | `Entry(datalist[i]).Reference(Amount).Load()` per promotion | 3 |
-| `GetOrderHeader` double query (line 441–451) | `.Any()` then `.FirstOrDefault()` | 2 |
-| `IsExistOrderReference` called independently for Header + Payments + Promotions | 3 separate calls to same table | 9 |
-| Reward items loop for `SourceSubOrderId == "All"` | 1 query per sub-order | 10 |
-| **Total** | | **~564** |
+| Source | Pattern | Location | Queries |
+|--------|---------|----------|---------|
+| `IsExistOrderReference` called independently by Header + Payments + Promotions | 3 calls × 2 queries each (`.Any()` + `.FirstOrDefault()`) | lines 55-57 → lines 497-510 | 6 |
+| `GetOrderHeader` double query | `.Any()` then `.FirstOrDefault()` on same predicate | lines 483-494 | 2 |
+| `GetOrderMessagePayments` | Single query with Include chain | lines 136-139 | 1 |
+| `GetSubOrderMessage` loop (N sub-orders) | Calls `GetSubOrderMessage()` per sub-order in foreach | lines 518-540 (called from line 12) | N (10) |
+| `GetOrderPromotion` N+1 on Amount | `Entry(datalist[i]).Reference(Amount).Load()` per promotion in for loop | line 209 | 1 + P (4) |
+| `GetRewardItem` loop (N sub-orders) | Calls `GetRewardItem()` per SourceSubOrderId | lines 69-77 → lines 358-394 | N (10) |
+| **Total (N=10, P=3)** | | | **~33** |
 
-Per `decision-rules.md`: `> 100 queries per request = CRITICAL, must fix before merge.`
+Per `decision-rules.md`: `10–30 queries = acceptable, monitor` but `30–100 = investigate`.
+Under concurrency: 100 requests × 33 queries × ~10ms each = **33s of total DB time per burst → pool exhaustion**.
 
-**7 specific bugs found (ranked by impact):**
+**7 specific bugs found in `target.cs` (ranked by impact):**
 
-**BUG-1 — `GetOrderItemOtherInfo` double-query inside item loop (line 805)**
+**BUG-1 — `GetSubOrderMessage` N+1: DB call inside a loop (lines 518-540)**
 ```csharp
-// Called per item — .Count() > 0 then .FirstOrDefault() = 2 round-trips per item
-var itemOtherInfo = GetOrderItemOtherInfo(orderId, subOrderId, itemModel.SourceItemId, itemModel.SourceItemNumber);
-```
-
-**BUG-2 — 7 lazy `Entry().Load()` calls inside item loop (lines 819–982)**
-```csharp
-// Inside foreach (SubOrderItemModel itemModel in subOrderModel.Items):
-_context.Entry(itemModel.Amount).Reference(p => p.Normal).Query().Include(i => i.Taxes).Load();
-_context.Entry(itemModel.Amount).Reference(p => p.Paid).Query().Include(i => i.Taxes).Load();
-_context.Entry(itemModel.Amount).Reference(p => p.RetailPrice).Load();
-_context.Entry(itemModel.Amount.RetailPrice).Collection(p => p.Taxes).Load();
-_context.Entry(itemModel.FulFillment).Collection(p => p.DeliveryWindow).Load();
-_context.Entry(itemModel).Reference(p => p.Promotion).Load();
-_context.Entry(itemModel).Collection(p => p.Promotions).Load();
-// = 7 DB calls × N items
-```
-
-**BUG-3 — `IsExistOrderReference` called 3 times independently for same `SourceOrderId`**
-```csharp
-var orderHeader   = GetOrderHeader(SourceOrderId);        // → resolves reference internally
-var orderPayments = GetOrderMessagePayments(SourceOrderId); // → resolves reference again
-results.OrderPromotion = GetOrderPromotion(SourceOrderId);  // → resolves reference again
-```
-
-**BUG-4 — `IsExistOrderReference` itself is 2–3 queries (lines 455–468)**
-```csharp
-if (_context.Order.Where(...).Any())                       // query 1
-if (_context.OrderReference.Where(...).Any())              // query 2
-var OrderRef = _context.OrderReference.Where(...).FirstOrDefault(); // query 3
-```
-
-**BUG-5 — `GetOrderHeader` double-query (lines 441–451)**
-```csharp
-if (_context.Order.Where(...).Any())                       // query 1 — existence check
-    return _context.Order.Include(...).Where(...).FirstOrDefault(); // query 2
-```
-
-**BUG-6 — `GetOrderPromotion` N+1 on Amount (line 167)**
-```csharp
-for (int i = 0; i < datalist.Length; i++)
+// target.cs:523-531 — called from line 12 when SourceSubOrderId == "All"
+foreach (SubOrderModel data1 in subOrderModel)
 {
-    _context.Entry(datalist[i]).Reference(x => x.Amount).Load(); // 1 query per promotion
+    SubOrderMessageViewModel suborder = GetSubOrderMessage(data1.SourceOrderId, data1.SourceSubOrderid);
+    // 1 DB query per sub-order
 }
 ```
 
-**BUG-7 — `GetLatestOrder` double-query (lines 590–596)**
+**BUG-2 — `GetRewardItem` N+1: DB call inside a loop (lines 69-77)**
 ```csharp
-if (_context.OrderReference.Where(...).Any())              // query 1
-var orderRef = _context.OrderReference.Where(...).FirstOrDefault(); // query 2
+// target.cs:69-77 — called when SourceSubOrderId == "All" and IsGetRewardPromotion == true
+for (int i = 0; i < results.SourceSubOrderIdList.Count; i++)
+{
+    string sourceSubOrderId1 = results.SourceSubOrderIdList[i] + "";
+    GetRewardItem(SourceOrderId, sourceSubOrderId1, ref rewardItemMessageTmp);
+    // Each call queries _context.PromotionItemTb (line 366-369)
+}
+```
+
+**BUG-3 — `IsExistOrderReference` called 3× independently for same SourceOrderId (lines 55-57)**
+```csharp
+// target.cs:55-57 — each of these internally calls IsExistOrderReference
+var orderHeader = GetOrderHeader(SourceOrderId);          // → resolves reference internally (line 479)
+var orderPayments = GetOrderMessagePayments(SourceOrderId); // → resolves reference again (line 131)
+results.OrderPromotion = GetOrderPromotion(SourceOrderId);  // → resolves reference again (line 185)
+```
+
+**BUG-4 — `IsExistOrderReference` itself has duplicate queries (lines 497-510)**
+```csharp
+// target.cs:499 — first overload (2-param)
+if (_context.Order.Where(w => w.SourceOrderId.Equals(SourceOrderId)).Any())          // query 1
+    // returns false
+if (_context.OrderReference.Where(w => w.NewSourceOrderId.Equals(SourceOrderId)).Any()) // query 2
+{
+    var OrderRef = _context.OrderReference.Where(w => w.NewSourceOrderId.Equals(SourceOrderId))
+        .OrderByDescending(o => o.CreatedDate).FirstOrDefault();                      // query 3 (duplicate filter)
+}
+```
+
+**BUG-5 — `GetOrderHeader` double-query (lines 483-494)**
+```csharp
+// target.cs:483-494
+if (_context.Order.Where(w => w.IsActive == true && w.SourceOrderId.Equals(OrderId)).Any()) // query 1
+{
+    return _context.Order
+        .Include(Order => Order.Customer)
+        .Where(w => w.IsActive == true && w.SourceOrderId.Equals(OrderId))
+        .FirstOrDefault();  // query 2 — identical predicate
+}
+```
+
+**BUG-6 — `GetOrderPromotion` N+1 on Amount via lazy load in loop (line 209)**
+```csharp
+// target.cs:199-214
+for (int i = 0; i < datalist.Length; i++)
+{
+    _context.Entry(datalist[i]).Reference(x => x.Amount).Load(); // 1 query per promotion row
+    CLResult rchk = model2ViewModel(datalist[i], ref viewModel);
+}
+```
+
+**BUG-7 — Missing `AsNoTracking()` on all read-only queries**
+```csharp
+// Every _context query in target.cs lacks AsNoTracking():
+// - GetOrderHeader (line 488)
+// - GetOrderMessagePayments (line 136)
+// - GetOrderPromotion (line 194)
+// - GetRewardItem (line 366)
+// - GetSubOrderMessage (line 518)
+// Risk: EF change tracker allocates memory per entity — 100% waste on read path
 ```
 
 ---
 
 ### Fix
 
-**Phase 1 — Move all lazy loads into Include() chain (highest impact)**
+**Phase 1 (Day 1) — Zero-risk fixes: collapse duplicate queries + AsNoTracking**
 
 ```csharp
-// BEFORE: bare SubOrder load + 7 lazy loads per item inside loop
-SubOrderModel subOrderModel = _context.SubOrder
-    .Include(s => s.Addresses)
-    .Include(s => s.Items).ThenInclude(i => i.Amount)
-    .Include(s => s.Items).ThenInclude(i => i.FulFillment)
-    .AsSplitQuery()
-    .Where(...).FirstOrDefault();
-
-// AFTER: full graph loaded in one shot — delete all Entry().Load() calls
-SubOrderModel subOrderModel = _context.SubOrder
-    .Include(s => s.Addresses)
-    .Include(s => s.Items)
-        .ThenInclude(i => i.Amount)
-            .ThenInclude(a => a.Normal).ThenInclude(n => n.Taxes)
-    .Include(s => s.Items)
-        .ThenInclude(i => i.Amount)
-            .ThenInclude(a => a.Paid).ThenInclude(p => p.Taxes)
-    .Include(s => s.Items)
-        .ThenInclude(i => i.Amount)
-            .ThenInclude(a => a.RetailPrice).ThenInclude(r => r.Taxes)
-    .Include(s => s.Items)
-        .ThenInclude(i => i.FulFillment).ThenInclude(f => f.DeliveryWindow)
-    .Include(s => s.Items).ThenInclude(i => i.Promotion)
-    .Include(s => s.Items).ThenInclude(i => i.Promotions)
-    .AsSplitQuery()
-    .AsNoTracking()
-    .Where(...).FirstOrDefault();
-```
-
-**Phase 2 — Batch `ItemOtherInfo` per sub-order**
-
-```csharp
-// BEFORE: 2 queries per item inside loop
-var itemOtherInfo = GetOrderItemOtherInfo(orderId, subOrderId, itemModel.SourceItemId, itemModel.SourceItemNumber);
-
-// AFTER: 1 query before loop, O(1) lookup inside
-var otherInfoMap = _context.ItemOtherInfo
-    .Where(w => w.SourceOrderId == orderId && w.SourceSubOrderId == subOrderId)
-    .AsNoTracking()
-    .ToDictionary(w => (w.SourceItemId, w.SourceItemNumber));
-
-// Inside loop:
-if (otherInfoMap.TryGetValue((itemModel.SourceItemId, itemModel.SourceItemNumber), out var itemOtherInfo))
-{
-    orderItemViewModel.Soh = itemOtherInfo.Soh;
-    orderItemViewModel.TimeStamp = itemOtherInfo.TimeStamp;
-}
-```
-
-**Phase 3 — Resolve canonical OrderId once at top of GetSubOrder**
-
-```csharp
-// Resolve once — pass resolved ID to all downstream calls
-string resolvedOrderId = ResolveOrderId(SourceOrderId); // single helper, single query
-var orderHeader        = GetOrderHeader(resolvedOrderId);
-var orderPayments      = GetOrderMessagePayments(resolvedOrderId);
-results.OrderPromotion = GetOrderPromotion(resolvedOrderId);
-```
-
-**Phase 4 — Fix `GetOrderPromotion` N+1**
-
-```csharp
-// BEFORE: load promotions, then Entry.Load() per item
-// AFTER: eager load Amount in initial query
-OrderPromotionModel[] datalist = _context.OrderPromotion
-    .Include(p => p.Amount)
-    .AsNoTracking()
-    .Where(p => p.SourceOrderId == SourceOrderId)
-    .ToArray();
-// Remove the per-item Entry().Reference(Amount).Load() call entirely
-```
-
-**Phase 5 — Collapse all Any() + FirstOrDefault() double-queries**
-
-```csharp
+// FIX BUG-5: GetOrderHeader — collapse Any() + FirstOrDefault() (lines 483-494)
 // BEFORE: 2 queries
-if (_context.Order.Where(...).Any())
-    return _context.Order.Include(...).Where(...).FirstOrDefault();
+if (_context.Order.Where(w => w.IsActive == true && w.SourceOrderId.Equals(OrderId)).Any())
+{
+    return _context.Order.Include(Order => Order.Customer)
+        .Where(w => w.IsActive == true && w.SourceOrderId.Equals(OrderId)).FirstOrDefault();
+}
 
 // AFTER: 1 query
 return _context.Order
     .AsNoTracking()
     .Include(o => o.Customer)
-    .Where(w => w.IsActive && w.SourceOrderId == orderId)
-    .FirstOrDefault(); // null check at caller
+    .Where(w => w.IsActive == true && w.SourceOrderId.Equals(OrderId))
+    .FirstOrDefault(); // returns null if not found
+```
+
+```csharp
+// FIX BUG-4: IsExistOrderReference — collapse Any() + Where() (lines 497-510)
+// BEFORE: 2-3 queries
+if (_context.Order.Where(w => w.SourceOrderId.Equals(SourceOrderId)).Any()) { ... }
+if (_context.OrderReference.Where(w => w.NewSourceOrderId.Equals(SourceOrderId)).Any())
+{
+    var OrderRef = _context.OrderReference.Where(w => w.NewSourceOrderId.Equals(SourceOrderId))...
+}
+
+// AFTER: 1 query
+var orderRef = _context.OrderReference
+    .AsNoTracking()
+    .Where(w => w.NewSourceOrderId.Equals(SourceOrderId))
+    .OrderByDescending(o => o.CreatedDate)
+    .FirstOrDefault();
+if (orderRef == null) { RefSourceOrderId = null; return false; }
+RefSourceOrderId = orderRef.RefSourceOrderId;
+return true;
+```
+
+```csharp
+// FIX BUG-6: GetOrderPromotion — eager load Amount (line 194 + 209)
+// BEFORE: load promotions then Entry.Load() per item
+OrderPromotionModel[] datalist = (from op in _context.OrderPromotion
+    where op.SourceOrderId == SourceOrderId select op).ToArray();
+// then per item: _context.Entry(datalist[i]).Reference(x => x.Amount).Load();
+
+// AFTER: eager load in initial query
+OrderPromotionModel[] datalist = _context.OrderPromotion
+    .Include(op => op.Amount)
+    .AsNoTracking()
+    .Where(op => op.SourceOrderId == SourceOrderId)
+    .ToArray();
+// Remove the Entry().Reference(Amount).Load() line entirely
+```
+
+```csharp
+// FIX BUG-7: Add AsNoTracking() to ALL read queries
+// Apply to every _context query in: GetOrderHeader, GetOrderMessagePayments,
+// GetOrderPromotion, GetRewardItem, GetSubOrderMessage
+```
+
+**Expected result Phase 1: ~30 → ~15 queries**
+
+---
+
+**Phase 2 (Day 2) — Coordinator refactor: resolve reference once**
+
+```csharp
+// FIX BUG-3: Hoist IsExistOrderReference to GetSubOrder (lines 55-57)
+// BEFORE: each sub-call resolves independently
+var orderHeader = GetOrderHeader(SourceOrderId);
+var orderPayments = GetOrderMessagePayments(SourceOrderId);
+results.OrderPromotion = GetOrderPromotion(SourceOrderId);
+
+// AFTER: resolve once, pass resolved ID down
+string resolvedOrderId = SourceOrderId;
+string refSourceOrderId = string.Empty;
+if (IsExistOrderReference(SourceOrderId, ref refSourceOrderId))
+    resolvedOrderId = refSourceOrderId;
+
+var orderHeader = GetOrderHeader(resolvedOrderId, skipRefCheck: true);
+var orderPayments = GetOrderMessagePayments(resolvedOrderId, skipRefCheck: true);
+results.OrderPromotion = GetOrderPromotion(resolvedOrderId, skipRefCheck: true);
+```
+
+**Expected result Phase 2: ~15 → ~10 queries**
+
+---
+
+**Phase 3 (Day 3) — Batch the N+1 loops**
+
+```csharp
+// FIX BUG-2: Batch GetRewardItem — replace per-sub-order loop (lines 69-77)
+// BEFORE: N queries in a loop
+for (int i = 0; i < results.SourceSubOrderIdList.Count; i++)
+{
+    GetRewardItem(SourceOrderId, results.SourceSubOrderIdList[i], ref rewardItemMessageTmp);
+}
+
+// AFTER: 1 query
+var allRewardItems = _context.PromotionItemTb
+    .AsNoTracking()
+    .Where(p => p.SourceOrderId == SourceOrderId
+        && results.SourceSubOrderIdList.Contains(p.SourceSubOrderId)
+        && !p.IsDelete)
+    .ToList();
+
+// Map to ViewModels in memory
+foreach (var reward in allRewardItems)
+{
+    RewardItemPromotionViewModel viewModel = new();
+    Databind(reward, ref viewModel, false);
+    rewardItemMessage.Add(viewModel);
+}
+```
+
+```csharp
+// FIX BUG-1: Batch GetSubOrderMessage — replace per-sub-order loop (lines 518-540)
+// BEFORE: foreach calling GetSubOrderMessage() one by one
+foreach (SubOrderModel data1 in subOrderModel)
+{
+    SubOrderMessageViewModel suborder = GetSubOrderMessage(data1.SourceOrderId, data1.SourceSubOrderid);
+}
+
+// AFTER: single query for all sub-orders, map in memory
+var allSubOrders = _context.SubOrder
+    .AsNoTracking()
+    .Where(w => w.IsActive == true && w.SourceOrderId.Equals(OrderId))
+    .Include(/* all needed navigations */)
+    .AsSplitQuery()
+    .ToList();
+// Map each to SubOrderMessageViewModel in memory loop (zero DB calls)
+```
+
+**Expected result Phase 3: ~10 → ~7 queries**
+
+---
+
+**Phase 4 (Follow-up PR) — Async migration**
+
+```csharp
+// Convert to async + parallel independent calls using IDbContextFactory
+var headerTask = Task.Run(async () => {
+    using var ctx = _contextFactory.CreateDbContext();
+    return await GetOrderHeaderAsync(ctx, resolvedOrderId);
+});
+var paymentsTask = Task.Run(async () => {
+    using var ctx = _contextFactory.CreateDbContext();
+    return await GetOrderMessagePaymentsAsync(ctx, resolvedOrderId);
+});
+var promotionTask = Task.Run(async () => {
+    using var ctx = _contextFactory.CreateDbContext();
+    return await GetOrderPromotionAsync(ctx, resolvedOrderId);
+});
+await Task.WhenAll(headerTask, paymentsTask, promotionTask);
+// Note: requires IDbContextFactory — EF Core DbContext is NOT thread-safe
 ```
 
 ---
@@ -266,31 +355,32 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 
 **Baseline targets per metric (fill in before fix, compare after):**
 
-| Metric | Baseline (before) | Target (after) | Actual (after) |
-|--------|-------------------|----------------|----------------|
-| ElapsedMs (P99) | ___ ms | < 300ms | — |
-| DB query count per request | ~560 | < 30 | — |
-| MemAllocatedKB per call | ___ KB | -40% | — |
-| GC.Gen0 delta per call | ___ | significant drop | — |
-| GC.Gen1 delta per call | ___ | 0 | — |
+| Metric | Baseline (before) | Target (after Phase 3) | Target (after Phase 4) | Actual (after) |
+|--------|-------------------|------------------------|------------------------|----------------|
+| ElapsedMs (P99) | timeout | < 300ms | < 100ms | — |
+| DB query count per request (N=10) | ~33 | ~7 | ~7 (parallel) | — |
+| Connection hold time per request | ~300ms+ | ~70ms | ~30ms (parallel) | — |
+| Connection pool utilization (100 concurrent) | saturated | ~25% | ~10% | — |
+| MemAllocatedKB per call | ___ KB | -40% | -40% | — |
+| GC.Gen0 delta per call | ___ | significant drop | significant drop | — |
 
 **What each metric reveals:**
 - `ElapsedMs` — direct latency impact
 - `DB query count` — confirms N+1 is eliminated
+- `Connection hold time` — determines pool exhaustion threshold under concurrency
 - `MemAllocatedKB` — EF tracking overhead; `AsNoTracking` will drop this visibly
 - `GC.Gen0 delta` — short-lived object churn from EF proxy objects; drops after batch fix
-- `GC.Gen1 delta` — if non-zero inside a request, memory pressure is serious
 
 ---
 
 ### Results
 
-| Metric | Before | After (estimated) |
-|--------|--------|-------------------|
-| Response time | timeout | < 200ms |
-| DB queries per request | ~564 | ~20–30 |
-| MemAllocatedKB | pending baseline | -40% (AsNoTracking) |
-| GC.Gen0 per call | pending baseline | significant drop |
+| Metric | Before | After Phase 1 | After Phase 3 (est.) | After Phase 4 (est.) |
+|--------|--------|---------------|----------------------|----------------------|
+| Response time (P99) | timeout | ~200ms | < 100ms | < 50ms |
+| DB queries per request (N=10) | ~33 | ~15 | ~7 | ~7 |
+| Max concurrent requests before pool exhaustion | ~30 | ~60 | ~150 | ~300+ |
+| MemAllocatedKB | pending | -40% (AsNoTracking) | -40% | -40% |
 
 > Fill in actual numbers after running baseline instrumentation and post-fix measurement.
 
@@ -302,19 +392,22 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 [ ] Any DB call inside a foreach or for loop?                    → BLOCK immediately
 [ ] Any Entry().Reference().Load() or Entry().Collection().Load()?  → Replace with Include() chain
 [ ] Any Any() followed by FirstOrDefault() on same predicate?    → Collapse to one query
-[ ] Same ID resolved by IsExistOrderReference multiple times?    → Resolve once, pass down
-[ ] All GET endpoint queries using AsNoTracking()?               → Required on every read
+[ ] Same ID resolved by IsExistOrderReference multiple times?    → Resolve once at coordinator, pass down
+[ ] All GET endpoint queries using AsNoTracking()?               → Required on every read path
 [ ] Query count logged before merging?                           → Use EF Core LogTo or MiniProfiler
 [ ] Stopwatch + GC baseline captured before and after fix?       → Required for hot-path changes
+[ ] Connection pool math validated for expected concurrency?     → queries × hold_time × concurrent_requests < pool_size
 ```
 
 ---
 
 ### Lesson Learned
 
+> **Connection pool math**: timeout under concurrency is not about a single slow query — it's about `query_count × hold_time × concurrent_requests > pool_size`. Reducing query count from 33 to 7 alone increases the concurrency ceiling by ~4×.
+
 > **Lazy load accumulation**: each `Entry().Load()` looks harmless in isolation. The problem only appears when you trace the full call graph — not just the method. Architects review call graphs, not individual methods.
 
-> **Shared context resolution**: when a sub-call resolves the same data the parent already knows (e.g. `IsExistOrderReference`), the design has a hidden coupling gap. Fix: resolve shared context at the coordinator level and inject the result.
+> **Shared context resolution**: when a sub-call resolves the same data the parent already knows (e.g. `IsExistOrderReference` called 3× for same ID), the design has a hidden coupling gap. Fix: resolve shared context at the coordinator level and inject the result.
 
 > **Latency ≈ DB query count × average round-trip time.** EF Core does not batch automatically. Every `.Load()` inside a loop is a performance bug waiting for enough data to detonate.
 
@@ -323,6 +416,24 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 - Every `.Load()` inside a loop is a block, not a warning
 - Resolve shared context (order reference lookups, header data) once at the coordinator and pass it down — never re-resolve independently in each sub-call
 - Instrument before you fix — a fix without a baseline is anecdotal
+- Always calculate connection pool math: `concurrent_requests × queries_per_request × avg_hold_time` must be < pool capacity
+- `AsNoTracking()` is mandatory on every read path — EF tracking overhead is never free
+
+---
+
+### Architecture Decision
+
+**Decision**: Option A (Batch Query Refactor) now, Option B (Async + Parallel) as fast-follow.
+
+| Option | Query Reduction | Risk | Effort |
+|--------|----------------|------|--------|
+| A. Batch Query Refactor | ~33 → ~7 | Low — same signatures, no infra change | 2-3 days |
+| B. Async + Parallel Calls | ~7 queries run in parallel | Medium — requires IDbContextFactory, async migration | 5-7 days |
+| C. CQRS Read Model | ~33 → 1 | High — new infra, eventual consistency | 2-3 weeks |
+
+**Rationale**: Option A fixes the root cause with minimal blast radius. After A is proven in production, Option B further reduces wall-clock time. Option C is premature until read/write ratio exceeds 100:1.
+
+See `architecture-decision.md` for full ADR.
 
 ---
 
@@ -330,8 +441,11 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 
 | Type | Record |
 |------|--------|
-| **Knowledge** | N+1 Query Problem, Batch Query Pattern, EF Core Best Practices, GC pressure from EF tracking |
-| **Pattern** | Avoid N+1 Query → see `references/patterns.md` #1 |
+| **Knowledge** | N+1 Query Problem, Batch Query Pattern, EF Core Best Practices, Connection Pool Math, GC pressure from EF tracking |
+| **Pattern** | Batch Query → `references/patterns.md` #1 |
+| **Pattern** | Eager Graph Loading → `references/patterns.md` #11 |
+| **Pattern** | Coordinator-Level Resolution (new) → `references/patterns.md` #12 |
 | **Decision** | Eager load via Include() chain over lazy Entry().Load() on hot-path read methods |
 | **Decision** | Resolve canonical OrderId once at coordinator level — not inside each sub-call |
+| **Decision** | Option A (Batch Refactor) now, Option B (Async) as follow-up — see `architecture-decision.md` |
 | **Tech Assets** | Stopwatch + GC instrumentation snippet, Prometheus histogram snippet, EF LogTo config snippet |
