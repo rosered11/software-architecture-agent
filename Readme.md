@@ -3,7 +3,7 @@
 ## Resume session
 
 ```
-claude --resume 5b0f1798-ddfa-4ecc-a871-5fcf4cd298c4
+claude --resume e73d3473-25dc-401d-86b1-3877bbb165dc
 ```
 
 ### Option 1 — Install the .skill file (Recommended)

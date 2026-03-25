@@ -353,36 +353,47 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 // histogram_quantile(0.99, rate(getsuborder_duration_seconds_bucket[5m]))
 ```
 
-**Baseline targets per metric (fill in before fix, compare after):**
+**Baseline captured 2026-03-25** — 30 sequential calls, single-user, OrderId `TWDCDS2602122610025068`, SubOrderId `All`:
 
-| Metric | Baseline (before) | Target (after Phase 3) | Target (after Phase 4) | Actual (after) |
-|--------|-------------------|------------------------|------------------------|----------------|
-| ElapsedMs (P99) | timeout | < 300ms | < 100ms | — |
-| DB query count per request (N=10) | ~33 | ~7 | ~7 (parallel) | — |
-| Connection hold time per request | ~300ms+ | ~70ms | ~30ms (parallel) | — |
-| Connection pool utilization (100 concurrent) | saturated | ~25% | ~10% | — |
-| MemAllocatedKB per call | ___ KB | -40% | -40% | — |
-| GC.Gen0 delta per call | ___ | significant drop | significant drop | — |
+| Metric | Baseline (measured) | Target (after Phase 3) | Target (after Phase 4) | Actual (after) |
+|--------|---------------------|------------------------|------------------------|----------------|
+| ElapsedMs (P50) | **5,048ms** | < 300ms | < 100ms | — |
+| ElapsedMs (P99) | **8,283ms** | < 500ms | < 200ms | — |
+| ElapsedMs (best) | 3,193ms | — | — | — |
+| CpuMs (steady state) | **15-62ms** | ~15ms (unchanged) | ~15ms | — |
+| I/O wait % | **99%** | < 80% | < 70% | — |
+| MemDelta per call (steady) | **2,676 KB** | < 1,500 KB | < 1,500 KB | — |
+| AllocatedKB per call (steady) | **2,668 KB** | < 1,500 KB | < 1,500 KB | — |
+| MemDelta (cold start, call #1) | 22,237 KB | one-time | one-time | — |
+| GC0 per 10 calls | **1** | 0 | 0 | — |
+| GC1 per 10 calls | **1** | 0 | 0 | — |
+| GC2 (cold start only) | 1 | 0 | 0 | — |
+| ThreadPool IO used | **0** (all sync) | 0 (still sync) | > 0 (async) | — |
+| DB query count per request | ~33 (estimated) | ~7 | ~7 (parallel) | — |
 
-**What each metric reveals:**
-- `ElapsedMs` — direct latency impact
-- `DB query count` — confirms N+1 is eliminated
-- `Connection hold time` — determines pool exhaustion threshold under concurrency
-- `MemAllocatedKB` — EF tracking overhead; `AsNoTracking` will drop this visibly
-- `GC.Gen0 delta` — short-lived object churn from EF proxy objects; drops after batch fix
+**Key findings from baseline:**
+- **99% of wall-clock time is waiting on DB I/O** — CpuMs=15-62ms vs ElapsedMs=5,000ms. DB round-trip reduction is the only lever that matters.
+- **2.6 MB of EF tracked entities per call** — under 100 concurrent requests = 260MB simultaneous tracked entities → GC pressure.
+- **ThreadPool IO = 0** — all DB calls are synchronous, blocking a thread for 5s per request.
+- **GC pattern**: heap grows ~2.6MB per call until ~80MB, then GC reclaims ~44MB. Under concurrency, GC frequency will increase significantly.
+- **Cold start penalty**: first call is 8.3s with 22MB allocation (EF model compilation + JIT). One-time cost.
 
 ---
 
 ### Results
 
-| Metric | Before | After Phase 1 | After Phase 3 (est.) | After Phase 4 (est.) |
-|--------|--------|---------------|----------------------|----------------------|
-| Response time (P99) | timeout | ~200ms | < 100ms | < 50ms |
-| DB queries per request (N=10) | ~33 | ~15 | ~7 | ~7 |
-| Max concurrent requests before pool exhaustion | ~30 | ~60 | ~150 | ~300+ |
-| MemAllocatedKB | pending | -40% (AsNoTracking) | -40% | -40% |
+| Metric | Baseline (measured) | After Phase 1 | After Phase 3 (est.) | After Phase 4 (est.) |
+|--------|---------------------|---------------|----------------------|----------------------|
+| ElapsedMs (P50) | **5,048ms** | — | < 300ms | < 100ms |
+| ElapsedMs (P99) | **8,283ms** | — | < 500ms | < 200ms |
+| CpuMs (steady) | 15-62ms | ~15ms | ~15ms | ~15ms |
+| MemDelta per call | 2,676 KB | ~1,600 KB | ~1,500 KB | ~1,500 KB |
+| GC0 per 10 calls | 1 | 0 | 0 | 0 |
+| ThreadPool IO | 0 (sync) | 0 | 0 | > 0 (async) |
+| DB queries per request | ~33 | ~15 | ~7 | ~7 |
+| Max concurrent before pool exhaustion | ~20 | ~40 | ~100+ | ~300+ |
 
-> Fill in actual numbers after running baseline instrumentation and post-fix measurement.
+> Fill in Phase 1/3/4 actual numbers after each fix deployment.
 
 ---
 
