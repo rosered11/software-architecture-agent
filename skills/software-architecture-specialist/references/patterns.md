@@ -21,6 +21,7 @@
 | 10 | [Competing Consumers](#10-competing-consumers) | Messaging | Scale Kafka consumers horizontally |
 | 11 | [Eager Graph Loading](#11-eager-graph-loading) | Performance | Load full entity graph in one shot via Include() chain |
 | 12 | [Coordinator-Level Resolution](#12-coordinator-level-resolution) | Performance | Resolve shared context once at parent, pass down |
+| 13 | [Bulk Load Then Map](#13-bulk-load-then-map) | Performance | Replace N outer-loop DB calls with one bulk query + in-memory mapping |
 
 ---
 
@@ -612,3 +613,93 @@ Resolver result could change mid-request (race condition) → do NOT cache, reso
 ```
 
 **Real Incident (target.cs)**: `IsExistOrderReference` called independently by `GetOrderHeader` (line 479), `GetOrderMessagePayments` (line 131), and `GetOrderPromotion` (line 185) — all for the same `SourceOrderId`. Each call performs 2-3 DB queries (`.Any()` + `.Where().FirstOrDefault()`). Hoisting to `GetSubOrder` (the coordinator) eliminates 4-8 redundant queries per request.
+
+---
+
+## 13. Bulk Load Then Map
+
+**Problem**: A method loops over N records, calling the DB once per record — the **outer loop** is the bottleneck, not the queries inside each iteration. Each iteration may load a full entity graph with its own network round-trip, making latency scale as O(N).
+
+**This is distinct from Pattern #1 (Batch Query)**: Pattern #1 batches a single supporting lookup inside a loop. Pattern #13 eliminates the outer loop itself — the entire entity graph for all N records is loaded in one query, then all mapping is done in memory.
+
+**Solution**: Collect all IDs → bulk-load ALL entities with full Include chain in one query + `AsSplitQuery()` → batch all supporting lookups → map ViewModels in memory (zero per-record DB calls in the mapping phase).
+
+**When to USE**:
+- A method loops N times and each iteration issues 5+ DB queries
+- N is bounded (e.g., 5–50 sub-orders) — not unbounded streaming data
+- The full entity graph can fit in memory for N records
+- The method is on a hot read path (API endpoint, not background job)
+
+**When NOT to USE**:
+- N is unbounded or N > 500 (memory risk — use chunked streaming instead)
+- Entity graph is sparse and most Include paths will load nothing (projection is better)
+- Per-record conditions are unique and can't be expressed as a bulk `Contains()` query
+
+**Complexity**: High (significant refactor — method structure changes completely)
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Eliminates N×queries → O(1) queries regardless of N | Single large query may be slower for N=1 than before |
+| Latency becomes nearly independent of sub-record count | All data loaded into RAM at once — watch memory for large N |
+| GC pressure stable and predictable | AsSplitQuery generates ~16+ split queries — higher query count but faster total |
+| Method structure becomes load → batch → map | Requires full method rewrite, not an incremental fix |
+
+**Your Stack (.NET + EF Core)**:
+```csharp
+// BEFORE: N outer-loop calls, each with ~44 sequential queries
+foreach (var subOrder in subOrders)
+{
+    GetSubOrderMessage(orderId, subOrder.SourceSubOrderid, ref output);
+    // Each call: IsExistOrderReference + GetLatestOrder + GetOrderItemOtherInfo +
+    //            multiple Entry().Load() per item + GetStoreLocation + GetPackageTb
+}
+
+// AFTER: Bulk Load Then Map (Phase 3 revised — target.cs:593-1331)
+// Step 1: Batch resolve all references (1 query)
+var orderRefs = _context.OrderReference.AsNoTracking()
+    .Where(w => w.NewSourceOrderId == orderId && subOrderIds.Contains(w.NewSourceSubOrderId))
+    .ToList();
+var refsBySubOrder = orderRefs
+    .GroupBy(g => g.NewSourceSubOrderId)
+    .ToDictionary(g => g.Key, g => g.OrderByDescending(o => o.CreatedDate).First());
+
+// Step 2: Bulk load ALL sub-orders with full entity graph (~16 split queries total)
+var allSubOrders = _context.SubOrder
+    .AsNoTracking()
+    .Include(so => so.Items).ThenInclude(i => i.Amount).ThenInclude(a => a.Normal).ThenInclude(n => n.Taxes)
+    .Include(so => so.Items).ThenInclude(i => i.Amount).ThenInclude(a => a.Paid).ThenInclude(p => p.Taxes)
+    // ... 14 more Include paths ...
+    .AsSplitQuery()
+    .Where(w => loadOrderIds.Contains(w.SourceOrderId) && loadSubOrderIds.Contains(w.SourceSubOrderid))
+    .ToList();
+
+// Step 3: Batch load all supporting data (2-3 more queries)
+var allItemOtherInfo = _context.ItemOtherInfo.AsNoTracking()
+    .Where(w => loadOrderIds.Contains(w.SourceOrderId) && loadSubOrderIds.Contains(w.SourceSubOrderId))
+    .ToList();
+
+// Step 4: Map ALL ViewModels in memory — zero DB calls
+foreach (var pair in resolvedPairs)
+{
+    var subOrderModel = allSubOrders.FirstOrDefault(s => ...);
+    var itemOtherInfo = allItemOtherInfo.FirstOrDefault(w => ...);  // dictionary lookup, no DB
+    // ... build ViewModel from in-memory data ...
+}
+```
+
+**AsSplitQuery note**: With 16 Include paths, EF Core generates 16 split queries in one bulk load instead of a cartesian join. This produces ~16 SQL statements but they are batched for ALL N records. Without AsSplitQuery, 16 paths × N records would produce N×16 cartesian rows (data explosion).
+
+**Decision Rule**:
+```
+Outer loop calls DB > 5 times per iteration AND N > 5       → apply Bulk Load Then Map
+Entity graph has > 3 collection Include paths               → add AsSplitQuery()
+All N records fit in memory (N < 200 and entity < 10KB)     → bulk load safe
+N > 500 OR entity very large                                → chunk before bulk loading
+Per-record supporting data can be batched with Contains()   → include in bulk approach
+Some per-record calls cannot be batched (external API, etc) → keep those as per-record, accept residual latency
+```
+
+**Real Incident (target.cs)**: `GetSubOrderMessage` list method (lines 593-634) looped N=10 sub-orders, calling the inner method per sub-order — each inner call issued ~44 queries sequentially = ~440 total. Refactored to bulk-load all 10 sub-orders with 16 Include paths + `AsSplitQuery()` + batch all supporting queries. Result: **P50 dropped from 2,730ms to 1,505ms (-45%)** measured 2026-03-26.
+
+**Failed approach (do not repeat)**: Replacing `Entry().Load()` inside each iteration with an expanded Include chain + `AsSplitQuery()` inside the loop produces **zero improvement** — AsSplitQuery generates the same number of queries as the lazy loads it replaces, 1:1. The outer loop must be eliminated, not optimized per-iteration. See incident-log.md Phase 3 attempt 1 notes.

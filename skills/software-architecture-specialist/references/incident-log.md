@@ -382,18 +382,43 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 
 ### Results
 
-| Metric | Baseline (measured) | After Phase 1 | After Phase 3 (est.) | After Phase 4 (est.) |
-|--------|---------------------|---------------|----------------------|----------------------|
-| ElapsedMs (P50) | **5,048ms** | — | < 300ms | < 100ms |
-| ElapsedMs (P99) | **8,283ms** | — | < 500ms | < 200ms |
-| CpuMs (steady) | 15-62ms | ~15ms | ~15ms | ~15ms |
-| MemDelta per call | 2,676 KB | ~1,600 KB | ~1,500 KB | ~1,500 KB |
-| GC0 per 10 calls | 1 | 0 | 0 | 0 |
-| ThreadPool IO | 0 (sync) | 0 | 0 | > 0 (async) |
-| DB queries per request | ~33 | ~15 | ~7 | ~7 |
-| Max concurrent before pool exhaustion | ~20 | ~40 | ~100+ | ~300+ |
+| Metric | Baseline (measured) | After Phase 1 (measured) | After Phase 2 (measured) | After Phase 3 (measured) | After Indexes (measured) | After Phase 4 (est.) |
+|--------|---------------------|--------------------------|--------------------------|--------------------------|--------------------------|----------------------|
+| ElapsedMs (P50) | **5,048ms** | **2,836ms (-44%)** | **~2,730ms (-46%)** | **~1,505ms (-70%)** | **~1,579ms (+5% noise)** | < 600ms |
+| ElapsedMs (best) | 3,193ms | **2,792ms (-13%)** | **2,634ms (-17%)** | **1,481ms (-54%)** | **1,539ms** | — |
+| ElapsedMs (cold start) | 8,283ms | 12,533ms | **6,309ms (-24%)** | **4,521ms (-45%)** | **9,014ms (plan recompile)** | — |
+| CpuMs (steady) | 15-62ms | **0-46ms** | **0-46ms** | **0-109ms** | **0-110ms** | ~15ms |
+| AllocatedKB per call | 2,668 KB | **2,697 KB (~same)** | **~2,655 KB (~same)** | **~2,470 KB (~same)** | **~1,808 KB (-27%)** | ~1,500 KB |
+| GC0 per 10 calls | 1 | **0.2 (-80%)** | **0.03 (-97%)** | **~5 (GC cycling)** | **0.3 (-94%)** | ~0.1 |
+| GC1 per 10 calls | 1 | **0.1 (-90%)** | **0.03 (-97%)** | **~5** | **0 (-100%)** | 0 |
+| ThreadPool IO | 0 (sync) | **0** | **0** | **0** | **0** | > 0 (async) |
+| DB queries per request | ~33 | **~22** | **~18** | **~50 (20+3N)** | **~50 (unchanged)** | ~20 |
+| Max concurrent before pool exhaustion | ~20 | **~35** | **~40** | **~140+** | **~200+ (lower I/O hold time)** | ~400+ |
 
-> Fill in Phase 1/3/4 actual numbers after each fix deployment.
+**Phase 1 notes (2026-03-26):**
+- Latency dropped 44% — duplicate query collapse + Include(Amount) working
+- GC pressure dropped 80-90% — AsNoTracking reducing tracking object churn
+- MemDelta flat because N+1 loops still dominate (20 queries still loading full entities)
+- Cold start worse due to new Include() query plan compilation — one-time cost
+- **Remaining bottleneck: N+1 loops** in GetSubOrderMessage (N queries) and GetRewardItem (N queries) — Phase 2-3 target
+
+**Phase 2 notes (2026-03-26):**
+- Marginal latency improvement (2,836ms → ~2,730ms, -4%) — expected since hoisted queries were individually fast (~25ms each)
+- Cold start dramatically improved (12,533ms → 6,309ms, -50%) — fewer query plan compilations at startup
+- GC nearly eliminated — only 1 GC0 + 1 GC1 across 30 calls (at call #21 when heap reached ~80MB)
+- MemDelta still flat — N+1 loops remain the dominant memory consumer
+- **Remaining bottleneck: N outer loop** — 10 sequential GetSubOrderMessage calls at ~270ms each ≈ ~2,700ms
+
+**Phase 3 notes (2026-03-26):**
+- **Include chain expansion FAILED (attempt 1)** — replaced 21 Entry().Load() with mega-Include + AsSplitQuery. Result: ~0% latency change, +19% worse cold start. Reverted.
+- **Root cause of failure**: AsSplitQuery generates the same number of queries as Entry().Load() — split queries replaced lazy loads 1:1. No net reduction.
+- **Lesson**: The bottleneck is the N outer loop (10 sequential per-sub-order calls), not the per-item lazy loads inside each call.
+- **Phase 3 revised (batch outer loop) — MEASURED 2026-03-26:**
+  - Replaced `GetSubOrderMessage` list method with bulk-load-then-map: one `AsSplitQuery` with 16 Include paths loads ALL sub-orders, all supporting queries batched, mapping in memory
+  - P50: 2,730ms → **1,505ms (-45%)** | Cold start: 6,309ms → **4,521ms (-28%)**
+  - GC cycling healthy at ~5 GC0/10 calls — 2.5 MB allocated per call, collected before accumulation
+  - **Remaining bottleneck**: per-sub-order calls kept as-is: `GetStoreLocation`, `getPackageInfoByOrderAndSubOrder`, `GetPackageTb` — 3×N sequential calls (~900ms for N=10)
+  - **Phase 4 target**: async parallel execution of the 3 remaining per-sub-order calls → expected < 300ms
 
 ---
 

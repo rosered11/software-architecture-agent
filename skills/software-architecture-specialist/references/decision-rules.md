@@ -66,6 +66,29 @@ Chunking     → optimizes tail latency and memory (controls max RAM per operati
 Both needed  → when N > 1000
 ```
 
+```
+When to add indexes vs when to fix code:
+
+Indexes help when:          → I/O cost per query is high (slow disk reads, full table scans)
+                            → Same rows fetched repeatedly (high AllocatedKB per call)
+                            → GC pressure from large result sets
+                            → Concurrency ceiling is low (index reduces hold_time per connection)
+
+Indexes do NOT help when:   → Bottleneck is sequential round-trip count (N calls in series)
+                            → Each query is fast but there are too many of them
+                            → P50 >> (query_count × avg_query_time) suggests non-DB overhead
+
+Diagnosis rule:
+  If (P50 ÷ query_count) > 30ms → bottleneck is likely sequential round-trips → fix code structure
+  If (P50 ÷ query_count) < 10ms → bottleneck is likely I/O → indexes first
+  If AllocatedKB drops after indexes but P50 unchanged → confirms round-trip bottleneck, proceed to async
+
+Real incident (target.cs):
+  Indexes reduced AllocatedKB by 27% (I/O working) but P50 unchanged (1,505ms → 1,579ms).
+  Diagnosis: P50 ÷ 50 queries = ~30ms/query → still borderline, but sequential tail of 30 per-sub-order
+  calls dominates regardless. Code fix (async parallel) is the correct next step.
+```
+
 ---
 
 ## EF Core
@@ -118,6 +141,31 @@ Include() chain depth:
 1–2 levels         → OK, no split query needed
 3+ levels or 2+ collections → AsSplitQuery() required to avoid cartesian explosion
 5+ levels and data sparse   → switch to projection (Select DTO) instead of deep Include()
+```
+
+```
+AsSplitQuery() behavior — what it does and does NOT do:
+  DOES:  Splits each Include path into a separate SQL query to avoid cartesian join explosion
+  DOES:  Improve memory efficiency when loading multiple collections
+  DOES NOT: Reduce total query count — N Include paths = N split queries (same count as Entry().Load() per path)
+  DOES NOT: Help if the outer loop is the bottleneck — AsSplitQuery inside a loop still runs N×queries
+
+Rule:
+  Using AsSplitQuery to replace Entry().Load() inside a loop → ZERO improvement (1:1 replacement)
+  Using AsSplitQuery in a BULK query (all records at once) → CORRECT — ~16 queries total regardless of N
+  If AsSplitQuery didn't reduce latency → the outer loop is the real bottleneck, apply Pattern #13
+
+Real incident (target.cs): Phase 3 attempt 1 — replaced 21 Entry().Load() with Include + AsSplitQuery
+  inside the per-sub-order loop. Result: ~0% latency change, +19% worse cold start. Reverted.
+  Fix: batch the outer loop itself (Pattern #13 Bulk Load Then Map). P50: 2,730ms → 1,505ms (-45%).
+```
+
+```
+Outer loop vs inner query optimization:
+  Symptoms of inner query bottleneck: each iteration has 1-2 queries, latency ∝ query_count × latency_per_query
+  Symptoms of outer loop bottleneck:  each iteration has 5+ queries, latency ∝ N × (queries × latency)
+  Diagnosis: if (P50 ÷ N) ≈ constant → outer loop is the bottleneck
+  Fix for outer loop: Pattern #13 Bulk Load Then Map — eliminate the loop, not the inner queries
 ```
 
 ---
