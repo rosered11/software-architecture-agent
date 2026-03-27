@@ -58,3 +58,7 @@ The real power comes from keeping the reference files updated. After every signi
 ```
 
 The skill becomes more useful the more you feed it. Six months from now, incident-log.md is your personal evidence base. A year from now, decision-rules.md reflects your own architectural instincts, not just the defaults that ship today.
+
+### Hook Sync to Notion
+ From now on, every time Claude edits a file under skills/software-architecture-specialist/references/, the hook fires automatically
+   and keeps Notion in sync. Just make sure to open /hooks once (or restart Claude Code) to activate the hook for this session.
