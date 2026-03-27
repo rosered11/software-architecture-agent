@@ -379,6 +379,65 @@ SUGGEST — Independent DB calls made sequentially
 
 ---
 
+## Checklist: Async .NET / EF Core Async
+
+Run when: code uses `async`/`await`, `Task`, `Task.Run`, `Task.WhenAll`, or async EF Core methods.
+
+```
+BLOCK — .Result or .Wait() on async method in ASP.NET context
+  Pattern: someAsyncMethod().Result or someAsyncMethod().Wait()
+  Risk: Deadlock — ASP.NET sync context blocks waiting for a thread that's waiting
+        for the sync context. Manifests as request hang, never completes.
+  Fix: Await all the way up the call chain. Never mix sync blocking with async code.
+
+BLOCK — Single DbContext shared across parallel Task.Run() / Task.WhenAll() calls
+  Pattern: Task.Run(() => _context.Orders...) alongside Task.Run(() => _context.Payments...)
+           using the same injected _context instance
+  Risk: EF Core DbContext is NOT thread-safe — concurrent access causes exceptions,
+        data corruption, or silent query interleaving.
+  Fix: Inject IDbContextFactory<T>, create one DbContext per task:
+       await using var ctx = _contextFactory.CreateDbContext();
+
+BLOCK — async void method outside of UI event handler
+  Pattern: public async void ProcessOrder() { ... }
+  Risk: Exceptions are unobservable — crash the process silently.
+        Callers cannot await it — fire-and-forget with no error propagation.
+  Fix: Use async Task for all async methods. async void only for UI/event handlers.
+
+WARN — Missing CancellationToken propagation
+  Pattern: public async Task<T> GetData() with no CancellationToken parameter
+  Risk: Client disconnect or request timeout does not cancel the in-flight DB query.
+        Wastes DB connections and compute on abandoned requests under load.
+  Fix: Accept CancellationToken, pass to all async calls:
+       .FirstOrDefaultAsync(cancellationToken), HttpClient.GetAsync(url, token)
+
+WARN — IDbContextFactory not used for parallel EF Core queries
+  Pattern: Task.WhenAll with EF Core queries but no IDbContextFactory
+  Risk: DbContext is not thread-safe — will throw InvalidOperationException or corrupt data.
+  Fix: Register in DI: builder.Services.AddDbContextFactory<MyDbContext>(options => ...);
+       Per-task usage: await using var ctx = _factory.CreateDbContext();
+
+WARN — Missing ConfigureAwait(false) in library/service code
+  Pattern: await someTask; (no ConfigureAwait) inside a library or service layer
+  Risk: In ASP.NET Framework, captures the sync context unnecessarily — can cause deadlock
+        when combined with .Result or .Wait() anywhere in the call chain.
+  Fix: Add .ConfigureAwait(false) on all awaits in service/library code.
+       (ASP.NET Core has no sync context — harmless but still good practice)
+
+SUGGEST — Async method missing Async suffix
+  Pattern: public async Task<T> GetData() instead of GetDataAsync()
+  Why: .NET convention — async methods end in Async for discoverability and clarity.
+  Option: Rename public methods to follow convention, especially on interfaces.
+
+SUGGEST — Task.Run() wrapping non-CPU-bound sync code
+  Pattern: await Task.Run(() => _context.Orders.ToList())
+  Why: For I/O-bound work, Task.Run offloads to a thread pool thread but still blocks it.
+       No throughput gain — use true async I/O methods instead.
+  Option: Use .ToListAsync() directly. Reserve Task.Run for genuinely CPU-bound work only.
+```
+
+---
+
 ## Checklist: Payment / Financial System
 
 Run when: code processes payments, transfers money, manages balances, or integrates with a PSP (Stripe, PayPal, Braintree).

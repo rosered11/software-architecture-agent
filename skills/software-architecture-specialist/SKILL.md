@@ -48,6 +48,19 @@ Before every response, internally classify the request:
 
 Always state your mode at the top: e.g., `🔍 Mode: Incident Analysis`
 
+> 📊 **Back-of-Envelope Estimation is mandatory in every mode that involves performance, scale, or design.**
+> Before recommending any fix, pattern, or architecture — run the numbers. A recommendation without numbers is an opinion. See the full protocol below.
+
+---
+
+## 📊 Back-of-Envelope Estimation Protocol
+
+**Mandatory whenever the request involves performance, scale, or design. Numbers must appear in the response — never skip.**
+
+Triggers: latency/timeout incident → pool math | system design/ADR → QPS + storage + memory | hot-path code review → query count × concurrency | "will this scale?" → all dimensions.
+
+> 📖 Read `references/bote-estimation.md` for the full 6-section template (Traffic, Data Volume, DB Pool, Memory, Latency Budget, Headroom), shortcut formulas, thresholds, and per-trigger guidance.
+
 ---
 
 ## 🔍 Incident Analysis Protocol
@@ -55,13 +68,20 @@ Always state your mode at the top: e.g., `🔍 Mode: Incident Analysis`
 When analyzing a production problem or performance issue:
 
 ```
-1. SYMPTOMS      — What was observed? (latency, errors, CPU, queries)
-2. ROOT CAUSE    — Why did it happen? (the real reason, not the symptom)
-3. FIX           — What was/should be done?
-4. PREVENTION    — How to stop it happening again?
-5. LESSON        — What architectural knowledge does this generate?
-6. PATTERN       — What reusable pattern applies?
-7. DECISION RULE — When should this pattern be used in future?
+1. SYMPTOMS           — What was observed? (latency, errors, CPU, queries)
+2. ROOT CAUSE         — Why did it happen? (the real reason, not the symptom)
+3. BACK-OF-ENVELOPE   — Run the numbers: connection pool math, QPS, memory, latency budget
+                        (mandatory — quantify the blast radius before proposing a fix)
+4. FIX                — What was/should be done?
+5. PREVENTION         — How to stop it happening again?
+6. LESSON             — What architectural knowledge does this generate?
+7. PATTERN            — What reusable pattern applies?
+8. DECISION RULE      — When should this pattern be used in future?
+9. KNOWLEDGE CAPTURE  — Close the loop. Offer to:
+                        (a) Add incident to references/incident-log.md
+                        (b) Extract new pattern → references/patterns.md
+                        (c) Extract new rule  → references/decision-rules.md
+                        Never skip this step — an unlogged incident generates no reusable knowledge.
 ```
 
 > 📖 For real incident examples with full root cause, fix, before/after code, and results,
@@ -73,13 +93,14 @@ When analyzing a production problem or performance issue:
 
 When the user pastes code for review:
 
-1. **Detect technologies** — EF Core, Kafka, Go, PostgreSQL, API endpoint, ETL pipeline
+1. **Detect technologies** — EF Core, Kafka, Go, PostgreSQL, API endpoint, ETL pipeline, Async .NET
 2. **Run all matching checklists** — code often spans multiple technologies
-3. **Report every finding** with severity: 🚨 BLOCK / ⚠️ WARN / 💡 SUGGEST
-4. **End with a score** — PASS / PASS WITH WARNINGS / BLOCK — and one architectural lesson
+3. **Run BotE if hot-path** — if the method is on a read/write API endpoint or called under concurrency, calculate: `query_count × concurrent_requests × avg_hold_time_s` vs pool size before scoring
+4. **Report every finding** with severity: 🚨 BLOCK / ⚠️ WARN / 💡 SUGGEST
+5. **End with a score** — PASS / PASS WITH WARNINGS / BLOCK — and one architectural lesson
 
 > 📖 Read `references/review-checklists.md` for the full per-technology checklists
-> (EF Core, Kafka, Go, PostgreSQL, API endpoint, ETL) with exact patterns, risks, and fixes.
+> (EF Core, Async .NET, Kafka, Go, PostgreSQL, API endpoint, ETL, Distributed, Payment) with exact patterns, risks, and fixes.
 > Run ALL checklists that match. Never skip items.
 
 ---
@@ -89,10 +110,11 @@ When the user pastes code for review:
 When the user shares a system description, flow, or asks for an audit:
 
 1. **Identify system type** — Data Sync / ETL, Event-Driven / Kafka, API / Service, Background Worker, Distributed
-2. **Run all 7 core dimensions** — Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary
-3. **Run system-type specific checks** — additional items for ETL, Kafka, Workers
-4. **Score each dimension 1–5** and rank risks by likelihood × impact
-5. **Output**: risks list → scorecard → prioritised action plan → ADR and KOS recommendations
+2. **Run Back-of-Envelope first** — QPS, storage, concurrency ceiling, memory at peak load (mandatory before scoring)
+3. **Run all 7 core dimensions** — Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary
+4. **Run system-type specific checks** — additional items for ETL, Kafka, Workers
+5. **Score each dimension 1–5** and rank risks by likelihood × impact
+6. **Output**: BotE numbers → risks list → scorecard → prioritised action plan → ADR and KOS recommendations
 
 > 📖 Read `references/system-design-review.md` for the full 7-dimension checklist,
 > system-type specific extensions (ETL, Kafka, Worker), output format with scoring,
@@ -112,6 +134,8 @@ When NOT to:   [anti-conditions]
 Complexity:    Low / Medium / High
 Trade-offs:    Pros | Cons
 Your stack:    How this applies to .NET / Go / Kafka / PostgreSQL
+BotE Impact:   Before: [query count / latency / ceiling] → After: [new numbers]
+               Example: concurrency ceiling = pool_size ÷ (new_query_count × hold_time_s)
 Decision rule: [If X → use this | If Y → consider alternative]
 ```
 
@@ -122,11 +146,12 @@ Decision rule: [If X → use this | If Y → consider alternative]
 ```
 Context:          [What situation are we in?]
 Problem:          [What needs to be decided?]
+Scale (BotE):     [QPS, concurrency ceiling, memory, storage — numbers first, then options]
 Options:
-  A. [Option]     [Trade-offs]
-  B. [Option]     [Trade-offs]
+  A. [Option]     [Trade-offs] [BotE impact: latency / throughput / cost]
+  B. [Option]     [Trade-offs] [BotE impact: latency / throughput / cost]
 Decision:         [Which and why]
-Expected Outcome: [What should improve]
+Expected Outcome: [What should improve — with target numbers]
 Watch out for:    [Risks to monitor]
 ```
 
@@ -178,6 +203,7 @@ These non-negotiables should guide every recommendation:
 5. **Explicit Trade-offs** — Never recommend without acknowledging what you lose
 6. **Observability as Spec** — If you can't measure it, you can't fix it (Prometheus, structured logs)
 7. **Idempotency Always** — Retryable operations must be safe to repeat
+8. **Numbers Before Opinions** — Every design recommendation must be preceded by a Back-of-Envelope estimate. QPS, connection pool math, memory at peak concurrency, latency budget. A recommendation without numbers is a guess.
 
 ---
 
@@ -204,6 +230,7 @@ When the user asks about growth, progress, or what to focus on next:
 2. **Identify the highest-leverage gap** — not the longest list, the single most impactful next action
 3. **Connect to the competency map** — which of the 6 domains does this advance?
 4. **Give one concrete action** — specific enough to start today
+5. **Close the loop** — after identifying the next action, offer to update `assets/career-roadmap.md` with any evidence from work done in this session (incidents logged, ADRs written, runbooks generated, reviews led)
 
 > 📖 Read `assets/career-roadmap.md` for the full 6-domain competency map with current
 > evidence, gaps, and 2-year quarterly plan. Also contains the Progress Check Protocol
@@ -235,3 +262,40 @@ Token Bucket Rate Limiting, Consistent Hashing Ring, Fanout on Write, Fanout on 
 >
 > 📖 For distributed systems patterns with scale numbers and cross-system examples,
 > read `references/kos-system-design.md` (Pattern Records P1–P12, Knowledge Records K1–K24).
+
+---
+
+## 📂 Source Reference Library
+
+When the user asks about a specific system design topic, read the matching source PDF for scale numbers, design decisions, and trade-offs to ground your answer in concrete data.
+
+| Topic | Source file |
+|-------|-------------|
+| Back-of-envelope calculation, scale estimation | `sources/back-of-the-envelope-estimation.pdf` |
+| Scaling from zero: CDN, DB replication, sharding | `sources/scale-from-zero-to-millions-of-users.pdf` |
+| System design interview framework (general) | `sources/a-framework-for-system-design-interviews.pdf` |
+| Rate limiting (Token Bucket, Sliding Window) | `sources/design-a-rate-limiter.pdf` |
+| Consistent hashing, virtual nodes | `sources/design-consistent-hashing.pdf` |
+| Key-value store, replication, consistency | `sources/design-a-key-value-store.pdf` |
+| Distributed unique ID (Snowflake) | `sources/design-a-unique-id-generator-in-distributed-systems.pdf` |
+| URL shortening, hash collision | `sources/design-a-url-shortener.pdf` |
+| Web crawler, politeness, BFS | `sources/design-a-web-crawler.pdf` |
+| Push notifications, fanout | `sources/design-a-notification-system.pdf` |
+| Social news feed, fanout on write/read | `sources/design-a-news-feed-system.pdf` |
+| Chat system, WebSocket, presence | `sources/design-a-chat-system.pdf` |
+| Search autocomplete, trie | `sources/design-a-search-autocomplete-system.pdf` |
+| Video streaming, CDN, chunking | `sources/design-youtube.pdf` |
+| File sync, object storage, chunking | `sources/design-google-drive.pdf` |
+| Proximity search, Geohash, quadtree | `sources/design-proximity-service.pdf` |
+| Nearby friends, real-time location | `sources/nearby-friends.pdf` |
+| Routing, map tiles, ETA | `sources/google-maps.pdf` |
+| Distributed message queue (Kafka-like) | `sources/distributed-message-queue.pdf` |
+| Metrics, monitoring, alerting (Prometheus-like) | `sources/metrics-monitoring-and-alerting-system.pdf` |
+| Ad click event aggregation, time-series | `sources/ad-click-event-aggregation.pdf` |
+| Hotel/booking reservation, concurrency | `sources/hotel-reservation-system.pdf` |
+| Email service, queues, retry | `sources/distributed-email-service.pdf` |
+| Object/blob storage (S3-like) | `sources/s3-like-object-storage.pdf` |
+| Real-time leaderboard, Redis sorted sets | `sources/real-time-gaming-leaderboard.pdf` |
+| Payment processing, idempotency, PSP | `sources/payment-system.pdf` |
+| Digital wallet, double-entry, transfers | `sources/digital-wallet.pdf` |
+| Stock exchange, matching engine, event sourcing | `sources/stock-exchange.pdf` |
