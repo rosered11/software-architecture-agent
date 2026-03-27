@@ -3,7 +3,9 @@
 ## Resume session
 
 ```
-claude --resume e73d3473-25dc-401d-86b1-3877bbb165dc
+claude --resume e73d3473-25dc-401d-86b1-3877bbb165dc -> original
+
+claude --resume 59205c88-9daa-4811-8cfc-2a3f081af68a -> waiting path incident2
 ```
 
 ### Option 1 — Install the .skill file (Recommended)

@@ -22,9 +22,10 @@
 | **Title** | GetSubOrder API Latency Spike — Timeout Under High Concurrency |
 | **Severity** | High |
 | **System** | SubOrder Processing |
-| **Status** | Analysed — Fix Pending |
-| **Source File** | `target.cs` — `GetSubOrder()` (line 1) |
+| **Status** | Fixed — Applied 2026-03-27 |
+| **Source File** | `incident2.cs` — `GetSubOrder()` (line 1) |
 | **Date Identified** | 2026-03-25 |
+| **Date Fixed** | 2026-03-27 |
 
 ---
 
@@ -478,10 +479,14 @@ See `architecture-decision.md` for full ADR.
 | Type | Record |
 |------|--------|
 | **Knowledge** | N+1 Query Problem, Batch Query Pattern, EF Core Best Practices, Connection Pool Math, GC pressure from EF tracking |
+| **Knowledge (KOS)** | → K20: Idempotency in Distributed Systems — safe retry design applied to async redesign |
 | **Pattern** | Batch Query → `references/patterns.md` #1 |
 | **Pattern** | Eager Graph Loading → `references/patterns.md` #11 |
 | **Pattern** | Coordinator-Level Resolution (new) → `references/patterns.md` #12 |
+| **Pattern (KOS)** | → P7: Scatter-Gather — parallel async sub-queries replacing sequential calls; → P12: Dead Letter Queue — retry + fallback for failed sub-queries |
 | **Decision** | Eager load via Include() chain over lazy Entry().Load() on hot-path read methods |
 | **Decision** | Resolve canonical OrderId once at coordinator level — not inside each sub-call |
 | **Decision** | Option A (Batch Refactor) now, Option B (Async) as follow-up — see `architecture-decision.md` |
+| **Decision (KOS)** | — (no D1–D7 match; decisions were EF Core–specific, not architectural-level) |
 | **Tech Assets** | Stopwatch + GC instrumentation snippet, Prometheus histogram snippet, EF LogTo config snippet |
+| **Tech Assets (KOS)** | — (TA1–TA6 are distributed-systems patterns; EF Core assets not yet in KOS) |

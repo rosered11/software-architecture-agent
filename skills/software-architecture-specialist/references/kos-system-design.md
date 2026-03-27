@@ -51,6 +51,9 @@
 | P10 | [Snowflake ID Generation](#p10-snowflake-id-generation) | Distributed Systems |
 | P11 | [Hosted Payment Page](#p11-hosted-payment-page) | API Design |
 | P12 | [Dead Letter Queue (DLQ) with Reconciliation](#p12-dead-letter-queue-dlq-with-reconciliation) | Resilience |
+| P13 | [Saga Pattern](#p13-saga-pattern) | Resilience |
+| P14 | [Transactional Outbox](#p14-transactional-outbox) | Messaging |
+| P15 | [Idempotency Key](#p15-idempotency-key) | Resilience |
 
 ### Decision Log
 | # | Title |
@@ -179,8 +182,8 @@ Decision Rule:    Data correctness = money/safety? → CP
 Related Concepts: → Quorum Consensus (N, W, R)
                   → Vector Clocks
                   → Distributed Transactions
-Related Patterns: → Event Sourcing (AP with replay)
-                  → Saga (AP with compensation)
+Related Patterns:  → P6: Event Sourcing Pattern
+                  → P13: Saga Pattern
 Source:           System Design Interview Vol. 1, Chapters 6, 8
 ```
 
@@ -238,7 +241,7 @@ Decision Rule:    Static server count? → Simple mod-N hashing is fine
                   Need even distribution? → Use virtual nodes (100-200 per server)
 Related Concepts: → Database Sharding Strategies
                   → CAP Theorem
-Related Patterns: → P2: Consistent Hashing Ring
+Related Patterns:  → P2: Consistent Hashing Ring
 Source:           System Design Interview Vol. 1, Chapter 5
 ```
 
@@ -311,7 +314,7 @@ Decision Rule:    Need burst tolerance? → Token Bucket
                   High accuracy required? → Sliding Window Log
                   Scale + accuracy balance? → Sliding Window Counter
 Related Concepts: → Back-of-the-Envelope Estimation
-Related Patterns: → P1: Token Bucket Rate Limiting
+Related Patterns:  → P1: Token Bucket Rate Limiting
 Source:           System Design Interview Vol. 1, Chapter 4
 ```
 
@@ -372,7 +375,7 @@ Decision Rule:    Need sortable IDs without a central coordinator? → Snowflake
                   Need globally unique but don't care about order? → UUID v4
 Related Concepts: → Back-of-the-Envelope Estimation
                   → Database Sharding Strategies
-Related Patterns: → P10: Snowflake ID Generation
+Related Patterns:  → P10: Snowflake ID Generation
 Source:           System Design Interview Vol. 1, Chapter 7
 ```
 
@@ -588,7 +591,7 @@ Decision Rule:    Need simple range search with fixed precision? → Geohash
                   Need arbitrary polygon regions? → Google S2
 Related Concepts: → Consistent Hashing
                   → Back-of-the-Envelope Estimation
-Related Patterns: → P9: Geohash Bucketing
+Related Patterns:  → P9: Geohash Bucketing
 Source:           System Design Interview Vol. 2, Chapters on Proximity Service, Nearby Friends
 ```
 
@@ -645,7 +648,7 @@ Decision Rule:    Financial system with audit requirements? → Event sourcing m
 Related Concepts: → CAP Theorem
                   → Distributed Transactions
                   → Message Queue Internals
-Related Patterns: → P6: Event Sourcing Pattern
+Related Patterns:  → P6: Event Sourcing Pattern
                   → P8: Write-Ahead Log
 Source:           System Design Interview Vol. 2, Chapters on Digital Wallet, Stock Exchange
 ```
@@ -713,7 +716,7 @@ Decision Rule:    Single DB (even if multiple services use it)? → DB transacti
 Related Concepts: → CAP Theorem
                   → Event Sourcing
                   → Idempotency in Distributed Systems
-Related Patterns: → Saga (patterns.md #4)
+Related Patterns:  → P13: Saga Pattern
                   → P8: Write-Ahead Log
 Source:           System Design Interview Vol. 2, Chapters on Payment, Digital Wallet, Hotel Reservation
 ```
@@ -780,7 +783,8 @@ Decision Rule:    Latency requirement < 1 minute? → Stream processing
                   Ad click / financial event aggregation? → Kappa with watermarking
 Related Concepts: → Message Queue Internals
                   → Event Sourcing
-Related Patterns: → Staging → Validate → Apply (patterns.md #7)
+Related Patterns:  → P8: Write-Ahead Log (WAL)
+                  → P12: Dead Letter Queue (late events + DLQ)
 Source:           System Design Interview Vol. 2, Chapter on Ad Click Event Aggregation
 ```
 
@@ -836,7 +840,7 @@ Decision Rule:    Social platform with celebrities (some users >> followers)? �
                   Low DAU, mostly read-heavy? → Pull
 Related Concepts: → CDN Strategy
                   → CAP Theorem
-Related Patterns: → P3, P4, P5: Fanout patterns
+Related Patterns:  → P3, P4, P5: Fanout patterns
 Source:           System Design Interview Vol. 1, Chapter 11 (News Feed)
 ```
 
@@ -1157,8 +1161,8 @@ Decision Rule:    Financial events (payment, order)? → ack=all + min.insync.re
 Related Concepts: → Stream vs Batch Processing
                   → Event Sourcing
                   → Retry + DLQ (patterns.md #5)
-Related Patterns: → Outbox (patterns.md #2)
-                  → Competing Consumers (patterns.md #10)
+Related Patterns:  → P14: Transactional Outbox
+                  → P12: Dead Letter Queue (DLQ) with Reconciliation
 Source:           System Design Interview Vol. 2, Chapter on Distributed Message Queue
 ```
 
@@ -1280,8 +1284,8 @@ Decision Rule:    Payment or order creation? → Client-generated idempotency ke
                   State machine transition? → Conditional update (most robust)
 Related Concepts: → Distributed Transactions
                   → Message Queue Internals
-Related Patterns: → Idempotency Key (patterns.md #6)
-                  → Retry + DLQ (patterns.md #5)
+Related Patterns:  → P15: Idempotency Key
+                  → P12: Dead Letter Queue (DLQ) with Reconciliation
 Source:           System Design Interview Vol. 2, Payment System, Hotel Reservation
 ```
 
@@ -1556,7 +1560,7 @@ When to Use:      Any public or partner-facing API
 When NOT to Use:  Strict constant-rate requirement (use Leaking Bucket)
                   Fine-grained per-operation rate limiting (use different strategies per endpoint)
 Complexity:       Low
-Based on Knowledge: → Rate Limiting Algorithms (K4)
+Based on Knowledge:  → Rate Limiting Algorithms (K4)
 Used in Decisions:  → D5: Rate limiter algorithm selection
 Related Tech Assets:→ Redis INCR + EXPIRE pattern
 ```
@@ -1580,7 +1584,7 @@ When to Use:      Distributed cache with dynamic node count (autoscaling)
 When NOT to Use:  Fixed, static number of servers (mod-N is simpler)
                   When exact key distribution control is needed
 Complexity:       Medium
-Based on Knowledge: → Consistent Hashing (K3)
+Based on Knowledge:  → Consistent Hashing (K3)
 Related Tech Assets:→ Sorted map / BST implementation of ring
 ```
 
@@ -1601,7 +1605,7 @@ When to Use:      Users have bounded follower counts (< 10K)
 When NOT to Use:  User has millions of followers (celebrity problem)
                   Most users are inactive (wastes write operations on inactive feed caches)
 Complexity:       Medium
-Based on Knowledge: → Fanout Strategies (K13)
+Based on Knowledge:  → Fanout Strategies (K13)
                     → CDN Strategy & Cache Layers (K15)
 Used in Decisions:  → D2: Real-time connection strategy
 ```
@@ -1625,7 +1629,7 @@ When to Use:      Users have very high follower counts (celebrities)
 When NOT to Use:  High-frequency feed reads (too many N calls per read)
                   Users follow many active users (fan-in too large at read time)
 Complexity:       Low (write path) / High (read path)
-Based on Knowledge: → Fanout Strategies (K13)
+Based on Knowledge:  → Fanout Strategies (K13)
 ```
 
 ---
@@ -1647,7 +1651,7 @@ When to Use:      Social platform with power-law follower distribution
                   Optimization needed at scale
 When NOT to Use:  Uniform follower distribution (either pure push or pull is simpler)
 Complexity:       High (dual path + classification logic + feed merge)
-Based on Knowledge: → Fanout Strategies (K13)
+Based on Knowledge:  → Fanout Strategies (K13)
                     → CDN Strategy & Cache Layers (K15)
 ```
 
@@ -1673,7 +1677,7 @@ When NOT to Use:  Simple CRUD with no audit/replay requirement (over-engineering
                   Real-time writes where event schema evolution is unmanageable
                   Small systems where snapshot + versioned DB is sufficient
 Complexity:       High
-Based on Knowledge: → Event Sourcing (K10)
+Based on Knowledge:  → Event Sourcing (K10)
                     → Message Queue Internals (K18)
 Related Tech Assets:→ Append-only event table schema
                     → Snapshot + replay recovery pattern
@@ -1698,7 +1702,7 @@ When to Use:      Top-K queries across sharded data (leaderboard, trending topic
 When NOT to Use:  Query can be routed to single shard (use direct routing instead)
                   N shards is too large (latency = max shard latency + merge time)
 Complexity:       Medium
-Based on Knowledge: → Database Sharding Strategies (K16)
+Based on Knowledge:  → Database Sharding Strategies (K16)
                     → Consistent Hashing (K3)
 ```
 
@@ -1721,7 +1725,7 @@ When to Use:      Any system with in-memory state that must survive crashes
 When NOT to Use:  Stateless systems (no state to restore)
                   Systems where replay would take too long (use snapshots + short WAL)
 Complexity:       Medium
-Based on Knowledge: → Event Sourcing (K10)
+Based on Knowledge:  → Event Sourcing (K10)
                     → LSM Tree & SSTables (K17)
 ```
 
@@ -1745,7 +1749,7 @@ When to Use:      Nearby search (restaurants, drivers, events)
 When NOT to Use:  Very high update frequency (e.g., moving vehicles — use quadtree or H3)
                   Need irregular region shapes (use Google S2)
 Complexity:       Low
-Based on Knowledge: → Geospatial Indexing (K9)
+Based on Knowledge:  → Geospatial Indexing (K9)
 ```
 
 ---
@@ -1769,7 +1773,7 @@ When NOT to Use:  Need strictly sequential IDs (use DB sequence)
                   Machine count exceeds 1,024 (expand machine bits)
                   Clock synchronization is unreliable (consider ULID instead)
 Complexity:       Low
-Based on Knowledge: → Distributed Unique ID Generation (K5)
+Based on Knowledge:  → Distributed Unique ID Generation (K5)
 ```
 
 ---
@@ -1792,7 +1796,7 @@ When to Use:      Any system processing credit card payments
 When NOT to Use:  Need fully custom payment UI (use PSP's JavaScript SDK instead)
                   Enterprise with existing PCI-DSS compliance (direct API may be better)
 Complexity:       Low
-Based on Knowledge: → Idempotency in Distributed Systems (K20)
+Based on Knowledge:  → Idempotency in Distributed Systems (K20)
                     → Double-Entry Ledger System (K23)
 ```
 
@@ -1817,9 +1821,117 @@ When to Use:      Any Kafka consumer processing financial or critical events
                   Any system where missed messages need audit trail
 When NOT to Use:  Non-critical events where loss is acceptable (discard instead of DLQ)
 Complexity:       Low–Medium
-Based on Knowledge: → Message Queue Internals (K18)
+Based on Knowledge:  → Message Queue Internals (K18)
                     → Idempotency in Distributed Systems (K20)
-Related Patterns: → Retry + DLQ (patterns.md #5)
+Related Patterns:  → P15: Idempotency Key
+```
+
+---
+
+### P13: Saga Pattern
+
+```
+Name:             Saga Pattern
+Category:         Resilience
+Problem:          How to maintain data consistency across multiple services without a
+                  distributed lock or 2PC, which blocks on coordinator failure?
+Solution:         Break a long-running transaction into a sequence of local transactions,
+                  each publishing an event. On failure, execute compensating transactions
+                  in reverse to undo committed steps.
+
+                  CHOREOGRAPHY SAGA:
+                  Each service listens for events and publishes its own.
+                  No central coordinator — each service knows what to do next.
+                  Pro: Loose coupling. Con: Hard to visualize the overall flow.
+
+                  ORCHESTRATION SAGA:
+                  A central orchestrator sends commands to each service and awaits replies.
+                  Pro: Easy to trace full flow. Con: Orchestrator is a SPOF / bottleneck.
+
+                  COMPENSATING TRANSACTIONS:
+                  Every step must have a defined compensation (undo) action.
+                  Example (payment):
+                    Step 1: ReserveBalance → Compensation: ReleaseBalance
+                    Step 2: ChargeCard     → Compensation: RefundCard
+                    Step 3: UpdateLedger  → Compensation: ReverseLedgerEntry
+
+When to Use:      Multi-service workflows where each service has a local DB
+                  Eventually consistent outcomes are acceptable
+                  Payment, order fulfillment, booking workflows
+When NOT to Use:  Single DB (use local ACID transaction instead)
+                  Strong consistency required between services at commit time
+Complexity:       High (compensation logic per step + idempotency required)
+Based on Knowledge:  → Distributed Transactions — 2PC, Saga, TC/C (K11)
+                    → Idempotency in Distributed Systems (K20)
+```
+
+---
+
+### P14: Transactional Outbox
+
+```
+Name:             Transactional Outbox
+Category:         Messaging
+Complexity:       Medium
+Problem:          How to guarantee that a domain event is published to a message broker
+                  if and only if the corresponding database write succeeds? Direct publish
+                  after DB commit can lose events on crash between the two operations.
+Solution:         1. Within the same DB transaction: write business data AND insert an
+                     "outbox" event record into an outbox table
+                  2. A separate relay process (poller or CDC) reads the outbox table
+                     and publishes unpublished events to Kafka/queue
+                  3. On successful publish, mark event as published (or delete row)
+
+                  Schema:
+                    outbox (id, aggregate_type, aggregate_id, event_type,
+                            payload JSONB, created_at, published_at)
+
+                  Relay options:
+                  - Polling relay: SELECT WHERE published_at IS NULL every N seconds
+                  - CDC (Debezium): read DB WAL, zero-poll latency, no extra queries
+
+When to Use:      Any write that must atomically produce a Kafka/queue event
+                  Payments, orders, inventory changes with event sourcing
+When NOT to Use:  Event loss is acceptable (fire-and-forget metrics/logs)
+Complexity:       Medium (outbox table + relay process or CDC setup)
+Based on Knowledge:  → Message Queue Internals — WAL, Partitions, ISR (K18)
+                    → Event Sourcing (K10)
+```
+
+---
+
+### P15: Idempotency Key
+
+```
+Name:             Idempotency Key
+Category:         Resilience
+Problem:          How to safely retry a mutating operation (payment, order creation)
+                  without duplicating its effect when retries happen due to network
+                  timeouts or at-least-once delivery?
+Solution:         1. Client generates a UUID per logical operation attempt
+                  2. Client sends the UUID in a header (e.g., Idempotency-Key)
+                  3. Server checks the key in an idempotency_keys table before processing
+                  4. If found: return the cached result immediately (no re-processing)
+                  5. If not found: process, store result with key, return result
+                  6. Key expires after a safe window (e.g., 24–48 hours)
+
+                  Schema:
+                    idempotency_keys (key VARCHAR PK, result JSONB,
+                                      created_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)
+
+                  Variant — DB constraint approach:
+                  - UNIQUE constraint on natural key (order_id, payment_id)
+                  - Duplicate insert raises constraint violation
+                  - Application catches violation and returns existing record
+
+When to Use:      Any API endpoint that creates or mutates financial/critical data
+                  Kafka consumers processing payment or order events
+                  Any operation exposed to retries
+When NOT to Use:  Read-only endpoints (already idempotent by nature)
+                  Extremely high-volume non-critical events (use DB constraint instead)
+Complexity:       Low (one extra table + pre-process key lookup)
+Based on Knowledge:  → Idempotency in Distributed Systems (K20)
+                    → Distributed Transactions — 2PC, Saga, TC/C (K11)
 ```
 
 ---
@@ -1863,6 +1975,9 @@ Rules:
   Document search?                        → Elasticsearch
   Object/file storage?                    → S3/Blob (not a DB)
   Financial ledger (audit + ACID)?        → Relational + Event Sourcing
+Related Knowledge:  → Database Sharding Strategies (K16)
+                   → LSM Tree & SSTables (K17)
+                   → Time-Series Database Design (K22)
 Date:             Derived from System Design Interview Vol. 1 & 2
 ```
 
@@ -1895,6 +2010,7 @@ Rules:
   Infrequent server push (file sync, notifications)? → Long Polling
   Live one-way feed (stock tickers, scores)? → SSE
   Simple polling acceptable (> 1 second interval)? → Short Polling
+Related Knowledge:  → WebSocket vs HTTP Polling vs Long Polling (K14)
 Date:             Derived from System Design Interview Vol. 1 & 2 (Chat, Nearby Friends, Maps)
 ```
 
@@ -1923,6 +2039,7 @@ Rules:
   Cold data (accessed < monthly)?               → Erasure coding (4+2)
   Storage cost is primary constraint?            → Erasure coding
   Fast recovery / simple operations?             → Replication
+Related Knowledge:  → Erasure Coding vs Replication (K19)
 Date:             Derived from System Design Interview Vol. 2, S3-like Object Storage
 ```
 
@@ -1959,6 +2076,10 @@ Rules:
   Financial payment across multiple services?     → TC/C + idempotency + reconciliation
   Complex multi-step workflow?                    → Orchestration Saga
   Strict ACID across few resources?               → 2PC (accept blocking risk)
+Related Knowledge:  → Distributed Transactions — 2PC, Saga, TC/C (K11)
+                   → Idempotency in Distributed Systems (K20)
+Related Pattern:   → P13: Saga Pattern
+                   → P15: Idempotency Key
 Date:             Derived from System Design Interview Vol. 2, Payment System, Hotel Reservation, Digital Wallet
 ```
 
@@ -1984,6 +2105,8 @@ Rules:
   Simple per-minute quotas?                 → Fixed Window Counter
   High accuracy needed?                     → Sliding Window Log
   Balance accuracy + memory at scale?       → Sliding Window Counter
+Related Knowledge:  → Rate Limiting Algorithms (K4)
+Related Pattern:   → P1: Token Bucket Rate Limiting
 Date:             Derived from System Design Interview Vol. 1, Chapter 4
 ```
 
@@ -2008,6 +2131,8 @@ Rules:
   Need random non-guessable IDs?               → UUID v4
   Need strictly sequential?                    → DB sequence (accept single server)
   Clocks unreliable?                           → ULID (monotonic without strict NTP)
+Related Knowledge:  → Distributed Unique ID Generation — Snowflake (K5)
+Related Pattern:   → P10: Snowflake ID Generation
 Date:             Derived from System Design Interview Vol. 1, Chapter 7
 ```
 
@@ -2034,6 +2159,8 @@ Rules:
   Short-lived jobs / serverless?             → Push model
   Strict firewall (can't expose ports)?      → Push model
   Need health check as side effect?          → Pull model
+Related Knowledge:  → Message Queue Internals — WAL, Partitions, ISR (K18)
+                   → Stream vs Batch Processing (K12)
 Date:             Derived from System Design Interview Vol. 2, Metrics Monitoring System
 ```
 
@@ -2085,8 +2212,8 @@ func (s *Snowflake) NextID() int64 {
     return (now-epoch)<<22 | s.machineID<<12 | s.sequence
 }
 
-Related Knowledge:→ Distributed Unique ID Generation (K5)
-Related Pattern:  → P10: Snowflake ID Generation
+Related Knowledge:  → Distributed Unique ID Generation (K5)
+Related Pattern:   → P10: Snowflake ID Generation
 ```
 
 ---
@@ -2123,8 +2250,8 @@ else
     return 0  -- rejected
 end
 
-Related Knowledge:→ Rate Limiting Algorithms (K4)
-Related Pattern:  → P1: Token Bucket Rate Limiting
+Related Knowledge:  → Rate Limiting Algorithms (K4)
+Related Pattern:   → P1: Token Bucket Rate Limiting
 ```
 
 ---
@@ -2158,8 +2285,8 @@ LIMIT 20;
 -- Index:
 CREATE INDEX idx_businesses_geohash ON businesses (geohash_6);
 
-Related Knowledge:→ Geospatial Indexing (K9)
-Related Pattern:  → P9: Geohash Bucketing
+Related Knowledge:  → Geospatial Indexing (K9)
+Related Pattern:   → P9: Geohash Bucketing
 ```
 
 ---
@@ -2194,8 +2321,8 @@ CREATE INDEX idx_idempotency_created ON idempotency_keys (created_at);
 -- Cleanup job (run daily):
 DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours';
 
-Related Knowledge:→ Idempotency in Distributed Systems (K20)
-Related Pattern:  → Idempotency Key (patterns.md #6)
+Related Knowledge:  → Idempotency in Distributed Systems (K20)
+Related Pattern:   → Idempotency Key (patterns.md #6)
                   → P12: Dead Letter Queue with Reconciliation
 ```
 
@@ -2243,9 +2370,9 @@ COMMIT;
 
 -- Invariant check: SUM(amount) = 0 for any transaction_id
 
-Related Knowledge:→ Double-Entry Ledger System (K23)
+Related Knowledge:  → Double-Entry Ledger System (K23)
                   → Idempotency in Distributed Systems (K20)
-Related Pattern:  → P6: Event Sourcing Pattern
+Related Pattern:   → P6: Event Sourcing Pattern
 ```
 
 ---
@@ -2296,8 +2423,8 @@ func hashKey(key string) int {
     return int(h[0])<<24 | int(h[1])<<16 | int(h[2])<<8 | int(h[3])
 }
 
-Related Knowledge:→ Consistent Hashing (K3)
-Related Pattern:  → P2: Consistent Hashing Ring
+Related Knowledge:  → Consistent Hashing (K3)
+Related Pattern:   → P2: Consistent Hashing Ring
 ```
 
 ---
