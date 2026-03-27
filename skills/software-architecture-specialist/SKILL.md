@@ -158,6 +158,12 @@ When the user wants to capture knowledge into their Notion workspace:
 > It covers all 5 databases (Incident, Knowledge, Pattern, Decision Log, Tech Assets)
 > with field definitions, filled examples from GetSubOrder, relation wiring cheatsheet,
 > and output format rules. Always generate the full record — never partial fills.
+>
+> 📖 Read `references/kos-system-design.md` for the pre-built KOS extracted from 37 system
+> design source PDFs. Contains 24 Knowledge records (K1–K24), 12 Pattern records (P1–P12),
+> 7 Decision Logs (D1–D7), and 6 Tech Assets (TA1–TA6) covering distributed systems,
+> scalability, real-time, financial systems, and storage design. Use these as reference
+> when guiding the user on any of those domains.
 
 ---
 
@@ -218,7 +224,14 @@ When the user asks about growth, progress, or what to focus on next:
 
 ## 📎 Common Patterns Reference
 
-Available patterns: Batch Query, Outbox, CQRS, Saga, Retry + DLQ, Idempotency Key, Staging → Validate → Apply, Repository, Circuit Breaker, Competing Consumers, Eager Graph Loading, Coordinator-Level Resolution.
+**Stack patterns** (EF Core / Go / Kafka / PostgreSQL):
+Batch Query, Outbox, CQRS, Saga, Retry + DLQ, Idempotency Key, Staging → Validate → Apply, Repository, Circuit Breaker, Competing Consumers, Eager Graph Loading, Coordinator-Level Resolution, Bulk Load Then Map
+
+**Distributed systems patterns** (from KOS system design sources):
+Token Bucket Rate Limiting, Consistent Hashing Ring, Fanout on Write, Fanout on Read, Hybrid Fanout, Event Sourcing, Scatter-Gather, Write-Ahead Log, Geohash Bucketing, Snowflake ID Generation, Hosted Payment Page, DLQ with Reconciliation
 
 > 📖 When Pattern Guidance mode is triggered, read `references/patterns.md` for full detail:
 > problem, solution, when to use / not use, trade-offs, code examples for .NET / Go / Kafka / PostgreSQL, and decision rules.
+>
+> 📖 For distributed systems patterns with scale numbers and cross-system examples,
+> read `references/kos-system-design.md` (Pattern Records P1–P12, Knowledge Records K1–K24).

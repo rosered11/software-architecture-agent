@@ -490,3 +490,320 @@ Kafka consumer lag > 10000         → critical
 - Is there a baseline measurement to compare this change against?
 - What is the connection pool math at expected peak concurrency?
 ```
+
+---
+
+## Distributed Systems — CAP & Consistency
+
+```
+Data correctness = money / safety (inventory, payment, booking)?
+  → CP system: refuse to respond during partition, never serve stale data
+  → Use: PostgreSQL/MySQL with ACID, ZooKeeper, 2PC
+
+User experience > strict correctness (social feed, notifications, analytics)?
+  → AP system: return possibly stale data during partition
+  → Use: Cassandra, DynamoDB, Redis (eventual consistency)
+
+Multi-region active-active?
+  → AP with conflict resolution (vector clocks, LWW, CRDT)
+  → Never 2PC across regions (too slow, too fragile)
+```
+
+```
+Quorum configuration (N replicas, W write quorum, R read quorum):
+Strong consistency:   W + R > N  (e.g. N=3, W=2, R=2)
+Fast reads:           R=1, W=N
+Fast writes:          W=1, R=N
+Balanced production:  N=3, W=2, R=2  ← default for most systems
+
+Financial/inventory?  → N=3, W=2, R=2 (balanced + consistent)
+Social/analytics?     → W=1, R=1 (fast, eventual)
+Audit log?            → W=N, R=1 (write to all, fast read)
+```
+
+```
+Conflict resolution strategy:
+Shopping cart / collaborative doc?  → CRDT or client-merge
+Financial transaction?              → TC/C + Saga (never LWW — too lossy)
+Key-value store (eventual OK)?      → Vector clocks + LWW
+```
+
+---
+
+## Distributed Systems — Consistent Hashing
+
+```
+Static server count (never changes)?  → Simple mod-N hashing
+Dynamic server count (autoscale)?     → Consistent hashing
+Need even distribution across nodes?  → Virtual nodes: 100–200 per physical server
+Standard deviation target:            → 5–10% with 100–200 virtual nodes
+```
+
+```
+Key remapping on topology change:
+Traditional mod-N:    ~all keys remapped on any server change
+Consistent hashing:   k/n keys remapped (k=total keys, n=total slots)
+```
+
+---
+
+## Distributed Systems — ID Generation
+
+```
+Need time-sortable 64-bit IDs, distributed, no coordination?
+  → Snowflake (41-bit timestamp + 5-bit DC + 5-bit machine + 12-bit sequence)
+  → 4,096 IDs/ms per machine, 69-year range, requires NTP
+
+Need random non-guessable IDs?
+  → UUID v4 (128-bit, no coordination, not sortable)
+
+Need strictly sequential, single-server?
+  → DB auto-increment (PostgreSQL SERIAL / MySQL AUTO_INCREMENT)
+
+Clock synchronization unreliable?
+  → ULID (monotonic, base32, UUID-compatible, no strict NTP)
+
+Max throughput per Snowflake node:
+  → 4,096 IDs/millisecond = 4.096M IDs/second per machine
+```
+
+---
+
+## Distributed Systems — Distributed Transactions
+
+```
+All operations in one DB?
+  → Local DB transaction (ACID) — no distributed mechanism needed
+
+Cross-service, 2–3 services, loss-tolerant with rollback?
+  → Choreography Saga + idempotency keys
+  → Each service emits event on success, compensates on failure
+
+Cross-service, complex multi-step with strict rollback?
+  → Orchestration Saga (central orchestrator coordinates steps)
+
+Financial payment across services with strict atomicity?
+  → TC/C (Try-Confirm/Cancel) + idempotency + end-of-day reconciliation
+
+Strict ACID across few resources (2–3 DBs), latency acceptable?
+  → 2PC (accept blocking on coordinator failure)
+
+Rule: never use 2PC across datacenters — network partition makes it deadlock
+```
+
+---
+
+## Rate Limiting
+
+```
+Algorithm selection:
+  General API, burst acceptable?           → Token Bucket (most widely used)
+  Stable constant processing rate?         → Leaking Bucket
+  Simple per-minute quota?                 → Fixed Window Counter
+  High accuracy required?                  → Sliding Window Log (high memory)
+  Scale + accuracy balance?                → Sliding Window Counter (~0.003% error)
+
+Token Bucket parameters:
+  bucket_size   = max burst allowed (e.g. 20 requests)
+  refill_rate   = sustained rate (e.g. 10 req/sec)
+  Start with:   bucket_size = 2× refill_rate
+
+Rate limit key selection:
+  Per user/API key?     → most common, protects against single client abuse
+  Per resource (order)? → when one order being hammered is the bottleneck
+  Per IP?               → edge/public APIs before auth
+
+Storage: Redis (INCR + EXPIRE or Lua script for atomicity)
+Response: HTTP 429 Too Many Requests + Retry-After header
+```
+
+---
+
+## Real-Time Connections
+
+```
+Connection type selection:
+  Bidirectional, low latency (chat, location, collaborative editing)?
+    → WebSocket (full-duplex, persistent TCP)
+
+  One-way server push, infrequent updates (file sync, order status)?
+    → Long Polling (HTTP-based, simpler, less overhead)
+
+  One-way continuous feed (stock tickers, live scores)?
+    → Server-Sent Events (SSE) — HTTP-based, auto-reconnect
+
+  Periodic check, low frequency (> 5 second interval)?
+    → Short Polling (simple, stateless)
+
+WebSocket memory budget:
+  Each connection: ~10KB server RAM
+  100K connections: ~1GB RAM
+  1M connections:  ~10GB RAM
+  Plan connection servers: 100K–1M connections per server instance
+
+WebSocket scaling: sticky sessions OR shared routing via Redis Pub/Sub
+  If WebSocket servers are stateless → use Redis Pub/Sub for message routing
+  If stateful → use service discovery (ZooKeeper/etcd) + consistent hashing
+```
+
+---
+
+## Caching — Enhanced (CDN + Distributed)
+
+```
+When to use CDN:
+  Static assets (HTML, CSS, JS, images, video)?  → CDN mandatory
+  Map tiles, precomputed content?                → CDN (pull model)
+  Dynamic API responses?                         → CDN only with explicit Cache-Control
+  Popular vs long-tail content (YouTube rule):
+    → Top 20% content → CDN
+    → Bottom 80% (long-tail) → origin only (CDN cost not justified)
+
+CDN cost signal: CDN egress ~$0.02–0.08/GB
+  If CDN monthly bill > Redis cluster bill → review what you're caching on CDN
+
+Cache layer selection:
+  Global static content?                  → CDN edge nodes
+  Session / auth tokens?                  → Redis (5–15 min TTL)
+  Hot read data, rarely changes?          → Redis (1 hour TTL)
+  Order / payment status?                 → Do not cache OR ≤ 30s TTL + event invalidation
+  Reference data (categories, config)?    → Redis (1–24 hour TTL)
+
+Cache invalidation strategy:
+  Write-through:  update cache on every write → consistent, higher write cost
+  TTL expiry:     simple, acceptable staleness for non-critical data
+  Event-driven:   Kafka event → invalidate cache key → most accurate for distributed systems
+  CDC (Debezium): watch DB changes → auto-invalidate → good for cache-DB sync
+
+Hot key / celebrity problem:
+  Condition: one cache key receives >> traffic than average
+  Detection: cache hit rate drops on specific keys despite high overall hit rate
+  Fix: replicate hot key to multiple shards + add random suffix (key_1, key_2)
+       or serve from client-side cache (short TTL in memory)
+```
+
+---
+
+## Storage Strategy
+
+```
+Replication vs Erasure Coding:
+  Hot data (accessed daily)?                    → 3× replication
+  Warm data (accessed weekly)?                  → 3× replication or hybrid
+  Cold data (accessed monthly or less)?         → Erasure coding 4+2 (50% overhead vs 200%)
+  Storage cost is primary constraint?           → Erasure coding
+  Fast recovery required?                       → 3× replication
+  Hybrid (best of both):                        → Replicate hot, erasure-code cold
+
+Durability comparison:
+  3× replication (4+2 erasure):
+  Both survive 2 simultaneous node failures
+  3× overhead: 200% | 4+2 overhead: 50%
+  3× recovery: fast (copy) | 4+2 recovery: slow (reconstruct)
+
+Database type by workload:
+  ACID + complex joins + bounded scale?         → PostgreSQL / MySQL
+  High-volume time series (metrics, IoT)?       → InfluxDB / Prometheus (10–100× faster)
+  Chat / messaging (time-sorted access)?        → Cassandra / HBase (wide-column)
+  Cache + session + leaderboard?                → Redis
+  Full-text / document search?                  → Elasticsearch
+  Object / file storage?                        → S3 / Blob (not a DB)
+  Financial ledger (audit + ACID)?              → PostgreSQL + Event Sourcing
+  High-write key-value at scale?                → DynamoDB / Cassandra
+
+LSM Tree vs B-Tree:
+  Write-heavy (events, logs, time series)?      → LSM-based DB (Cassandra, RocksDB, InfluxDB)
+  Read-heavy with complex queries?              → B-Tree DB (PostgreSQL, MySQL)
+  Both?                                         → CQRS: LSM for write, B-Tree read model
+```
+
+---
+
+## Geospatial Indexing
+
+```
+Algorithm selection:
+  Nearby search, simple range, fixed precision?  → Geohash (string prefix + 8 neighbors)
+  Density-aware, variable precision?             → Quadtree (dynamic subdivision)
+  Arbitrary polygon regions?                     → Google S2
+
+Geohash precision levels:
+  Level 4: ~39km × 20km (city-scale)
+  Level 5: ~4.9km × 4.9km (neighborhood-scale)
+  Level 6: ~1.2km × 609m (block-scale)  ← most common for "nearby" search
+
+Geohash search pattern:
+  1. Convert user location to geohash at chosen precision
+  2. Compute 8 neighboring cells
+  3. Query WHERE geohash_col = ANY(9 cells)
+  4. Filter by haversine distance
+  5. If insufficient results → expand to one precision level lower
+
+Index: CREATE INDEX ON businesses(geohash_6) — regular string index, O(log n) lookup
+Boundary problem: always check all 8 neighbors, not just the center cell
+```
+
+---
+
+## Financial Systems
+
+```
+Double-entry ledger rule:
+  Any monetary transfer?  → double-entry ledger mandatory
+  Balance query?          → SUM of ledger entries (never store mutable balance only)
+  Currency storage?       → integer cents (never float — floating point is lossy)
+  Deletion of entries?    → NEVER — append-only, immutable audit trail
+
+Idempotency in payments:
+  Every payment attempt?  → client-generated UUID idempotency_key required
+  Retry window?           → idempotency key TTL: 24–48 hours
+  Duplicate detection?    → check key before processing, store result with key
+  Kafka payment event?    → deduplication table with event_id + TTL
+
+PCI-DSS scope:
+  Team handles raw card data?  → PCI-DSS Level 1 audit required (expensive)
+  Use PSP hosted page?         → PCI scope eliminated (Stripe / PayPal tokenize for you)
+  Rule: always use hosted payment page unless you have a dedicated compliance team
+
+Reconciliation:
+  Financial system?  → end-of-day reconciliation mandatory
+  Compare: internal ledger total vs PSP settlement file
+  Any discrepancy?   → alert immediately, treat as incident
+
+Event sourcing for finance:
+  Financial audit trail required?   → Event sourcing mandatory
+  Temporal queries ("balance at T")? → Event sourcing mandatory
+  Simple balance counter?            → regular DB update is sufficient
+```
+
+---
+
+## Scalability Thresholds (Back-of-Envelope Reference)
+
+```
+QPS estimation formula:
+  QPS = DAU × actions_per_day / 86,400
+
+Key latency targets:
+  < 100ms  → good (green)
+  100–300ms → acceptable under load
+  300–900ms → degraded, investigate
+  > 900ms  → incident level, page on this
+
+When to add caching:     QPS > 1,000 reads on same data
+When to shard:           Storage > 1 TB OR write QPS > 5,000 on single node
+When to add CDN:         Static assets > 100MB OR users in multiple continents
+When to add message queue: Producer throughput ≠ consumer throughput (mismatch)
+When to go async:        Connection hold time × concurrent requests > 80% of pool size
+
+Storage estimation:
+  100M users × 10 actions/day × 100 bytes = 100GB/day
+  1B events/day × 1KB = 1TB/day
+  Video (300MB avg) × 5M uploads/day = 1.5PB/day
+
+Availability → downtime budget:
+  99%    → 3.65 days/year (not acceptable for production)
+  99.9%  → 8.7 hours/year (acceptable for internal tools)
+  99.99% → 52.6 min/year (target for customer-facing)
+  99.999%→ 5.26 min/year (financial / payments target)
+```

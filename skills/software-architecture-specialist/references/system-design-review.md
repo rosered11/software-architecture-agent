@@ -20,8 +20,10 @@
    - API / Service Layer
    - Background Worker / Batch Job
    - Distributed Transaction / Multi-service Flow
+   - Real-time / Stateful Connection System (WebSocket, live location, chat)
+   - Financial / Payment System (payments, ledger, wallets, reconciliation)
 
-2. **Run every applicable review section** for the system type(s)
+2. **Run every applicable review section** for the system type(s) — including system-type-specific sections at the bottom
 
 3. **Score each dimension** 1–5:
    - 5 = Strong, no concerns
@@ -385,6 +387,96 @@ Additional checks:
 [ ] Job failure leaves system in a recoverable state
     Risk: Half-run job leaves data in an intermediate state with no recovery path
     Check: Is there a rollback or cleanup procedure for failed runs?
+```
+
+---
+
+### Real-Time / Stateful Connection System
+
+Additional checks for systems using WebSocket, SSE, long polling, or persistent connections:
+
+```
+[ ] Connection protocol is appropriate for the use case
+    Risk: Using polling when WebSocket is needed = high latency or wasted requests
+    Check (patterns.md #16–18 / K14):
+      Bidirectional, low latency (chat, location)?  → WebSocket
+      One-way push, infrequent (notifications)?     → Long Polling or SSE
+      Periodic pull, > 5s interval?                 → Short Polling
+
+[ ] Connection memory budget is calculated
+    Risk: 1M connections × 10KB/connection = 10GB RAM — server OOM
+    Check: connections_per_server × 10KB < available_RAM - headroom
+    Plan: 100K–1M connections per WebSocket server instance
+
+[ ] WebSocket server scaling strategy is defined
+    Risk: Sticky sessions or a pub/sub router is needed — standard load balancer doesn't route by connection
+    Check: Are sessions sticky? OR is Redis Pub/Sub used to route messages between servers?
+
+[ ] Heartbeat / presence mechanism is defined
+    Risk: Silently disconnected clients appear online — stale presence data
+    Check: Is there a heartbeat (every 5–30s)? TTL-based presence in Redis?
+
+[ ] Message delivery guarantee is defined
+    Risk: WebSocket is NOT at-least-once — messages can be lost on disconnect
+    Check: Is there an offline message queue for disconnected users?
+           Are messages persisted before delivery attempt (not just sent to socket)?
+
+[ ] Service discovery routes users to correct server
+    Risk: Message for user on server A arrives at server B — not delivered
+    Check: Is there a user-to-server mapping? (ZooKeeper, etcd, Redis hash)
+           Is consistent hashing used to route users to the same server?
+
+[ ] Reconnection and message replay is handled
+    Risk: Client disconnects for 30s, misses messages — no catch-up mechanism
+    Check: Can client request messages since last_message_id on reconnect?
+```
+
+---
+
+### Financial / Payment System
+
+Additional checks for payment processing, wallets, ledgers, and settlement:
+
+```
+[ ] Double-entry ledger is used
+    Risk: Mutable balance only = no audit trail, race conditions, no reconciliation
+    Check: Is there an append-only ledger table?
+           Does every transaction create two rows (debit + credit)?
+           Does sum(debit) + sum(credit) = 0 for every transaction_id?
+
+[ ] Money is stored as integer minor units (never float)
+    Risk: Float arithmetic drift causes balance errors at scale
+    Check: Is amount column BIGINT (cents) or DECIMAL(19,4)? Never FLOAT or DOUBLE.
+
+[ ] Idempotency key is required for every payment
+    Risk: Retry on timeout = double charge
+    Check: Is Idempotency-Key header required? Checked before processing?
+           Is the result stored with the key (TTL: 24-48 hours)?
+
+[ ] PCI scope is minimised or eliminated
+    Risk: Handling raw card data requires PCI-DSS Level 1 audit
+    Check: Is PSP hosted page used (Pattern #24)? Does your server ever touch card numbers?
+
+[ ] TC/C or Saga pattern used for multi-step payments
+    Risk: Partial failure leaves money reserved without charge, or charged without fulfillment
+    Check: Does every step have a defined compensate/cancel operation?
+           Is compensation triggered automatically on failure?
+
+[ ] End-of-day reconciliation exists
+    Risk: Silent balance discrepancies accumulate undetected
+    Check: Is there a daily reconciliation job?
+           Does it compare internal ledger against PSP settlement files?
+           Is there an alert if discrepancy > 0?
+
+[ ] PSP external calls have timeout + Circuit Breaker
+    Risk: PSP slowdown cascades into your payment service
+    Check: Is there an explicit timeout (15s)? A Circuit Breaker (Pattern #9)?
+           Is there an async fallback (queue the payment, retry via Kafka)?
+
+[ ] Kafka payment consumer is idempotent
+    Risk: At-least-once delivery = same payment event processed twice = double debit
+    Check: Is there a processed_event_ids deduplication table?
+           Is ON CONFLICT DO NOTHING on the ledger insert?
 ```
 
 ---

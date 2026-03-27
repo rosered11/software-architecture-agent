@@ -328,3 +328,107 @@ SUGGEST — No progress metric for long-running sync
   Why: Impossible to know if job is stuck or just slow in production
   Option: Emit Prometheus counter per N rows processed, log progress every 1000 rows
 ```
+
+---
+
+## Checklist: Distributed / High-Concurrency API
+
+Run when: code handles high concurrent load, uses connection pools, manages distributed state, or involves cache/rate limiting.
+
+```
+BLOCK — Synchronous DB calls in high-concurrency endpoint
+  Pattern: .FirstOrDefault(), .ToList() without async variants in a concurrent API endpoint
+  Risk: Each request blocks a thread pool thread for the full DB wait duration.
+        Under 100 concurrent × 1.5s hold = 150s of blocked threads → thread starvation.
+  Fix: Use async/await + async DB methods (.FirstOrDefaultAsync(), .ToListAsync())
+       Requires IDbContextFactory for parallel independent queries (DbContext is not thread-safe)
+  Formula: concurrent_requests × hold_time_seconds < pool_size
+           If result > 80% of pool → reduce queries or go async
+
+BLOCK — No rate limiting on expensive endpoint
+  Pattern: Endpoint hitting DB or external API with no rate limit per client
+  Risk: One client can exhaust the connection pool for all other clients (thundering herd)
+  Fix: Add Token Bucket per user/resource using Redis (patterns.md #14)
+       Return HTTP 429 with Retry-After header on rejection
+
+BLOCK — Shared DbContext across concurrent operations
+  Pattern: Single _context instance shared between Task.Run() calls or parallel threads
+  Risk: EF Core DbContext is NOT thread-safe — race conditions, data corruption, exceptions
+  Fix: Inject IDbContextFactory<T>, create a new context per task:
+       await using var ctx = _contextFactory.CreateDbContext();
+
+WARN — No Redis cache on read-heavy endpoint
+  Pattern: Frequently-called GET endpoint with no caching, reads same data repeatedly
+  Risk: DB connection pool exhausted under sustained concurrent load
+  Check: Same data read > 10× per minute with low change frequency?
+  Fix: Add Redis cache-aside pattern with TTL:
+       30s for order status, 5min for user profile, 1hr for reference data
+       Add event-driven invalidation via Kafka for accuracy
+
+WARN — Connection pool ceiling not validated
+  Pattern: No proof that concurrent_requests × queries × hold_time fits within pool_size
+  Risk: Works fine at 10 concurrent, silently fails at 100 concurrent
+  Check: concurrent × query_count × avg_query_ms / 1000 < pool_size (default 100)
+  Fix: Reduce query count (batch), reduce hold time (async), or increase pool size
+
+SUGGEST — Independent DB calls made sequentially
+  Pattern: Three unrelated DB calls executed one after another in the same request
+  Why: Serial: A + B + C = 300ms; Parallel via Task.WhenAll: max(A,B,C) = 100ms
+  Option: Task.WhenAll() with IDbContextFactory for independent DB calls per task
+```
+
+---
+
+## Checklist: Payment / Financial System
+
+Run when: code processes payments, transfers money, manages balances, or integrates with a PSP (Stripe, PayPal, Braintree).
+
+```
+BLOCK — Money stored as float
+  Pattern: amount column as float or double type
+  Risk: Floating point arithmetic errors — 0.1 + 0.2 ≠ 0.3 → balance drift over time
+  Fix: Store as integer minor units (cents: 100 = $1.00) or DECIMAL(19,4) column
+
+BLOCK — Missing idempotency key on payment endpoint
+  Pattern: POST /payments with no idempotency_key check
+  Risk: Client retry on timeout = double charge (at-least-once HTTP = two executions)
+  Fix: Accept Idempotency-Key header, check existing result before processing,
+       store result with key (TTL: 24–48 hours)
+
+BLOCK — No double-entry ledger
+  Pattern: Single mutable balance column, no append-only transaction log
+  Risk: No audit trail, race conditions, no reconciliation capability
+  Fix: Append debit + credit rows per transaction to ledger table
+       Balance = SUM(ledger entries) — never from a mutable column alone
+
+BLOCK — Raw card data handled by your service
+  Pattern: Code receives, stores, or transmits credit card numbers or CVVs
+  Risk: PCI-DSS Level 1 compliance required — major audit burden and breach liability
+  Fix: Use PSP hosted payment page (patterns.md #24) — card data never reaches your server
+
+BLOCK — No reconciliation process
+  Pattern: Financial system with no end-of-day comparison against PSP settlement files
+  Risk: Silent balance discrepancies accumulate undetected for days/weeks
+  Fix: Daily reconciliation job: internal ledger == PSP settlement; any mismatch → alert
+
+WARN — Non-idempotent Kafka payment consumer
+  Pattern: Payment consumer processes without checking for duplicate event_id
+  Risk: Kafka at-least-once delivery = same payment event may arrive twice = double debit
+  Fix: Deduplication table: check processed_event_ids before processing, insert after success
+
+WARN — No compensation on partial payment failure
+  Pattern: Multi-step payment with no rollback if a middle step fails
+  Risk: Money reserved but not charged, or charged but order not fulfilled
+  Fix: TC/C or Orchestration Saga — every step has a defined cancel/compensate operation
+
+WARN — PSP HTTP call with no timeout or circuit breaker
+  Pattern: Synchronous PSP call on the critical payment path with no timeout
+  Risk: PSP slowdown hangs all payment requests → connection pool exhaustion
+  Fix: Explicit timeout (15s for external PSP) + Circuit Breaker (patterns.md #9)
+
+SUGGEST — Financial state not event-sourced
+  Pattern: Payment state stored only as current mutable status (PENDING → PAID → REFUNDED)
+  Why: No audit trail, cannot answer "what happened at 14:32?", cannot replay on bug fix
+  Option: Append payment events to immutable log (patterns.md #19)
+          PaymentInitiated → CardCharged → PaymentSettled → Refunded
+```

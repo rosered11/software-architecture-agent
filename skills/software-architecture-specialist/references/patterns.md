@@ -22,6 +22,18 @@
 | 11 | [Eager Graph Loading](#11-eager-graph-loading) | Performance | Load full entity graph in one shot via Include() chain |
 | 12 | [Coordinator-Level Resolution](#12-coordinator-level-resolution) | Performance | Resolve shared context once at parent, pass down |
 | 13 | [Bulk Load Then Map](#13-bulk-load-then-map) | Performance | Replace N outer-loop DB calls with one bulk query + in-memory mapping |
+| 14 | [Token Bucket Rate Limiting](#14-token-bucket-rate-limiting) | API Design | Protect APIs from burst traffic with refillable token budget |
+| 15 | [Consistent Hashing Ring](#15-consistent-hashing-ring) | Scalability | Minimize key remapping when nodes are added or removed |
+| 16 | [Fanout on Write (Push)](#16-fanout-on-write-push) | Architecture | Pre-compute follower feeds at write time for fast reads |
+| 17 | [Fanout on Read (Pull)](#17-fanout-on-read-pull) | Architecture | Assemble feed at read time — avoid write amplification |
+| 18 | [Hybrid Fanout](#18-hybrid-fanout) | Architecture | Push for regular users, pull for celebrities |
+| 19 | [Event Sourcing](#19-event-sourcing) | Architecture | Immutable event log as the source of truth |
+| 20 | [Scatter-Gather](#20-scatter-gather) | Distributed | Fan-out query across shards, merge results |
+| 21 | [Write-Ahead Log (WAL)](#21-write-ahead-log-wal) | Resilience | Persist intent before applying — enables crash recovery |
+| 22 | [Geohash Bucketing](#22-geohash-bucketing) | Data | Encode lat/lon as string prefix for efficient nearby search |
+| 23 | [Snowflake ID Generation](#23-snowflake-id-generation) | Distributed | 64-bit time-sortable IDs with no coordination |
+| 24 | [Hosted Payment Page](#24-hosted-payment-page) | API Design | Delegate card data to PSP — eliminate PCI scope |
+| 25 | [DLQ with Reconciliation](#25-dlq-with-reconciliation) | Resilience | Dead letter queue + end-of-day financial reconciliation |
 
 ---
 
@@ -703,3 +715,547 @@ Some per-record calls cannot be batched (external API, etc) → keep those as pe
 **Real Incident (target.cs)**: `GetSubOrderMessage` list method (lines 593-634) looped N=10 sub-orders, calling the inner method per sub-order — each inner call issued ~44 queries sequentially = ~440 total. Refactored to bulk-load all 10 sub-orders with 16 Include paths + `AsSplitQuery()` + batch all supporting queries. Result: **P50 dropped from 2,730ms to 1,505ms (-45%)** measured 2026-03-26.
 
 **Failed approach (do not repeat)**: Replacing `Entry().Load()` inside each iteration with an expanded Include chain + `AsSplitQuery()` inside the loop produces **zero improvement** — AsSplitQuery generates the same number of queries as the lazy loads it replaces, 1:1. The outer loop must be eliminated, not optimized per-iteration. See incident-log.md Phase 3 attempt 1 notes.
+
+---
+
+## 14. Token Bucket Rate Limiting
+
+**Problem**: API endpoints receive burst traffic that exhausts downstream resources (DB connections, third-party API quotas) or monopolises the system for other users.
+
+**Solution**: Assign each client (user ID, API key, or resource key) a bucket of capacity C tokens refilled at rate R per second. Each request consumes 1 token. Reject with HTTP 429 if empty.
+
+**When to USE**:
+- Any public or partner-facing API
+- Endpoints that call expensive downstream services (DB, external APIs)
+- When burst traffic is legitimate (allow it up to capacity, then throttle)
+
+**When NOT to USE**:
+- Need constant-rate output regardless of input (use Leaking Bucket instead)
+- Rate limit is per-second-exact with no tolerance for burst
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Burst-tolerant — allows spikes up to capacity | Tuning capacity + refill rate requires experimentation |
+| Atomic via Redis Lua script | Distributed state needed for multi-instance deployments |
+| HTTP 429 + Retry-After header is standard | Key expiry strategy needed to avoid stale buckets |
+
+**Your Stack (Redis + .NET or Go)**:
+```lua
+-- Redis Lua script (atomic token bucket check)
+local tokens = tonumber(redis.call('GET', KEYS[1])) or tonumber(ARGV[1])
+if tokens >= 1 then
+    redis.call('SET', KEYS[1], tokens - 1, 'EX', ARGV[2])
+    return 1  -- allowed
+else
+    return 0  -- rejected (HTTP 429)
+end
+-- Background: replenish via scheduled refill or lazy calculation on each request
+```
+
+**Rate limit key selection**:
+- Per user/API key → most common, fair per-client
+- Per resource (e.g., per SourceOrderId) → when one resource being hammered is the bottleneck
+- Per IP → edge servers before auth
+
+**Decision Rule**:
+- General API, burst acceptable? → Token Bucket
+- Strict constant rate? → Leaking Bucket
+- Simple per-minute count? → Fixed Window Counter
+- Need < 0.01% error at scale? → Sliding Window Counter
+
+---
+
+## 15. Consistent Hashing Ring
+
+**Problem**: Adding or removing nodes in a distributed cache or data store remaps most keys with traditional mod-N hashing, causing a cache stampede or massive data rebalancing.
+
+**Solution**: Map both server IDs and keys onto a hash ring (0–2^32). Assign 100–200 virtual nodes per physical server. For each key, walk clockwise to find the owning server. On topology change, only adjacent keys on the ring are remapped (k/n total vs ~all keys with mod-N).
+
+**When to USE**:
+- Distributed cache with dynamic node count (autoscaling, failures)
+- Data partitioning where servers join/leave regularly
+- Load balancing across stateful servers requiring key affinity
+
+**When NOT to USE**:
+- Fixed, static server count (mod-N is simpler)
+- When you need exact control over which key goes where
+
+**Complexity**: Medium
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Minimal key remapping on topology change | More complex than mod-N |
+| Even distribution with virtual nodes | Storage overhead for ring mapping |
+| Battle-tested (DynamoDB, Cassandra, Discord, Akamai) | SHA computation per lookup |
+
+**Your Stack (Go)**:
+```go
+type Ring struct {
+    nodes   []int            // sorted hash positions
+    nodeMap map[int]string
+    vnodes  int              // virtual nodes per server (100–200)
+}
+
+func (r *Ring) GetNode(key string) string {
+    hash := hashKey(key)
+    idx := sort.SearchInts(r.nodes, hash) % len(r.nodes)
+    return r.nodeMap[r.nodes[idx]]
+}
+```
+
+**Decision Rule**:
+- Static server count → mod-N hashing
+- Dynamic server count (autoscale) → Consistent hashing
+- Need even distribution → virtual nodes (100–200 per server)
+
+---
+
+## 16. Fanout on Write (Push)
+
+**Problem**: Followers need to see a new post in their feed with minimal read latency, but building the feed at read time is too slow.
+
+**Solution**: On post creation, immediately write the post ID to all followers' feed caches. Feed reads are O(1) — just fetch from pre-computed Redis list per user.
+
+**When to USE**:
+- Users have bounded follower counts (< ~10,000)
+- Feed read frequency >> write frequency
+- Majority of followers are active (cache writes are not wasted)
+
+**When NOT to USE**:
+- Celebrity users with millions of followers (write amplification: 1 post → millions of cache writes)
+- Most followers are inactive (wasted writes to rarely-read caches)
+
+**Complexity**: Medium
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| O(1) feed reads — instant | Write amplification for high-follower users |
+| Pre-computed = no fan-out at read time | Memory: N copies of every post ID |
+| Predictable read latency | Stale cache risk if invalidation lags |
+
+**Decision Rule**:
+- Regular users (< 10K followers)? → Fanout on Write
+- Celebrity users (> 1M followers)? → Fanout on Read (#17)
+- Mixed platform? → Hybrid Fanout (#18)
+
+---
+
+## 17. Fanout on Read (Pull)
+
+**Problem**: Pre-computing feeds for all followers wastes resources — especially for high-follower celebrities where 1 post triggers millions of cache writes.
+
+**Solution**: Post is written only to the author's post store. When a user requests their feed, the system fetches recent posts from all followed users, merges, and sorts them. Optionally cache the merged result per user with a short TTL.
+
+**When to USE**:
+- Author has very high follower counts (celebrities)
+- Low active-user ratio (most users don't read regularly)
+- Feed freshness is critical — cannot tolerate staleness
+
+**When NOT to USE**:
+- Users follow many highly active users (fan-in too large at read time)
+- Low latency is required on every feed read
+
+**Complexity**: Low (write) / High (read merge)
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| No write amplification | Slow reads — N fetches per feed request |
+| Always fresh — reads latest data | Complex merge + sort at read time |
+| Works for any follower count | Cannot be pre-warmed for inactive users |
+
+**Decision Rule**:
+- Author has > 1M followers? → Fanout on Read
+- Read latency must be < 100ms? → Fanout on Write or Hybrid
+
+---
+
+## 18. Hybrid Fanout
+
+**Problem**: Pure push wastes compute for celebrities; pure pull makes reads slow for regular users. Neither alone works for a platform with both.
+
+**Solution**: Classify users by follower count. Below threshold: fanout on write (push). Above threshold (celebrities): fanout on read (pull). At feed assembly time, merge the pre-computed feed (regular users' posts) with freshly-fetched celebrity posts.
+
+**When to USE**:
+- Social platform with power-law follower distribution (a few users have millions, most have hundreds)
+- Both fast read AND efficient write are required
+
+**When NOT to USE**:
+- Uniform follower distribution (either pure push or pure pull is simpler)
+- Celebrity threshold is hard to define (start with > 10,000 followers)
+
+**Complexity**: High (dual path + threshold classification + merge logic)
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Optimal for both read speed and write cost | Higher system complexity |
+| Scales to any user size | Threshold tuning required |
+| Instagram / Twitter production approach | Feed merge at read time adds latency |
+
+**Decision Rule**:
+```
+follower_count < 10,000   → fanout on write (push)
+follower_count > 10,000   → fanout on read (pull)
+Feed assembly:             → pre-computed cache + freshly-fetched celebrity posts
+Threshold:                 → tune per system; start at 10K, adjust based on write cost
+```
+
+---
+
+## 19. Event Sourcing
+
+**Problem**: Traditional CRUD loses history. You cannot audit what happened, replay to recover from bugs, or derive different read models from the same source data.
+
+**Solution**: Instead of storing current state, store an immutable append-only log of every state-change event. Current state = replay of all events (or snapshot + replay of events since snapshot). Build read projections from the event stream.
+
+**When to USE**:
+- Financial systems requiring full audit trail
+- Systems needing temporal queries ("what was the state at time T?")
+- Systems where a bug fix requires reprocessing historical data
+- Systems needing multiple read models from the same source (CQRS)
+
+**When NOT to USE**:
+- Simple CRUD with no audit/replay requirement (adds complexity for no gain)
+- Real-time systems where event schema evolution is too complex to maintain
+- Small systems where snapshot + versioned DB is sufficient
+
+**Complexity**: High
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Full audit trail — know exactly what happened and when | Event schema evolution is complex |
+| Temporal queries — state at any point in time | Query complexity — need projections for reads |
+| Replay — re-derive state after fixing a bug | Storage grows unboundedly (compaction needed) |
+| Multiple projections from same events | Eventual consistency for read models |
+
+**Your Stack (PostgreSQL)**:
+```sql
+-- Event store table (append-only, never UPDATE or DELETE)
+CREATE TABLE domain_events (
+    id             BIGSERIAL PRIMARY KEY,
+    aggregate_id   UUID NOT NULL,
+    event_type     VARCHAR(100) NOT NULL,
+    payload        JSONB NOT NULL,
+    sequence_num   BIGINT NOT NULL,
+    created_at     TIMESTAMP DEFAULT NOW()
+);
+CREATE UNIQUE INDEX ON domain_events(aggregate_id, sequence_num);
+
+-- Snapshot table (periodic materialization to avoid full replay)
+CREATE TABLE snapshots (
+    aggregate_id   UUID PRIMARY KEY,
+    state          JSONB NOT NULL,
+    at_sequence    BIGINT NOT NULL,
+    created_at     TIMESTAMP DEFAULT NOW()
+);
+-- Recovery: load snapshot WHERE aggregate_id=X, then replay events WHERE sequence_num > at_sequence
+```
+
+**Decision Rule**:
+- Financial system with audit requirements? → Event sourcing mandatory
+- Need temporal queries? → Event sourcing
+- Simple CRUD, no audit, no replay? → Traditional DB state storage
+- Gaming score, simple counter? → Regular DB update (event sourcing is overkill)
+
+---
+
+## 20. Scatter-Gather
+
+**Problem**: A query cannot be served from a single node — data is partitioned across multiple shards and must be aggregated to answer.
+
+**Solution**: 1. Coordinator receives the query. 2. **Scatter**: broadcast sub-queries to all relevant shards in parallel. 3. **Gather**: collect responses, merge/sort/reduce. 4. Return merged result.
+
+**When to USE**:
+- Top-K queries across sharded data (leaderboard, trending)
+- Search across multiple index shards
+- Aggregations (SUM, MAX) where data is partitioned by key
+
+**When NOT to USE**:
+- Query can be routed to a single shard using the shard key (direct routing is always better)
+- Fan-out is too wide (N shards = latency bounded by slowest shard)
+
+**Complexity**: Medium
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Enables arbitrary queries across all shards | Latency = max(shard_latency) not avg |
+| No data movement required | All shards must respond; one slow shard delays all |
+| Works with consistent hashing for shard selection | Merge logic needed at coordinator |
+
+**Decision Rule**:
+```
+Query includes shard key → direct shard routing (no scatter needed)
+Query is global (top-K, search, aggregation) → Scatter-Gather
+Shard count > 50 → add shard sampling (don't scatter to all — too slow)
+```
+
+**Real example**: Gaming leaderboard — top 100 globally requires querying all N Redis shards and merging sorted results.
+
+---
+
+## 21. Write-Ahead Log (WAL)
+
+**Problem**: In-memory state is lost on crash. Rebuilding state from scratch after every restart is too slow (full replay of all history).
+
+**Solution**: Before modifying in-memory state, append the change to a sequential log on durable storage. On crash recovery, load the latest snapshot and replay only the WAL entries since the snapshot.
+
+**When to USE**:
+- Any system with in-memory state that must survive crashes
+- Databases (PostgreSQL, MySQL), message queues (Kafka segment files), matching engines
+- Financial systems requiring deterministic crash recovery
+
+**When NOT to USE**:
+- Stateless systems (nothing to restore)
+- Systems where WAL replay would take too long without snapshots (add periodic snapshots)
+
+**Complexity**: Medium
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Crash recovery without losing in-flight work | WAL file grows unboundedly without truncation |
+| Sequential writes = fast (no random I/O) | Recovery time bounded by WAL size since last snapshot |
+| Deterministic — same WAL = same state | Adds write latency (must persist to WAL before ack) |
+
+**Your Stack (Go + file-based)**:
+```go
+// Write entry to WAL before applying to in-memory state
+func (w *WAL) Append(entry []byte) error {
+    _, err := w.file.Write(entry)       // sequential append — fast
+    if err != nil { return err }
+    return w.file.Sync()                // fsync — guarantee durability before ack
+}
+
+// Recovery: load snapshot, then replay WAL entries since snapshot sequence
+func Recover(snapshotPath, walPath string) State {
+    state := loadSnapshot(snapshotPath)
+    entries := readWALSince(walPath, state.LastSequence)
+    for _, e := range entries {
+        state = state.Apply(e)
+    }
+    return state
+}
+```
+
+**Decision Rule**:
+- In-memory state + crash recovery required? → WAL mandatory
+- Event log that doubles as WAL? → Event Sourcing (#19) subsumes WAL
+- Kafka segment files? → Kafka uses WAL internally (you don't implement it)
+
+---
+
+## 22. Geohash Bucketing
+
+**Problem**: Nearby location search over millions of businesses requires spatial indexing — scanning all records by lat/lon is O(n) and impractical.
+
+**Solution**: Encode each business location as a geohash string (e.g., "9q9p1y"). Index this string column. For a user at location L, compute the geohash at precision P, compute the 8 neighboring cells, query `WHERE geohash IN (9 cells)`, then filter by exact distance.
+
+**When to USE**:
+- Nearby search (restaurants, drivers, points of interest)
+- Static or semi-static locations updated infrequently
+- Scale up to hundreds of millions of records
+
+**When NOT to USE**:
+- Constantly moving entities at high frequency (>1 update/second per entity) — use Quadtree or H3
+- Arbitrary polygon regions — use Google S2
+- Precision requirements finer than ~100m — use higher precision but be aware of 8-neighbor requirement
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| O(log n) lookup using standard string index | Boundary problem: nearby points may have different prefixes |
+| Works on any relational DB | Must always check 8 neighbors, not just center cell |
+| Simple to implement and understand | Fixed precision per level (quadtree is density-adaptive) |
+
+**Your Stack (PostgreSQL)**:
+```sql
+-- Store and index geohash
+ALTER TABLE businesses ADD COLUMN geohash_6 CHAR(6);
+CREATE INDEX idx_biz_geohash ON businesses(geohash_6);
+
+-- Nearby query (9 cells: center + 8 neighbors computed in application)
+SELECT id, name,
+    6371 * acos(cos(radians(:lat)) * cos(radians(lat))
+        * cos(radians(lon) - radians(:lon))
+        + sin(radians(:lat)) * sin(radians(lat))) AS distance_km
+FROM businesses
+WHERE geohash_6 = ANY(:nine_cells) AND is_active = true
+HAVING distance_km < :radius_km
+ORDER BY distance_km LIMIT 20;
+```
+
+**Decision Rule**:
+```
+Nearby search, simple range, static locations?       → Geohash level 6
+Density-aware indexing, frequent updates?             → Quadtree
+Arbitrary polygon, global scale mapping?              → Google S2
+Precision < 100m?                                     → Geohash level 7-8 + 8 neighbors
+Insufficient results at precision 6?                  → Expand to precision 5 and retry
+```
+
+---
+
+## 23. Snowflake ID Generation
+
+**Problem**: Multiple distributed services need globally unique, time-sortable IDs without coordination, without a central DB sequence, and without the 128-bit bulk of UUID.
+
+**Solution**: Compose a 64-bit integer from timestamp (41 bits, ms precision), datacenter ID (5 bits), machine ID (5 bits), and per-ms sequence counter (12 bits). No coordination needed — each machine generates IDs independently.
+
+**When to USE**:
+- High-throughput ID generation across distributed services
+- Need time-sortable IDs (enables range queries: find all orders after ID X)
+- Want to avoid DB auto-increment bottleneck or UUID size overhead
+
+**When NOT to USE**:
+- Need strictly sequential IDs with no gaps (use DB sequence)
+- Machine count exceeds 1,024 (expand machine bits)
+- Clock synchronization is unreliable (consider ULID instead)
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| 64-bit — fits in a BIGINT column | Requires NTP clock synchronization |
+| Time-sortable — enables range queries | Not strictly monotonic across machines |
+| No coordination needed — zero network hop | ~69-year range before overflow |
+| 4,096 IDs/ms per machine | Machine ID assignment must be managed |
+
+**Your Stack (Go)**:
+```go
+func (s *Snowflake) NextID() int64 {
+    s.mu.Lock(); defer s.mu.Unlock()
+    now := time.Now().UnixMilli()
+    if now == s.lastMs {
+        s.seq = (s.seq + 1) & 0xFFF
+        if s.seq == 0 { for now <= s.lastMs { now = time.Now().UnixMilli() } }
+    } else {
+        s.seq = 0
+    }
+    s.lastMs = now
+    // [41-bit ts][5-bit dc][5-bit machine][12-bit seq]
+    return (now-s.epoch)<<22 | s.dcID<<17 | s.machineID<<12 | s.seq
+}
+```
+
+**Decision Rule**:
+```
+Distributed, time-sortable, 64-bit?        → Snowflake
+Non-guessable, random?                     → UUID v4
+Strictly sequential, single server?        → DB auto-increment
+Clock unreliable across nodes?             → ULID (monotonic, NTP-independent)
+```
+
+---
+
+## 24. Hosted Payment Page
+
+**Problem**: Processing raw credit card data requires PCI-DSS Level 1 compliance — a costly, time-consuming, and high-risk audit burden for most teams.
+
+**Solution**: Redirect the user to the PSP's (Stripe, PayPal, Braintree) hosted payment form. The PSP collects card data directly and returns a payment token to your system. Your system only handles the token — never touches raw card data.
+
+**When to USE**:
+- Any system processing card payments
+- Team lacks dedicated security/compliance expertise for PCI-DSS
+- Speed to market matters more than fully custom payment UI
+
+**When NOT to USE**:
+- Need fully custom, branded payment experience (use PSP's JavaScript SDK instead — still PCI-scope-reduced)
+- Enterprise with existing PCI-DSS L1 infrastructure (direct API may be more efficient)
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Eliminates PCI-DSS scope entirely | Redirect interrupts UX flow |
+| PSP handles fraud detection, 3D Secure | Less control over payment page design |
+| PSP absorbs card data breach risk | PSP downtime = your payment downtime |
+| Faster to implement than custom card form | PSP per-transaction fees |
+
+**Implementation flow**:
+```
+1. Your server creates a payment session via PSP API
+2. User redirected to PSP hosted page (HTTPS on PSP's domain)
+3. PSP collects and tokenizes card data
+4. PSP redirects back to your success/failure URL with payment token
+5. Your server calls PSP API with token to confirm/capture charge
+6. Store idempotency_key + result in your ledger
+```
+
+**Decision Rule**:
+- New team building payments? → Hosted Payment Page first, always
+- Need custom UI + still avoid PCI? → PSP JavaScript SDK (card data goes PSP, not your server)
+- Already PCI-compliant and need control? → Direct PSP API with your own form
+
+---
+
+## 25. DLQ with Reconciliation
+
+**Problem**: Some Kafka messages permanently fail processing (bad payload, downstream permanently unavailable). Without a DLQ they block the partition or cause silent data loss. For financial systems, missed events cause balance discrepancies that are never detected.
+
+**Solution**: After max retries with exponential backoff, route failed messages to a Dead Letter Queue topic. Alert on DLQ depth > 0. For financial systems: add end-of-day reconciliation — compare internal ledger totals against PSP/partner settlement files and alert on any discrepancy.
+
+**When to USE**:
+- Any Kafka consumer processing financial or critical events
+- Any system where missed messages need an audit trail
+- Any system with at-least-once delivery and downstream side effects
+
+**When NOT to USE**:
+- Non-critical events where silent loss is acceptable (discard instead of DLQ)
+- Events with TTL that are useless once stale (drop, not DLQ)
+
+**Complexity**: Low–Medium
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| No silent data loss — every failure is auditable | DLQ requires monitoring + operational runbook |
+| Allows manual inspection + replay after fix | Replay must be idempotent (consumer must handle duplicates) |
+| Reconciliation catches discrepancies that DLQ misses | Reconciliation job adds operational complexity |
+
+**Your Stack (Go + Kafka)**:
+```go
+const maxRetries = 3
+
+func processWithDLQ(msg kafka.Message) {
+    var lastErr error
+    for attempt := 0; attempt <= maxRetries; attempt++ {
+        if err := processMessage(msg); err == nil { return }
+        else { lastErr = err }
+
+        if isPermanentError(lastErr) { break }           // don't retry permanent errors
+        time.Sleep(backoff(attempt))                     // exponential: 1s, 4s, 16s
+    }
+    // Route to DLQ after maxRetries or permanent error
+    publishToDLQ(msg, lastErr)
+}
+
+// DLQ topic: original_topic.DLQ
+// Alert: if dlq_depth > 0 for 5 minutes → page on-call
+```
+
+**End-of-day reconciliation (financial)**:
+```
+1. Fetch internal ledger totals for the day
+2. Download PSP settlement file (CSV/SFTP)
+3. Match: internal_total == psp_total for each currency
+4. Any unmatched transaction → create investigation record
+5. Alert: if unmatched_count > 0 → escalate immediately
+```
+
+**Decision Rule**:
+- Financial Kafka consumer? → DLQ + reconciliation mandatory
+- Critical business events (order, inventory)? → DLQ mandatory
+- Analytics/logs? → DLQ optional (consider dropping instead)
+- After DLQ message fixed → replay with same consumer group (idempotency key prevents double-processing)
