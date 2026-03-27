@@ -6,7 +6,7 @@
 ._*
 
 # Custom folder icons
-Icon
+Icon
 
 # Volume root files
 .DocumentRevisions-V100
@@ -45,6 +45,9 @@ $RECYCLE.BIN/
 
 # NFS temporary files
 .nfs*
+
+### KOS Sync — never commit secrets
+sync/config.json
 
 ### VS Code
 # VSCode settings (keep shared configuration)

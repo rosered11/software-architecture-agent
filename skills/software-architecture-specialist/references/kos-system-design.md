@@ -1646,7 +1646,7 @@ When to Use:      Social platform with power-law follower distribution
                   Mix of celebrity and regular users
                   Optimization needed at scale
 When NOT to Use:  Uniform follower distribution (either pure push or pull is simpler)
-Complexity:       High (dual path, classification logic, feed merge)
+Complexity:       High (dual path + classification logic + feed merge)
 Based on Knowledge: → Fanout Strategies (K13)
                     → CDN Strategy & Cache Layers (K15)
 ```

@@ -1,0 +1,14 @@
+{
+  "_readme": "Copy this file to config.json and fill in your values. Never commit config.json (it contains your secret token).",
+
+  "notion_token": "secret_REPLACE_WITH_YOUR_INTEGRATION_TOKEN",
+
+  "databases": {
+    "_readme": "Get each database ID from the Notion URL: notion.so/<workspace>/<DATABASE_ID>?v=...",
+    "incidents":   "REPLACE_WITH_INCIDENTS_DATABASE_ID",
+    "knowledge":   "REPLACE_WITH_KNOWLEDGE_DATABASE_ID",
+    "patterns":    "REPLACE_WITH_PATTERNS_DATABASE_ID",
+    "decisions":   "REPLACE_WITH_DECISIONS_DATABASE_ID",
+    "tech_assets": "REPLACE_WITH_TECH_ASSETS_DATABASE_ID"
+  }
+}

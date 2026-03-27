@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where python*)",
+      "Bash(where py:*)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/Users/**)"
+    ]
+  }
+}
