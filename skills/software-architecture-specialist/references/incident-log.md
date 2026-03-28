@@ -419,7 +419,17 @@ private static readonly Histogram GetSubOrderDuration = Metrics
   - P50: 2,730ms → **1,505ms (-45%)** | Cold start: 6,309ms → **4,521ms (-28%)**
   - GC cycling healthy at ~5 GC0/10 calls — 2.5 MB allocated per call, collected before accumulation
   - **Remaining bottleneck**: per-sub-order calls kept as-is: `GetStoreLocation`, `getPackageInfoByOrderAndSubOrder`, `GetPackageTb` — 3×N sequential calls (~900ms for N=10)
-  - **Phase 4 target**: async parallel execution of the 3 remaining per-sub-order calls → expected < 300ms
+
+**Phase 4 notes (2026-03-27) — Applied to incident2.cs:**
+- **Implemented**: `GetSubOrderAsync` coordinator using `Task.WhenAll` with `IDbContextFactory`
+- **New async private methods**: `GetOrderHeaderAsync`, `GetOrderMessagePaymentsInternalAsync`, `GetOrderPromotionInternalAsync`, `GetRewardItemsBatchedAsync` — each accepts its own `DbContext` from the factory
+- **Map functions extracted**: `MapPayments`, `MapPromotions`, `MapRewardItems` — pure in-memory, shared by sync and async paths
+- **Execution model**: Step 1 = `GetSubOrderMessage` (serial, produces suborder list) → Step 2 = resolve reference once → Step 3 = 4 DB calls fired in parallel via `Task.WhenAll` → Step 4 = assemble in memory (zero DB)
+- **Expected latency**: `max(t_header, t_payments, t_promotions, t_rewards)` instead of `t1+t2+t3+t4`
+- **Thread safety**: EF Core DbContext is not thread-safe — each parallel task gets its own `DbContext` instance from `IDbContextFactory`
+- **Migration**: sync `GetSubOrder` preserved unchanged; callers migrate to `GetSubOrderAsync` one at a time
+- **Wire-up required**: `services.AddDbContextFactory<YourDbContext>(...)` in Program.cs + inject `IDbContextFactory` in constructor
+- **BotE impact**: latency ceiling drops from `~1,500ms (sequential)` to `~max(400ms, 300ms, 250ms, 200ms) = ~400ms` — estimated 73% reduction from Phase 3 baseline
 
 ---
 
@@ -479,14 +489,19 @@ See `architecture-decision.md` for full ADR.
 | Type | Record |
 |------|--------|
 | **Knowledge** | N+1 Query Problem, Batch Query Pattern, EF Core Best Practices, Connection Pool Math, GC pressure from EF tracking |
-| **Knowledge (KOS)** | → K20: Idempotency in Distributed Systems — safe retry design applied to async redesign |
+| **Knowledge (KOS)** | K20, K25 |
 | **Pattern** | Batch Query → `references/patterns.md` #1 |
 | **Pattern** | Eager Graph Loading → `references/patterns.md` #11 |
-| **Pattern** | Coordinator-Level Resolution (new) → `references/patterns.md` #12 |
-| **Pattern (KOS)** | → P7: Scatter-Gather — parallel async sub-queries replacing sequential calls; → P12: Dead Letter Queue — retry + fallback for failed sub-queries |
+| **Pattern** | Coordinator-Level Resolution → `references/patterns.md` #12 |
+| **Pattern** | Bulk Load Then Map → `references/patterns.md` #13 |
+| **Pattern** | Async Parallel DB Coordinator (new) → `references/patterns.md` #26 |
+| **Pattern (KOS)** | P7, P16, P17, P18, P19, P20 |
 | **Decision** | Eager load via Include() chain over lazy Entry().Load() on hot-path read methods |
 | **Decision** | Resolve canonical OrderId once at coordinator level — not inside each sub-call |
-| **Decision** | Option A (Batch Refactor) now, Option B (Async) as follow-up — see `architecture-decision.md` |
-| **Decision (KOS)** | — (no D1–D7 match; decisions were EF Core–specific, not architectural-level) |
+| **Decision** | Option A (Batch Refactor) Phase 1-3 complete; Option B (Async Parallel) Phase 4 applied 2026-03-27 |
+| **Decision** | Use IDbContextFactory over shared _context for parallel async paths — thread safety |
+| **Knowledge** | EF Core DbContext is not thread-safe → IDbContextFactory required for parallel tasks |
+| **Decision (KOS)** | D8, D9, D10, D11 |
 | **Tech Assets** | Stopwatch + GC instrumentation snippet, Prometheus histogram snippet, EF LogTo config snippet |
-| **Tech Assets (KOS)** | — (TA1–TA6 are distributed-systems patterns; EF Core assets not yet in KOS) |
+| **Tech Assets** | `GetSubOrderAsync` + `MapPayments` + `MapPromotions` + `MapRewardItems` snippets (incident2.cs) |
+| **Tech Assets (KOS)** | TA7, TA8, TA9, TA10, TA11 |

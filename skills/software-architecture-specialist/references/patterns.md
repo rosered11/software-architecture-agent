@@ -34,6 +34,7 @@
 | 23 | [Snowflake ID Generation](#23-snowflake-id-generation) | Distributed | 64-bit time-sortable IDs with no coordination |
 | 24 | [Hosted Payment Page](#24-hosted-payment-page) | API Design | Delegate card data to PSP — eliminate PCI scope |
 | 25 | [DLQ with Reconciliation](#25-dlq-with-reconciliation) | Resilience | Dead letter queue + end-of-day financial reconciliation |
+| 26 | [Async Parallel DB Coordinator](#26-async-parallel-db-coordinator) | Performance | Fire independent DB calls in parallel using Task.WhenAll + IDbContextFactory |
 
 ---
 
@@ -1258,4 +1259,100 @@ func processWithDLQ(msg kafka.Message) {
 - Financial Kafka consumer? → DLQ + reconciliation mandatory
 - Critical business events (order, inventory)? → DLQ mandatory
 - Analytics/logs? → DLQ optional (consider dropping instead)
+
+---
+
+## 26. Async Parallel DB Coordinator
+
+**Problem**: A coordinator method fires multiple independent DB calls sequentially — total latency = sum of all call times. Under high concurrency, threads block during I/O and the connection pool exhausts.
+
+**Solution**: Resolve any shared context first (reference lookup, auth), then fire all independent DB calls concurrently via `Task.WhenAll`, each using its own `DbContext` from `IDbContextFactory`. Assemble results in memory after all tasks complete.
+
+**When to USE**:
+- Coordinator method calls 2+ independent DB operations sequentially (no data dependency between them)
+- Hot-path API endpoint under concurrent load
+- I/O wait % > 80% (threads blocking on DB, not CPU-bound)
+- Sequential latency > 300ms and at least 2 calls can run in parallel
+- .NET + EF Core stack with `IDbContextFactory` available
+
+**When NOT to USE**:
+- Calls have data dependencies (one result feeds the next query)
+- Single DB call — parallelism adds overhead with zero benefit
+- Legacy sync-only codebase where async migration risk is too high
+- Low concurrency (< 10 req/s) — sequential async is sufficient
+
+**Complexity**: Medium
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Latency = max(tasks) not sum(tasks) | Requires IDbContextFactory — extra DI wiring |
+| Frees thread pool during I/O wait | Harder to debug — parallel stack traces |
+| Higher concurrency ceiling | Each task opens its own DB connection |
+| Sync and async paths coexist safely | Async migration of all callers needed over time |
+
+**Your stack (.NET / EF Core / PostgreSQL)**:
+
+```csharp
+// Step 1: Register factory in Program.cs
+services.AddDbContextFactory<AppDbContext>(options =>
+    options.UseNpgsql(connectionString));
+
+// Step 2: Inject in service constructor
+private readonly IDbContextFactory<AppDbContext> _contextFactory;
+
+// Step 3: Coordinator method
+public async Task<Result> GetSubOrderAsync(string orderId, string subOrderId)
+{
+    // Serial: must complete first (result feeds parallel tasks)
+    var subOrderData = GetSubOrderMessage(orderId, subOrderId);
+    string resolvedId = ResolveOnce(orderId); // resolve shared context once
+
+    // Parallel: all independent — each gets its own DbContext
+    await using var ctx1 = _contextFactory.CreateDbContext();
+    await using var ctx2 = _contextFactory.CreateDbContext();
+    await using var ctx3 = _contextFactory.CreateDbContext();
+
+    await Task.WhenAll(
+        GetOrderHeaderAsync(ctx1, resolvedId),
+        GetOrderPaymentsAsync(ctx2, resolvedId),
+        GetOrderPromotionAsync(ctx3, resolvedId)
+    );
+    // Assemble in memory — zero DB calls
+}
+
+// Step 4: Each async private method owns its context
+private async Task<OrderModel> GetOrderHeaderAsync(DbContext ctx, string id)
+{
+    return await ctx.Set<OrderModel>()
+        .AsNoTracking()
+        .Include(o => o.Customer)
+        .Where(o => o.SourceOrderId == id)
+        .FirstOrDefaultAsync();
+}
+```
+
+**BotE Impact**:
+```
+BEFORE (sequential): latency = t1 + t2 + t3 + t4
+  Example: 400 + 300 + 250 + 200 = 1,150ms
+
+AFTER (parallel):   latency = max(t1, t2, t3, t4)
+  Example: max(400, 300, 250, 200) = 400ms  (-65%)
+
+Pool pressure:
+  BEFORE: 100 concurrent × 4 sequential queries × 0.01s = 4 connections held
+  AFTER:  100 concurrent × 4 parallel queries × 0.01s = 4 connections held
+  (same pool usage — but latency drops, so throughput improves)
+```
+
+**Decision Rule**:
+- 2+ independent DB calls in one coordinator method + hot-path → use Async Parallel DB Coordinator
+- Only 1 DB call → async/await alone is sufficient, no parallelism needed
+- Calls have dependencies → use sequential `await` (dependency chain, not parallel)
+- EF Core DbContext shared across tasks → BLOCK — must use `IDbContextFactory` (DbContext is NOT thread-safe)
+
+**Real incident**: `GetSubOrder` (incident2.cs) — Phase 4. Sequential calls to `GetOrderHeader`, `GetOrderMessagePayments`, `GetOrderPromotion`, `GetRewardItemsBatched` replaced with `Task.WhenAll`. Estimated latency: 1,505ms → ~400ms (-73%).
+
+**Related patterns**: #12 Coordinator-Level Resolution, #13 Bulk Load Then Map
 - After DLQ message fixed → replay with same consumer group (idempotency key prevents double-processing)

@@ -38,7 +38,12 @@ except ImportError:
 
 ROOT         = Path(__file__).parent.parent
 CONFIG_PATH  = Path(__file__).parent / "config.json"
-KOS_SD_PATH  = ROOT / "skills/software-architecture-specialist/references/kos-system-design.md"
+KOS_SD_PATH      = ROOT / "skills/software-architecture-specialist/references/kos-system-design.md"
+KOS_KNOWLEDGE    = ROOT / "skills/software-architecture-specialist/references/kos-knowledge.md"
+KOS_PATTERNS     = ROOT / "skills/software-architecture-specialist/references/kos-patterns.md"
+KOS_DECISIONS    = ROOT / "skills/software-architecture-specialist/references/kos-decisions.md"
+KOS_TECH_ASSETS  = ROOT / "skills/software-architecture-specialist/references/kos-tech-assets.md"
+KOS_SPLIT_PATHS  = [KOS_KNOWLEDGE, KOS_PATTERNS, KOS_DECISIONS, KOS_TECH_ASSETS]
 INCIDENT_PATH= ROOT / "skills/software-architecture-specialist/references/incident-log.md"
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -128,10 +133,13 @@ def extract_code_block(section_text: str) -> str | None:
 
 def parse_kos_system_design() -> dict[str, list[dict]]:
     """
-    Parse kos-system-design.md into records grouped by type:
-    knowledge (K), patterns (P), decisions (D), tech_assets (TA)
+    Parse KOS split files (kos-knowledge/patterns/decisions/tech-assets.md) into records.
+    Falls back to legacy kos-system-design.md if split files are not present.
     """
-    text = KOS_SD_PATH.read_text(encoding="utf-8")
+    sources = [p for p in KOS_SPLIT_PATHS if p.exists()]
+    if not sources:
+        sources = [KOS_SD_PATH]
+    text = "\n".join(p.read_text(encoding="utf-8") for p in sources)
     result: dict[str, list[dict]] = {
         "knowledge": [],
         "patterns": [],

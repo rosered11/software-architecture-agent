@@ -137,6 +137,43 @@ Real example (target.cs):
 ```
 
 ```
+Async parallel coordinator (Task.WhenAll + IDbContextFactory):
+Trigger when ALL of these are true:
+  (1) Coordinator calls 2+ independent DB operations sequentially
+  (2) I/O wait % > 80% (threads blocking, not CPU-bound)
+  (3) Sequential latency > 300ms on hot-path
+
+Do NOT use when:
+  - Calls have data dependencies (B needs A's result) → sequential await
+  - Only 1 DB call → async/await alone, no Task.WhenAll
+  - < 10 req/s low-concurrency → sequential async sufficient
+
+Thread safety rule:
+  EF Core DbContext is NOT thread-safe.
+  NEVER share _context across Task.WhenAll tasks.
+  Each parallel task MUST get its own DbContext from IDbContextFactory.
+  Rule: 1 concurrent task = 1 DbContext instance. No exceptions.
+
+BotE impact:
+  Sequential: latency = sum(all DB calls)
+  Parallel:   latency = max(all DB calls)
+  Throughput gain = (sum - max) / sum
+  Example: 400+300+250+200=1150ms → max=400ms → 65% latency reduction
+
+See patterns.md #26: Async Parallel DB Coordinator.
+Real example: GetSubOrderAsync (incident2.cs) — Phase 4, applied 2026-03-27.
+```
+
+```
+Map function extraction:
+When: async version of a method needs the same in-memory mapping as the sync version.
+Rule: extract the mapping (e.g. MapPayments, MapPromotions, MapRewardItems) to a private
+  pure method with no DbContext dependency.
+  Both sync and async paths call the same mapper — zero duplication, zero DB.
+Why: keeps async methods thin (query + return), mapping logic tested independently.
+```
+
+```
 Include() chain depth:
 1–2 levels         → OK, no split query needed
 3+ levels or 2+ collections → AsSplitQuery() required to avoid cartesian explosion

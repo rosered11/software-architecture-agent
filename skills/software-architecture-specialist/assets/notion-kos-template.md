@@ -450,4 +450,238 @@ After outputting the record, add:
 📎 Suggested relations to create in Notion:
 - [Database] → [Record title]
 - [Database] → [Record title]
+
+---
+
+## Filled Records — GetSubOrder Phase 4 (incident2.cs, 2026-03-27)
+
+### Incident Record
+
+```
+Title:              GetSubOrder Timeout Under High Concurrent Load (incident2.cs)
+Severity:           High
+System:             SubOrder Processing
+Problem:            API times out under concurrent request bursts. Latency scaled with concurrency, not data size.
+                    Baseline: P50=5,048ms, P99=8,283ms at 30 sequential calls.
+Root Cause:         Connection pool exhaustion from query count multiplication.
+                    Per-request query count ~33 (5 suborders, 3 promotions):
+                    - IsExistOrderReference called 3× for same SourceOrderId = 6 redundant queries (BUG-3)
+                    - GetRewardItem called per subOrderId in a loop = N queries (BUG-2)
+                    - Entry().Reference(Amount).Load() per promotion row = M queries (BUG-6)
+                    - Any()+FirstOrDefault() double-query on GetOrderHeader + IsExistOrderReference (BUG-4, BUG-5)
+                    - Missing AsNoTracking() on all read queries (BUG-7)
+                    Formula: 100 concurrent × 33 queries × 10ms = 33 connections held → pool (100) exhausted
+Fix:                Phase 1-3 (synchronous refactor, incident2.cs):
+                      BUG-3: Resolve IsExistOrderReference once in GetSubOrder coordinator, pass resolvedId to private internal methods
+                      BUG-2: GetRewardItemsBatched() — single WHERE SourceSubOrderId IN (...) query
+                      BUG-6: GetOrderPromotionInternal() — .Include(op => op.Amount).AsNoTracking()
+                      BUG-4: IsExistOrderReference collapsed from 3 queries to 2
+                      BUG-5: GetOrderHeader collapsed from 2 queries to 1
+                      BUG-7: AsNoTracking() added to all read paths
+                    Phase 4 (async parallel, incident2.cs):
+                      GetSubOrderAsync() — fires GetOrderHeader, GetOrderMessagePayments,
+                      GetOrderPromotion, GetRewardItemsBatched in parallel via Task.WhenAll.
+                      Each task gets its own DbContext from IDbContextFactory.
+                      Map functions (MapPayments, MapPromotions, MapRewardItems) shared by sync + async.
+Result:             Queries: ~33 → ~7 per request (-79%)
+                    P50 latency: 5,048ms → est. ~400ms (-92%) after Phase 4
+                    Concurrency ceiling: ~20 req → ~400+ req
+Lesson Learned:     Timeout under concurrency = query COUNT problem, not slow query problem.
+                    Formula: concurrent_requests × queries_per_request × hold_time_ms must be < pool_size × 1000.
+                    EF Core DbContext is not thread-safe — parallel tasks require IDbContextFactory.
+                    Resolve shared context (IsExistOrderReference) once at coordinator, never inside sub-calls.
+Related Knowledge:  → N+1 Query Problem
+                    → EF Core DbContext Thread Safety + IDbContextFactory
+                    → Connection Pool Math
+                    → Async Parallel DB Coordinator
+Applied Pattern:    → Batch Query (#1)
+                    → Eager Graph Loading (#11)
+                    → Coordinator-Level Resolution (#12)
+                    → Bulk Load Then Map (#13)
+                    → Async Parallel DB Coordinator (#26)
+Related Decisions:  → Resolve IsExistOrderReference once at coordinator
+                    → Use IDbContextFactory for parallel GetSubOrderAsync
+Related Tech Assets:→ GetSubOrderAsync snippet
+                    → MapPayments / MapPromotions / MapRewardItems helpers
+                    → GetRewardItemsBatched snippet
+                    → EF LogTo query counter
+```
+
+---
+
+### Knowledge Record — EF Core DbContext Thread Safety
+
+```
+Title:            EF Core DbContext is Not Thread-Safe — IDbContextFactory Required
+Type:             Framework Knowledge
+Domain:           DB Performance / ORM
+Difficulty:       Intermediate
+Summary:          A single EF Core DbContext instance cannot be used concurrently from multiple threads.
+                  Parallel DB tasks require separate DbContext instances, obtained from IDbContextFactory.
+Deep Dive:        EF Core DbContext maintains internal state (change tracker, query cache, connection).
+                  Concurrent access from multiple threads causes race conditions, corrupted state, or exceptions.
+                  The solution: IDbContextFactory<TContext> creates a fresh DbContext per request/task.
+                  In ASP.NET Core, scoped DbContext (default) is safe for sequential use in one request.
+                  For parallel Task.WhenAll, each task must call _contextFactory.CreateDbContext()
+                  and dispose it after use (await using).
+                  Registration: services.AddDbContextFactory<AppDbContext>(options => ...);
+                  The factory is registered as Singleton — safe to inject and use from any lifetime.
+Example:          await using var ctx1 = _contextFactory.CreateDbContext();
+                  await using var ctx2 = _contextFactory.CreateDbContext();
+                  await Task.WhenAll(
+                      GetOrderHeaderAsync(ctx1, orderId),
+                      GetOrderPaymentsAsync(ctx2, orderId)
+                  );
+Trade-offs:       Pros: Enables true parallel DB queries in same request
+                  Pros: Each context has isolated change tracker — no contamination
+                  Cons: More connections opened per request (N parallel tasks = N connections)
+                  Cons: Requires factory registration — extra DI setup
+Decision Rule:    Single sequential method → use injected _context (scoped)
+                  Parallel Task.WhenAll → use IDbContextFactory, 1 context per task
+                  Shared _context across Task.WhenAll → BLOCK, race condition guaranteed
+Related Concepts: → EF Core Change Tracking
+                  → Async Parallel DB Coordinator
+                  → Connection Pool Math
+Related Patterns: → Async Parallel DB Coordinator (#26)
+Related Incidents:→ GetSubOrder Timeout Under High Concurrent Load (incident2.cs)
+Related Decisions:→ Use IDbContextFactory for parallel GetSubOrderAsync
+Source:           incident2.cs Phase 4, 2026-03-27; EF Core Microsoft docs
+```
+
+---
+
+### Pattern Record — Async Parallel DB Coordinator
+
+```
+Name:             Async Parallel DB Coordinator
+Category:         Performance
+Problem:          A coordinator method calls 2+ independent DB operations sequentially —
+                  total latency = sum of all call times. Under load, threads block on I/O
+                  and the connection pool exhausts.
+Solution:         1. Complete any serial prerequisites (shared context resolution, initial query)
+                  2. Identify all independent DB calls (no data dependency between them)
+                  3. Create one DbContext per parallel task from IDbContextFactory
+                  4. Fire all tasks simultaneously via Task.WhenAll
+                  5. Await results and assemble in memory (zero DB calls in assembly step)
+                  6. Expose sync wrapper (existing callers unaffected); migrate callers incrementally
+When to Use:      - Coordinator calls 2+ independent DB operations sequentially
+                  - I/O wait % > 80% on hot path
+                  - Sequential latency > 300ms
+                  - EF Core + .NET stack with IDbContextFactory available
+When NOT to Use:  - Calls have data dependencies (sequential await instead)
+                  - Only 1 DB call (parallelism overhead not worth it)
+                  - Very low concurrency (< 10 req/s) — sequential async sufficient
+Complexity:       Medium
+Based on Knowledge: → EF Core DbContext Thread Safety + IDbContextFactory
+                    → Connection Pool Math
+Used in Incidents:  → GetSubOrder Timeout Under High Concurrent Load (incident2.cs)
+Used in Decisions:  → Use IDbContextFactory for parallel GetSubOrderAsync
+Related Tech Assets:→ GetSubOrderAsync snippet
+```
+
+---
+
+### Decision Log Record
+
+```
+Title:            Use IDbContextFactory for Parallel GetSubOrderAsync
+Context:          GetSubOrder Phase 4 — async parallelization of 3 independent DB calls.
+                  Three options for enabling parallel DB access in EF Core.
+Problem:          EF Core DbContext is not thread-safe. Task.WhenAll requires concurrent DB access.
+                  How to enable parallel queries without race conditions?
+Scale (BotE):     Sequential: 400+300+250+200 = 1,150ms per request
+                  Parallel ceiling: max(400,300,250,200) = 400ms (-65%)
+                  Connection cost: 4 parallel tasks × 1 connection each = 4 connections per request
+Options:
+  A. IDbContextFactory          Each task creates its own DbContext.
+                                Safe, explicit, EF Core recommended pattern.
+                                BotE: 400ms latency, 4 connections per request.
+  B. IServiceScopeFactory       Create a new DI scope per task, resolve DbContext from scope.
+                                More boilerplate, same safety guarantee as A.
+                                Useful when more than just DbContext is needed per scope.
+  C. Shared _context            Use existing scoped DbContext across tasks.
+                                BLOCKED — DbContext is not thread-safe. Race condition guaranteed.
+Decision:         Option A — IDbContextFactory
+                  Cleanest API for this use case. No extra DI scope needed. await using disposes cleanly.
+                  Factory registered as Singleton; DbContext instances scoped per task.
+Expected Outcome: P50 latency: ~1,500ms → ~400ms (-73%)
+                  Concurrency ceiling: ~140 req → ~400+ req
+                  Thread safety: guaranteed — no shared state across parallel tasks
+Watch out for:    Connection pool growth — 4 parallel tasks = 4 connections per request.
+                  Under very high concurrency: 400 req × 4 connections = 1,600 connections.
+                  Ensure pool size ≥ expected_concurrent_requests × parallel_tasks.
+                  Monitor: pg_stat_activity (PostgreSQL) or sys.dm_exec_requests (SQL Server).
+Related Knowledge:→ EF Core DbContext Thread Safety + IDbContextFactory
+Related Patterns: → Async Parallel DB Coordinator (#26)
+Related Incidents:→ GetSubOrder Timeout Under High Concurrent Load (incident2.cs)
+```
+
+---
+
+### Tech Asset Records
+
+```
+Name:             GetSubOrderAsync — Async Parallel Coordinator
+Type:             Code Snippet
+Language:         C# / EF Core
+Purpose:          Async version of GetSubOrder that fires 4 independent DB calls in parallel
+Pattern:          Async Parallel DB Coordinator (#26)
+Key Lines:
+  await using var ctx1 = _contextFactory.CreateDbContext();
+  await using var ctx2 = _contextFactory.CreateDbContext();
+  await using var ctx3 = _contextFactory.CreateDbContext();
+  await using var ctx4 = _contextFactory.CreateDbContext();
+  await Task.WhenAll(
+      GetOrderHeaderAsync(ctx1, resolvedOrderId),
+      GetOrderMessagePaymentsInternalAsync(ctx2, resolvedOrderId),
+      GetOrderPromotionInternalAsync(ctx3, resolvedOrderId),
+      GetRewardItemsBatchedAsync(ctx4, resolvedOrderId, subOrderIds)
+  );
+Source:           incident2.cs, GetSubOrderAsync(), 2026-03-27
+Related Pattern:  → Async Parallel DB Coordinator (#26)
+Related Incident: → GetSubOrder Timeout Under High Concurrent Load
+```
+
+```
+Name:             MapPayments / MapPromotions / MapRewardItems — In-Memory Mappers
+Type:             Code Snippet
+Language:         C# / EF Core
+Purpose:          Pure in-memory mapping functions with no DbContext dependency.
+                  Shared by both sync and async paths — zero duplication.
+Pattern:          Map Function Extraction (decision-rules.md)
+Key Rule:         Extract mapping to a private method when both sync and async versions
+                  need the same in-memory transformation. No DbContext in the mapper.
+Source:           incident2.cs, MapPayments/MapPromotions/MapRewardItems, 2026-03-27
+Related Pattern:  → Async Parallel DB Coordinator (#26)
+Related Incident: → GetSubOrder Timeout Under High Concurrent Load
+```
+
+---
+
+### KOS Relation Wiring
+
+```
+📎 Relations to create in Notion for this session:
+
+Incidents:
+- GetSubOrder Timeout (incident2.cs) → Knowledge: EF Core DbContext Thread Safety
+- GetSubOrder Timeout (incident2.cs) → Pattern: Async Parallel DB Coordinator (#26)
+- GetSubOrder Timeout (incident2.cs) → Decision: Use IDbContextFactory for parallel GetSubOrderAsync
+- GetSubOrder Timeout (incident2.cs) → Tech Asset: GetSubOrderAsync snippet
+- GetSubOrder Timeout (incident2.cs) → Tech Asset: MapPayments/MapPromotions/MapRewardItems
+
+Knowledge:
+- EF Core DbContext Thread Safety → Pattern: Async Parallel DB Coordinator (#26)
+- EF Core DbContext Thread Safety → Incident: GetSubOrder Timeout (incident2.cs)
+
+Patterns:
+- Async Parallel DB Coordinator (#26) → Knowledge: EF Core DbContext Thread Safety
+- Async Parallel DB Coordinator (#26) → Knowledge: Connection Pool Math
+- Async Parallel DB Coordinator (#26) → Incident: GetSubOrder Timeout (incident2.cs)
+
+Decision:
+- Use IDbContextFactory → Knowledge: EF Core DbContext Thread Safety
+- Use IDbContextFactory → Pattern: Async Parallel DB Coordinator (#26)
+- Use IDbContextFactory → Incident: GetSubOrder Timeout (incident2.cs)
+```
 ```
