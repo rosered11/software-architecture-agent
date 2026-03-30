@@ -648,8 +648,8 @@ def sync_patterns(notion: Client, db_id: str, records: list[dict],
                   id_maps: dict[str, dict] | None = None,
                   rebuild_body: bool = False) -> dict[str, str]:
     print(f"\n🧩 Patterns — {len(records)} records → DB {db_id[:8]}...")
-    k_map = (id_maps or {}).get("knowledge", {})
-    has_relation = bool(k_map)
+    k_map  = (id_maps or {}).get("knowledge", {})
+    ta_map = (id_maps or {}).get("tech_assets", {})
 
     for r in records:
         props = {
@@ -661,23 +661,27 @@ def sync_patterns(notion: Client, db_id: str, records: list[dict],
         }
 
         # Relation: Based on Knowledge → Knowledge DB
-        if has_relation:
+        if k_map:
             raw = r.get("Based on Knowledge", "")
             k_ids = [k_map[kid] for kid in extract_kos_ids(raw) if kid in k_map]
             if k_ids:
                 props["Based on Knowledge"] = _relation(k_ids)
 
+        # Relation: Related Tech Assets → Tech Assets DB
+        if ta_map:
+            raw = r.get("Related Tech Assets", "")
+            ta_ids = [ta_map[tid] for tid in extract_kos_ids(raw) if tid in ta_map]
+            if ta_ids:
+                props["Related Tech Assets"] = _relation(ta_ids)
+
         try:
             action, _ = upsert_page(notion, db_id, props, r, rebuild_body)
             print(f"  {'✓' if action == 'updated' else '+'} {action:7}  {r['_id']}: {r['_title']}")
         except APIResponseError as e:
-            # Relation property may not exist yet — retry without it
-            if "Based on Knowledge" in props:
-                props.pop("Based on Knowledge")
-                action, _ = upsert_page(notion, db_id, props, r, rebuild_body)
-                print(f"  {'✓' if action == 'updated' else '+'} {action:7}  {r['_id']}: {r['_title']}  ⚠ relation skipped: {e}")
-            else:
-                raise
+            props.pop("Based on Knowledge", None)
+            props.pop("Related Tech Assets", None)
+            action, _ = upsert_page(notion, db_id, props, r, rebuild_body)
+            print(f"  {'✓' if action == 'updated' else '+'} {action:7}  {r['_id']}: {r['_title']}  ⚠ relations skipped: {e}")
         time.sleep(RATE_LIMIT_DELAY)
 
     return build_id_map(notion, db_id)
@@ -920,6 +924,20 @@ def main():
                 )
             except _NOTION_ERRORS as e:
                 print(f"\n✗ Notion API error on knowledge pass 2: {e}")
+
+    # Pass 3: re-sync Patterns with Tech Assets id_map to wire Related Tech Assets
+    # (Tech Assets had to be created first before Patterns can relate to them)
+    if not target or target == "patterns":
+        p_db_id = dbs.get("patterns")
+        p_records = records_map["patterns"]
+        if p_db_id and p_records and id_maps.get("tech_assets"):
+            print("\n🔁 Patterns (pass 3) — wiring Related Tech Assets...")
+            try:
+                id_maps["patterns"] = sync_patterns(
+                    notion, p_db_id, p_records, id_maps, rebuild_body
+                )
+            except _NOTION_ERRORS as e:
+                print(f"\n✗ Notion API error on patterns pass 3: {e}")
 
     print("\n✅ Sync complete.")
 

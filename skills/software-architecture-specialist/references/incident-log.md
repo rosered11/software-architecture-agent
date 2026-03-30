@@ -10,6 +10,7 @@
 | # | Incident | System | Severity | Pattern Applied |
 |---|----------|--------|----------|-----------------|
 | 1 | [GetSubOrder API Latency Spike](#1-getsuborder-api-latency-spike) | SubOrder Processing | High | Batch Query + AsNoTracking |
+| 2 | [PostgreSQL Dead Tuple Bloat — stockadjustments](#2-postgresql-dead-tuple-bloat--stockadjustments) | spc_inventory | High | Per-Table Autovacuum Tuning + REINDEX CONCURRENTLY |
 
 ---
 
@@ -505,3 +506,221 @@ See `architecture-decision.md` for full ADR.
 | **Tech Assets** | Stopwatch + GC instrumentation snippet, Prometheus histogram snippet, EF LogTo config snippet |
 | **Tech Assets** | `GetSubOrderAsync` + `MapPayments` + `MapPromotions` + `MapRewardItems` snippets (incident2.cs) |
 | **Tech Assets (KOS)** | TA7, TA8, TA9, TA10, TA11 |
+
+---
+
+## 2. PostgreSQL Dead Tuple Bloat — stockadjustments
+
+### Overview
+
+| Field | Value |
+|-------|-------|
+| **Title** | PostgreSQL Dead Tuple Bloat — stockadjustments (spc_inventory) |
+| **Severity** | High |
+| **System** | spc_inventory — stockadjustments table |
+| **Status** | Fixed — All critical actions complete 2026-03-30. Monitoring job deferred to next phase. |
+| **Date Identified** | 2026-03-30 |
+| **Date Fixed** | 2026-03-30 |
+| **Knowledge (KOS)** | K26, K27 |
+| **Pattern (KOS)** | P21 |
+| **Decision (KOS)** | D12 |
+| **Tech Assets (KOS)** | TA12, TA13, TA14 |
+
+---
+
+### Symptoms
+
+- `stockadjustments` table: 702,783 dead rows (14.50% dead ratio) out of 4,144,411 live rows
+- `last_autovacuum` was NULL — autovacuum had **never run** on this table
+- Index scans degraded: sparse B-tree traversal due to high dead index page ratio
+- No explicit errors — silent performance degradation (slower range queries, bloated storage)
+- Other tables: `StockSyncTracker` 72.73% dead ratio (32 dead / 12 live) — tiny table, autovacuum caught it
+
+---
+
+### Root Cause
+
+**PostgreSQL default autovacuum scale factor (0.20) is too high for large tables — autovacuum trigger was never reached.**
+
+```
+Autovacuum trigger formula:
+  threshold = autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × n_live_tup
+            = 50 + 0.20 × 4,144,411
+            = 828,932 dead rows required to trigger
+
+Actual dead rows at incident: 702,783 — still 126,149 below trigger
+Result: autovacuum never fired, dead tuples accumulated silently
+```
+
+Secondary problem: even after manual VACUUM, **index bloat remained** — VACUUM marks index pages as "reusable" but does not compact or shrink the index files.
+
+---
+
+### VACUUM Output Analysis (2026-03-30)
+
+```
+Pages removed:        6,975 pages (54 MB freed from heap)
+Dead index entries:   702,347 removed across 6 indexes
+Heap tuples removed:  2,492 (partial scan — 32.23% of heap pages)
+Duration:             41.72 seconds (non-blocking)
+Dead remaining:       0 — heap is clean
+```
+
+**Index bloat after VACUUM (critical finding):**
+
+| Index | Total Pages | Reusable Pages | Bloat % | Est. Wasted |
+|---|---|---|---|---|
+| `stockadjustments_pkey` | 76,838 | 65,465 | **85%** | ~510 MB |
+| `stockadjustments_adjusted_at_idx` | 22,297 | 18,906 | **85%** | ~148 MB |
+| `stockadjustments_sync_stock_seq_idx` | 22,296 | 18,904 | **85%** | ~148 MB |
+| `stockadjustments_adjustment_type_idx` | 26,502 | 20,227 | **76%** | ~158 MB |
+| `stockadjustments_product_id_idx` | 35,093 | 9,267 | **26%** | ~72 MB |
+| `stockadjustments_stock_id_idx` | 34,327 | 4,631 | **13%** | ~36 MB |
+| **TOTAL** | **217,353** | **137,400** | **63%** | **~1.07 GB** |
+
+VACUUM marks pages "reusable" — B-tree index files do not shrink. Index scans traverse a 63% sparse B-tree = 2.7× more I/O than a clean index.
+
+---
+
+### Back-of-Envelope
+
+```
+Table heap bloat:
+  702,783 dead rows × ~200 bytes/row = ~140 MB wasted heap storage
+  Sequential scan: +14.5% extra I/O per full scan
+
+Index bloat:
+  Total index: 217,353 pages × 8KB = ~1.7 GB
+  Dead/reusable: 137,400 pages × 8KB = ~1.07 GB wasted
+  Effective index data: ~630 MB — everything else is traversed for nothing
+
+B-tree traversal overhead:
+  pkey index: 76,838 total pages, only ~11,373 contain live data (15%)
+  Every PK lookup traverses 6.7× more pages than needed
+  Every FK join resolving stockadjustments_pkey hits ~85% empty pages
+```
+
+---
+
+### Fix
+
+**Step 1 — Immediate: Manual VACUUM (applied 2026-03-30)**
+```sql
+VACUUM (ANALYZE, VERBOSE) stockadjustments;
+VACUUM (ANALYZE) "StockSyncTracker";
+ANALYZE "ShipAdjustment";  -- 6,076 n_mod_since_analyze, stale stats
+```
+
+**Step 2 — Prevent recurrence: Per-Table Autovacuum Tuning**
+```sql
+-- Trigger vacuum at 1% dead rows (~41K) instead of 20% (~828K)
+ALTER TABLE stockadjustments SET (
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.005,
+  autovacuum_analyze_threshold = 500
+);
+
+ALTER TABLE stock SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_analyze_scale_factor = 0.01
+);
+```
+
+**Step 3 — Reclaim index space: REINDEX CONCURRENTLY (pending)**
+```sql
+-- Rebuilds index from scratch — no table lock, reads/writes continue
+-- Run one at a time. Each takes 5–15 minutes on 4M rows.
+REINDEX INDEX CONCURRENTLY stockadjustments_pkey;
+REINDEX INDEX CONCURRENTLY stockadjustments_adjusted_at_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_sync_stock_seq_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_adjustment_type_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_product_id_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_stock_id_idx;
+-- Expected: ~1.7 GB → ~630 MB index size; 2-3× faster index scans
+```
+
+---
+
+### Prevention
+
+```
+[✅] VACUUM (ANALYZE) stockadjustments              — heap clean, 702K dead tuples removed
+[✅] ALTER TABLE autovacuum_vacuum_scale_factor=0.01 — triggers at ~41K dead rows going forward
+[✅] REINDEX CONCURRENTLY all 6 indexes             — ~1.7 GB → 251 MB (-85%), B-tree density restored
+[✅] VACUUM ANALYZE ShipAdjustment                  — stale stats refreshed
+[✅] StockSyncTracker                               — autovacuum handling it, no manual action needed
+[ ] Add dead_ratio monitoring to external scheduler — DEFERRED to next phase
+    Query: see TA12 — Dead Tuple Health Monitor
+    Alert threshold: dead_ratio > 5% on tables > 100K rows
+    Tool: pg_cron / Grafana / external cron — choose based on available infra
+```
+
+**Ongoing prevention rules:**
+```
+[ ] Every table > 500K rows must have autovacuum_vacuum_scale_factor = 0.01
+[ ] Every table > 5M rows must have autovacuum_vacuum_scale_factor = 0.005
+[ ] After heavy DELETE/UPDATE migrations: check pg_stat_user_tables before and after
+[ ] After manual VACUUM on large tables: check index bloat and run REINDEX CONCURRENTLY
+[ ] Long-running transactions block VACUUM — monitor pg_stat_activity for idle-in-transaction
+```
+
+---
+
+### Lesson Learned
+
+> **PostgreSQL default autovacuum is calibrated for small tables. For large tables (> 500K rows), the default scale_factor = 0.20 means hundreds of thousands of dead rows accumulate before vacuum fires. This is silent: no errors, no alerts, just steadily degrading query performance.**
+
+> **VACUUM cleans the heap but does not shrink index files. After a high-churn period, REINDEX CONCURRENTLY is needed to recover the index space. VACUUM alone is not enough.**
+
+**Architectural rules extracted:**
+- Dead tuple ratio > 5% on a table > 100K rows = performance incident
+- Per-table autovacuum tuning is mandatory for any table expected to exceed 500K rows
+- After VACUUM, always check index bloat separately — they are independent problems
+- `REINDEX CONCURRENTLY` is safe for production (no lock) and should be used whenever index bloat > 30%
+- "Autovacuum never ran" + large table = almost certainly a scale_factor configuration problem
+
+---
+
+### KOS Links
+
+| Type | Record |
+|------|--------|
+| **Knowledge** | PostgreSQL MVCC and Dead Tuples (K26) |
+| **Knowledge** | Autovacuum Scale Factor Trap for Large Tables (K27) |
+| **Pattern** | Per-Table Storage Hygiene — Autovacuum Tuning (P27) |
+| **Decision** | REINDEX CONCURRENTLY vs VACUUM FULL vs Accept Reusable Pages (D12) |
+| **Tech Assets** | Dead Tuple Health Monitor Query (TA12) |
+| **Tech Assets** | Per-Table Autovacuum Configuration SQL (TA13) |
+| **Tech Assets** | REINDEX CONCURRENTLY Script (TA14) |
+
+---
+
+### Results (Measured 2026-03-30)
+
+| Metric | Before | After | Delta |
+|--------|--------|-------|-------|
+| Heap dead_ratio | 14.50% (702,783 dead rows) | **0.00%** (0 dead rows) | -100% |
+| Total index size | ~1.7 GB (est. from page counts) | **251 MB** (measured) | **-85% (~1.45 GB reclaimed)** |
+| `stockadjustments_pkey` | ~600 MB | **89 MB** | -85% |
+| `stockadjustments_stock_id_idx` | ~268 MB | **44 MB** | -84% |
+| `stockadjustments_product_id_idx` | ~274 MB | **35 MB** | -87% |
+| `stockadjustments_adjusted_at_idx` | ~174 MB | **28 MB** | -84% |
+| `stockadjustments_sync_stock_seq_idx` | ~174 MB | **28 MB** | -84% |
+| `stockadjustments_adjustment_type_idx` | ~207 MB | **27 MB** | -87% |
+| B-tree density | ~15% live pages (pkey) | **~100% live pages** | fully restored |
+
+**Actual outcome exceeded estimate**: predicted ~630 MB post-REINDEX, actual = 251 MB. Effective index data was smaller than the reusable-page estimate suggested — original bloat was ~85%, not 63%.
+
+**Additional finding from idx_scan data:**
+
+| Index | idx_scan | Assessment |
+|---|---|---|
+| `stockadjustments_pkey` | 3,006 | Active — FK joins + PK lookups |
+| `stockadjustments_adjusted_at_idx` | 2 | Occasional range queries |
+| `stockadjustments_stock_id_idx` | 0 | Potentially unused |
+| `stockadjustments_product_id_idx` | 0 | Potentially unused |
+| `stockadjustments_sync_stock_seq_idx` | 0 | Potentially unused |
+| `stockadjustments_adjustment_type_idx` | 0 | Potentially unused |
+
+4 of 6 indexes show zero scans. Each unused index adds write overhead on every INSERT/UPDATE/DELETE with no read benefit. Monitor over 30 days — if still 0, consider dropping to reduce write amplification.

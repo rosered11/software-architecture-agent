@@ -341,3 +341,42 @@ Date:             2026-03-27
 
 ---
 
+### D12: REINDEX CONCURRENTLY vs VACUUM FULL vs Accept Reusable Pages
+
+```
+Title:            REINDEX CONCURRENTLY vs VACUUM FULL vs Accept Reusable Pages
+Context:          After VACUUM on stockadjustments (4M rows, spc_inventory), 6 indexes retained
+                  63% reusable pages (~1.07 GB). VACUUM marks pages "reusable" but does not
+                  shrink the index file or compact the B-tree structure.
+                  pkey index: 85% empty pages — every PK lookup traverses 6.7× more pages than needed.
+Problem:          How to reclaim ~1.07 GB of index space and restore B-tree density
+                  without taking the table offline in a production inventory system?
+Scale (BotE):     Total index: 217,353 pages × 8KB = ~1.7 GB
+                  Reusable:    137,400 pages × 8KB = ~1.07 GB wasted
+                  pkey alone:  65,465 / 76,838 = 85% empty → 2.7× I/O overhead on all PK/FK scans
+Options:
+  A. REINDEX CONCURRENTLY (chosen)
+     No table lock — reads and writes continue during rebuild.
+     Rebuilds fresh compact index from live data only.
+     Fully reclaims ~1.07 GB. Each index: ~5–20 min on 4M rows.
+  B. VACUUM FULL
+     EXCLUSIVE table lock — zero reads/writes for 10–60+ min. Unacceptable for production.
+  C. Accept Reusable Pages
+     Zero effort. B-tree stays sparse until pages naturally refill. Problem recurs next cycle.
+Decision:         Option A — REINDEX CONCURRENTLY for all 6 indexes.
+                  Only REINDEX builds a genuinely dense, compact B-tree. Non-blocking is mandatory.
+Expected Outcome: Index size: ~1.7 GB → ~630 MB. B-tree density restored. 2–3× faster index scans.
+Actual Outcome:   Index size: ~1.7 GB → 251 MB (-85%, reclaimed ~1.45 GB).
+                  pkey: ~600 MB → 89 MB. dead_ratio: 14.50% → 0.00%.
+                  Actual bloat was 85% — estimate was conservative (predicted 63%).
+                  Additional finding: 4 of 6 indexes had idx_scan = 0 (potentially unused).
+                  Monitor 30 days; consider dropping if still 0 to reduce write amplification.
+Related Knowledge:  → K26: PostgreSQL MVCC and Dead Tuples
+                    → K27: Autovacuum Scale Factor Trap for Large Tables
+Related Pattern:    → P21: Per-Table Storage Hygiene
+Related Incidents:  → I2: PostgreSQL Dead Tuple Bloat — stockadjustments
+Date:             2026-03-30
+```
+
+---
+

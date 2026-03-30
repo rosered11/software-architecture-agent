@@ -519,3 +519,35 @@ Source:           incident2.cs Phase 3, 2026-03-27
 
 ---
 
+### P21: Per-Table Storage Hygiene
+
+```
+Name:             Per-Table Storage Hygiene
+Category:         DB Performance
+Stack:            PostgreSQL
+Summary:          Override autovacuum scale_factor per-table for any table > 500K rows, and run
+                  REINDEX CONCURRENTLY after any high-churn period to restore B-tree density.
+                  Default autovacuum settings are calibrated for small tables and silently fail large ones.
+When to Use:      Any PostgreSQL table expected to exceed 500K rows.
+                  Tables with regular UPDATE or DELETE workloads (stock, orders, adjustments).
+                  After bulk migrations that delete or overwrite large row counts.
+                  When dead_ratio > 5% or last_autovacuum IS NULL on a large table.
+                  When index reusable_pages / total_pages > 30%.
+When NOT to Use:  Read-only tables (no dead tuples generated).
+                  Tables < 50K rows with infrequent writes (default autovacuum is sufficient).
+Complexity:       Low
+Decision Rule:    dead_ratio > 10% AND last_autovacuum IS NULL → VACUUM immediately + fix scale_factor
+                  index reusable / total > 30%               → REINDEX CONCURRENTLY
+                  table rows > 500K with default scale_factor → ALTER TABLE scale_factor = 0.01
+Based on Knowledge:  → K26: PostgreSQL MVCC and Dead Tuples
+                     → K27: Autovacuum Scale Factor Trap for Large Tables
+Used in Incidents:   → I2: PostgreSQL Dead Tuple Bloat — stockadjustments (2026-03-30)
+Used in Decisions:   → D12: REINDEX CONCURRENTLY vs VACUUM FULL
+Related Tech Assets: → TA12: Dead Tuple Health Monitor Query
+                     → TA13: Per-Table Autovacuum Configuration SQL
+                     → TA14: REINDEX CONCURRENTLY Script
+Source:           stockadjustments incident, spc_inventory, 2026-03-30
+```
+
+---
+

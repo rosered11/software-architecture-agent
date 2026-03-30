@@ -35,6 +35,7 @@
 | 24 | [Hosted Payment Page](#24-hosted-payment-page) | API Design | Delegate card data to PSP — eliminate PCI scope |
 | 25 | [DLQ with Reconciliation](#25-dlq-with-reconciliation) | Resilience | Dead letter queue + end-of-day financial reconciliation |
 | 26 | [Async Parallel DB Coordinator](#26-async-parallel-db-coordinator) | Performance | Fire independent DB calls in parallel using Task.WhenAll + IDbContextFactory |
+| 27 | [Per-Table Storage Hygiene](#27-per-table-storage-hygiene) | DB Performance | Tune per-table autovacuum thresholds + REINDEX CONCURRENTLY for large PostgreSQL tables |
 
 ---
 
@@ -1356,3 +1357,114 @@ Pool pressure:
 
 **Related patterns**: #12 Coordinator-Level Resolution, #13 Bulk Load Then Map
 - After DLQ message fixed → replay with same consumer group (idempotency key prevents double-processing)
+
+---
+
+## 27. Per-Table Storage Hygiene
+
+**Problem**: PostgreSQL's default autovacuum scale factor (0.20) triggers only after 20% of live rows become dead. On large tables (> 500K rows), this means hundreds of thousands of dead tuples accumulate silently — degrading index scan performance and bloating storage — before autovacuum fires. After a VACUUM, index pages are marked "reusable" but the index file does not shrink, leaving a sparse B-tree that wastes I/O on every scan.
+
+**Solution**: Override per-table autovacuum settings to trigger at 1% dead rows. After any high-churn period, run `REINDEX CONCURRENTLY` to compact index files and restore B-tree density.
+
+**When to USE**:
+- Any PostgreSQL table exceeding 500K rows with default autovacuum settings
+- After detecting dead_ratio > 5% in `pg_stat_user_tables`
+- After `last_autovacuum IS NULL` on a large active table (autovacuum never triggered)
+- After heavy bulk DELETE or UPDATE migrations
+- After index bloat > 30% (reusable_pages / total_pages)
+
+**When NOT to USE**:
+- Tables with < 50K rows and infrequent writes — default autovacuum is sufficient
+- Read-only tables — no dead tuples generated, no vacuum needed
+- Aggressive `autovacuum_vacuum_scale_factor = 0.001` on tiny tables — unnecessary overhead
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Prevents silent bloat accumulation | Autovacuum runs more frequently (but each pass is lighter) |
+| Maintains B-tree density for fast index scans | REINDEX CONCURRENTLY takes 5–20 min on large tables |
+| No application code changes required | Extra connections opened during REINDEX |
+| Non-blocking — VACUUM and REINDEX CONCURRENTLY don't lock table | Requires DBA access to ALTER TABLE |
+
+**Your Stack (PostgreSQL)**:
+
+```sql
+-- Step 1: Detect tables with dead tuple problem
+SELECT
+  relname AS table_name,
+  n_live_tup,
+  n_dead_tup,
+  ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2) AS dead_ratio_pct,
+  last_autovacuum,
+  last_analyze
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 10000
+   OR (n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) > 0.05
+ORDER BY n_dead_tup DESC;
+
+-- Step 2: Immediate cleanup
+VACUUM (ANALYZE, VERBOSE) stockadjustments;
+
+-- Step 3: Per-table autovacuum tuning (apply to any table > 500K rows)
+ALTER TABLE stockadjustments SET (
+  autovacuum_vacuum_scale_factor = 0.01,    -- trigger at 1% dead rows
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.005,
+  autovacuum_analyze_threshold = 500
+);
+
+-- Step 4: Check index bloat
+SELECT
+  indexrelname AS index_name,
+  pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+  idx_scan,
+  idx_tup_read
+FROM pg_stat_user_indexes
+WHERE relname = 'stockadjustments'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- Step 5: Rebuild bloated indexes (non-blocking)
+REINDEX INDEX CONCURRENTLY stockadjustments_pkey;
+REINDEX INDEX CONCURRENTLY stockadjustments_adjusted_at_idx;
+-- (repeat for each bloated index)
+
+-- Monitor REINDEX progress
+SELECT phase, blocks_done, blocks_total,
+       ROUND(blocks_done::numeric / NULLIF(blocks_total, 0) * 100, 1) AS pct
+FROM pg_stat_progress_create_index
+WHERE relid = 'stockadjustments'::regclass;
+```
+
+**BotE Impact**:
+```
+BEFORE (stockadjustments incident):
+  Index size:   ~1.7 GB (217,353 pages)
+  Index bloat:  63% — 137,400 reusable pages = ~1.07 GB wasted
+  PK scan:      traverses 85% empty pages per lookup
+  Heap:         ~140 MB dead tuple bloat
+
+AFTER (VACUUM + REINDEX CONCURRENTLY):
+  Index size:   ~630 MB (-63%)
+  Index bloat:  < 5%
+  PK scan:      dense B-tree, 2–3× fewer page reads
+  Heap:         0 dead tuples
+```
+
+**Decision Rule**:
+```
+Table rows > 5M   → autovacuum_vacuum_scale_factor = 0.005
+Table rows > 500K → autovacuum_vacuum_scale_factor = 0.01
+Table rows > 100K → autovacuum_vacuum_scale_factor = 0.05
+Table rows < 100K → default (0.20) is fine
+
+dead_ratio > 10% AND last_autovacuum IS NULL → run VACUUM immediately, then fix scale_factor
+dead_ratio > 5% consistently despite autovacuum → check for long-running blocking transactions
+index reusable_pages / total_pages > 30%      → run REINDEX CONCURRENTLY
+VACUUM FULL (instead of REINDEX CONCURRENTLY)  → only in maintenance window; locks table entirely
+```
+
+**Real incident**: `stockadjustments` (spc_inventory, 2026-03-30). 702,783 dead rows (14.5%) — autovacuum never triggered because default threshold = 828,932. After manual VACUUM: heap clean but 63% index bloat (1.07 GB waste) remained. REINDEX CONCURRENTLY queued for all 6 indexes.
+
+**Related patterns**: none — this is a DB operations pattern, standalone.

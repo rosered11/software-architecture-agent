@@ -452,3 +452,107 @@ Related Pattern:    → P16: Async Parallel DB Coordinator
 
 ---
 
+### TA12: Dead Tuple Health Monitor Query (PostgreSQL)
+
+```
+Name:             Dead Tuple Health Monitor
+Type:             Code Snippet
+Language:         SQL / PostgreSQL
+Usage:            Run on a schedule (daily or weekly) or after any heavy write/delete operation.
+                  Alert when dead_ratio > 5% on tables with > 100K rows.
+                  Add to pg_cron, Grafana alert, or external cron scheduler.
+
+SELECT
+  schemaname,
+  relname AS table_name,
+  n_live_tup AS live_rows,
+  n_dead_tup AS dead_rows,
+  ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2) AS dead_ratio_pct,
+  last_vacuum,
+  last_autovacuum,
+  last_analyze,
+  n_mod_since_analyze
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 10000
+   OR (n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) > 0.05
+ORDER BY n_dead_tup DESC;
+
+Related Knowledge:  → K26: PostgreSQL MVCC and Dead Tuples
+Related Pattern:    → P21: Per-Table Storage Hygiene
+```
+
+---
+
+### TA13: Per-Table Autovacuum Configuration (PostgreSQL)
+
+```
+Name:             Per-Table Autovacuum Scale Factor Override
+Type:             Config Snippet
+Language:         SQL / PostgreSQL
+Usage:            Apply to any table > 500K rows with default autovacuum settings.
+                  Run once — persists in pg_class until explicitly changed.
+                  Scale by table size: 0.005 for > 5M rows, 0.01 for > 500K, 0.05 for > 100K.
+
+-- For large tables (> 500K rows): trigger vacuum at ~1% dead rows
+ALTER TABLE stockadjustments SET (
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.005,
+  autovacuum_analyze_threshold = 500
+);
+
+-- For very large tables (> 5M rows)
+ALTER TABLE <your_large_table> SET (
+  autovacuum_vacuum_scale_factor = 0.005,
+  autovacuum_vacuum_threshold = 1000
+);
+
+-- Verify the setting was applied
+SELECT relname, reloptions
+FROM pg_class
+WHERE relname = 'stockadjustments';
+
+Related Knowledge:  → K27: Autovacuum Scale Factor Trap for Large Tables
+Related Pattern:    → P21: Per-Table Storage Hygiene
+```
+
+---
+
+### TA14: REINDEX CONCURRENTLY Script (PostgreSQL)
+
+```
+Name:             REINDEX CONCURRENTLY — Non-Blocking Index Rebuild
+Type:             Code Snippet
+Language:         SQL / PostgreSQL
+Usage:            Run after detecting index bloat > 30% (reusable / total pages).
+                  Run one index at a time. Monitor via pg_stat_progress_create_index.
+                  Does not lock the table — safe for production.
+                  Requires PostgreSQL 12+.
+
+-- Run each one at a time (not all in parallel)
+REINDEX INDEX CONCURRENTLY stockadjustments_pkey;
+REINDEX INDEX CONCURRENTLY stockadjustments_adjusted_at_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_sync_stock_seq_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_adjustment_type_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_product_id_idx;
+REINDEX INDEX CONCURRENTLY stockadjustments_stock_id_idx;
+
+-- Monitor progress (run in a separate session)
+SELECT phase, blocks_done, blocks_total,
+       ROUND(blocks_done::numeric / NULLIF(blocks_total, 0) * 100, 1) AS pct_complete
+FROM pg_stat_progress_create_index
+WHERE relid = 'stockadjustments'::regclass;
+
+-- Verify sizes after (before: ~1.7 GB, after: 251 MB measured)
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'stockadjustments'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+Related Knowledge:  → K26: PostgreSQL MVCC and Dead Tuples
+Related Pattern:    → P21: Per-Table Storage Hygiene
+Related Decision:   → D12: REINDEX CONCURRENTLY vs VACUUM FULL
+```
+
+---
+

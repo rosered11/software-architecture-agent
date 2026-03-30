@@ -91,6 +91,64 @@ Real incident (target.cs):
 
 ---
 
+## PostgreSQL Storage & Vacuum
+
+```
+Autovacuum scale_factor by table size:
+  table rows > 5M   → autovacuum_vacuum_scale_factor = 0.005  (trigger at ~0.5% dead rows)
+  table rows > 500K → autovacuum_vacuum_scale_factor = 0.01   (trigger at ~1% dead rows)
+  table rows > 100K → autovacuum_vacuum_scale_factor = 0.05   (trigger at ~5% dead rows)
+  table rows < 100K → default 0.20 is acceptable
+
+  Default trigger formula: 50 + 0.20 × n_live_tup
+  Example: 4M rows × 0.20 = 828,932 dead rows before autovacuum fires — too high
+  Fix:     4M rows × 0.01 = ~41,000 dead rows → frequent, lightweight passes
+```
+
+```
+Dead tuple thresholds:
+  dead_ratio < 5%   → healthy, no action
+  dead_ratio 5–10%  → monitor, check autovacuum settings
+  dead_ratio > 10%  → run VACUUM immediately, fix scale_factor
+  dead_ratio > 20%  → incident — autovacuum is broken or blocked, investigate
+
+  last_autovacuum IS NULL on large table → always a scale_factor or autovacuum-disabled problem
+```
+
+```
+VACUUM vs REINDEX decision:
+  High dead_ratio → VACUUM (ANALYZE) — cleans heap, updates stats, non-blocking
+  High index reusable_pages (> 30%) → REINDEX CONCURRENTLY — compacts index, non-blocking
+  Both problems → VACUUM first, then REINDEX
+  Need to reclaim heap disk space urgently → VACUUM FULL (blocks table — maintenance window only)
+
+  VACUUM alone does NOT shrink index files — "reusable pages" stay in the file
+  REINDEX CONCURRENTLY is safe for production — no table lock, takes 5–20 min on large tables
+```
+
+```
+Long-running transaction blocking VACUUM:
+  Diagnosis: SELECT pid, now() - query_start AS duration, state, query
+             FROM pg_stat_activity
+             WHERE state != 'idle' AND query_start < now() - interval '5 minutes';
+  If found: identify and terminate or wait — VACUUM cannot reclaim tuples visible to open txns
+  Dead_ratio grows despite autovacuum running → long transactions are the cause
+```
+
+```
+Index bloat thresholds:
+  reusable / total < 10%  → healthy
+  reusable / total 10–30% → monitor
+  reusable / total > 30%  → REINDEX CONCURRENTLY
+  reusable / total > 70%  → critical — run REINDEX immediately
+
+  Real incident (stockadjustments, 2026-03-30):
+    pkey index: 65,465 / 76,838 = 85% reusable → every PK scan traverses 85% empty pages
+    Total index waste: ~1.07 GB across 6 indexes — all required REINDEX CONCURRENTLY
+```
+
+---
+
 ## EF Core
 
 ```

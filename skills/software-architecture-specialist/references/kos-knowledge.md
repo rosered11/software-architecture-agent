@@ -1518,3 +1518,89 @@ Source:           incident2.cs Phase 4, 2026-03-27; EF Core Microsoft documentat
 
 ---
 
+### K26: PostgreSQL MVCC and Dead Tuples
+
+```
+Title:            PostgreSQL MVCC and Dead Tuples
+Type:             Concept
+Domain:           DB Performance
+Difficulty:       Intermediate
+Summary:          PostgreSQL's MVCC model never overwrites rows in place — every UPDATE and DELETE
+                  creates a dead tuple that remains in the heap and indexes until VACUUM reclaims it.
+                  Uncleaned dead tuples degrade scan performance and bloat storage silently.
+Deep Dive:        In MVCC, UPDATE = insert new row version + mark old version dead.
+                  DELETE = mark row dead. Dead tuples remain visible to open transactions
+                  that started before the operation — VACUUM cannot remove them until all such
+                  transactions close (the "removable cutoff" XID).
+                  Dead heap tuples: cause sequential scans to read wasted pages (+dead_ratio% I/O).
+                  Dead index entries: remain in the B-tree, requiring visibility checks on every
+                  index lookup — slowing range queries and PK lookups even when data is indexed.
+                  VACUUM cleans heap + marks index pages "reusable" — but does NOT shrink index files.
+                  Only REINDEX CONCURRENTLY produces a genuinely compact, dense B-tree.
+                  Monitor via: pg_stat_user_tables (n_dead_tup, last_autovacuum, dead_ratio_pct)
+Example:          SELECT relname, n_live_tup, n_dead_tup,
+                    ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2) AS dead_ratio_pct,
+                    last_autovacuum
+                  FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;
+Trade-offs:       Pros: MVCC enables non-blocking reads alongside writes (no read locks needed)
+                  Cons: Dead tuples accumulate silently; require periodic VACUUM + REINDEX to reclaim
+Decision Rule:    dead_ratio < 5%  → healthy
+                  dead_ratio 5–10% → monitor, check autovacuum settings
+                  dead_ratio > 10% → run VACUUM immediately
+                  dead_ratio > 20% → incident — autovacuum is broken or blocked
+Related Concepts: → K27: Autovacuum Scale Factor Trap for Large Tables
+Related Patterns: → P21: Per-Table Storage Hygiene
+Related Incidents:→ I2: PostgreSQL Dead Tuple Bloat — stockadjustments (2026-03-30)
+Related Decisions:→ D12: REINDEX CONCURRENTLY vs VACUUM FULL
+Related Tech Assets: → TA12: Dead Tuple Health Monitor Query
+Source:           stockadjustments incident, spc_inventory, 2026-03-30
+```
+
+---
+
+### K27: Autovacuum Scale Factor Trap for Large Tables
+
+```
+Title:            Autovacuum Scale Factor Trap for Large Tables
+Type:             Framework Knowledge
+Domain:           DB Performance
+Difficulty:       Intermediate
+Summary:          PostgreSQL's default autovacuum_vacuum_scale_factor = 0.20 requires 20% of live
+                  rows to be dead before vacuum fires. On large tables this means hundreds of
+                  thousands of dead rows accumulate silently — the default is calibrated for small
+                  tables and must be overridden per-table in production.
+Deep Dive:        Autovacuum trigger formula:
+                    threshold = autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × n_live_tup
+                    Default:   50 + 0.20 × n_live_tup
+                  Real incident: 4M-row table → threshold = 828,932 dead rows to trigger.
+                  At incident detection: 702,783 dead rows (14.5%) — still 126,149 below threshold.
+                  Autovacuum never fired — working as configured, but configuration was wrong.
+                  Fix: per-table override with ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = 0.01)
+                  This triggers at ~1% dead rows (~41K for a 4M-row table):
+                  frequent, lightweight passes vs. one massive deferred cleanup.
+                  Global postgresql.conf affects all tables; per-table settings override for that table only.
+Example:          ALTER TABLE stockadjustments SET (
+                    autovacuum_vacuum_scale_factor = 0.01,
+                    autovacuum_vacuum_threshold = 1000,
+                    autovacuum_analyze_scale_factor = 0.005,
+                    autovacuum_analyze_threshold = 500
+                  );
+                  -- Verify:
+                  SELECT relname, reloptions FROM pg_class WHERE relname = 'stockadjustments';
+Trade-offs:       Pros: Prevents large bloat accumulation; each vacuum pass is small and fast
+                  Cons: Autovacuum worker fires more often (negligible overhead on modern hardware)
+Decision Rule:    table rows > 5M   → autovacuum_vacuum_scale_factor = 0.005
+                  table rows > 500K → autovacuum_vacuum_scale_factor = 0.01
+                  table rows > 100K → autovacuum_vacuum_scale_factor = 0.05
+                  table rows < 100K → default 0.20 is fine
+                  last_autovacuum IS NULL on large active table → scale_factor is almost certainly too high
+Related Concepts: → K26: PostgreSQL MVCC and Dead Tuples
+Related Patterns: → P21: Per-Table Storage Hygiene
+Related Incidents:→ I2: PostgreSQL Dead Tuple Bloat — stockadjustments (2026-03-30)
+Related Decisions:→ D12: REINDEX CONCURRENTLY vs VACUUM FULL
+Related Tech Assets: → TA13: Per-Table Autovacuum Configuration SQL
+Source:           stockadjustments incident, spc_inventory, 2026-03-30; PostgreSQL documentation
+```
+
+---
+
