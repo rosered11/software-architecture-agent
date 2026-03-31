@@ -384,18 +384,19 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 
 ### Results
 
-| Metric | Baseline (measured) | After Phase 1 (measured) | After Phase 2 (measured) | After Phase 3 (measured) | After Indexes (measured) | After Phase 4 (est.) |
-|--------|---------------------|--------------------------|--------------------------|--------------------------|--------------------------|----------------------|
-| ElapsedMs (P50) | **5,048ms** | **2,836ms (-44%)** | **~2,730ms (-46%)** | **~1,505ms (-70%)** | **~1,579ms (+5% noise)** | < 600ms |
-| ElapsedMs (best) | 3,193ms | **2,792ms (-13%)** | **2,634ms (-17%)** | **1,481ms (-54%)** | **1,539ms** | — |
-| ElapsedMs (cold start) | 8,283ms | 12,533ms | **6,309ms (-24%)** | **4,521ms (-45%)** | **9,014ms (plan recompile)** | — |
-| CpuMs (steady) | 15-62ms | **0-46ms** | **0-46ms** | **0-109ms** | **0-110ms** | ~15ms |
-| AllocatedKB per call | 2,668 KB | **2,697 KB (~same)** | **~2,655 KB (~same)** | **~2,470 KB (~same)** | **~1,808 KB (-27%)** | ~1,500 KB |
-| GC0 per 10 calls | 1 | **0.2 (-80%)** | **0.03 (-97%)** | **~5 (GC cycling)** | **0.3 (-94%)** | ~0.1 |
-| GC1 per 10 calls | 1 | **0.1 (-90%)** | **0.03 (-97%)** | **~5** | **0 (-100%)** | 0 |
-| ThreadPool IO | 0 (sync) | **0** | **0** | **0** | **0** | > 0 (async) |
-| DB queries per request | ~33 | **~22** | **~18** | **~50 (20+3N)** | **~50 (unchanged)** | ~20 |
-| Max concurrent before pool exhaustion | ~20 | **~35** | **~40** | **~140+** | **~200+ (lower I/O hold time)** | ~400+ |
+| Metric | Baseline (measured) | After Phase 1 (measured) | After Phase 2 (measured) | After Phase 3 (measured) | After Indexes (measured) | After P0+P1 (measured) | After Phase 4 (est.) |
+|--------|---------------------|--------------------------|--------------------------|--------------------------|--------------------------|------------------------|----------------------|
+| ElapsedMs (P50) | **5,048ms** | **2,836ms (-44%)** | **~2,730ms (-46%)** | **~1,505ms (-70%)** | **~1,579ms (+5% noise)** | **1,224ms (-76%)** | ~400ms |
+| ElapsedMs (best) | 3,193ms | **2,792ms (-13%)** | **2,634ms (-17%)** | **1,481ms (-54%)** | **1,539ms** | **1,198ms** | — |
+| ElapsedMs (cold start) | 8,283ms | 12,533ms | **6,309ms (-24%)** | **4,521ms (-45%)** | **9,014ms (plan recompile)** | **5,849ms (compiled query init)** | — |
+| CpuMs (steady) | 15-62ms | **0-46ms** | **0-46ms** | **0-109ms** | **0-110ms** | **0-62ms** | ~15ms |
+| AllocatedKB per call | 2,668 KB | **2,697 KB (~same)** | **~2,655 KB (~same)** | **~2,470 KB (~same)** | **~1,808 KB (-27%)** | **~1,536 KB (-42%)** | ~1,500 KB |
+| GC0 per 10 calls | 1 | **0.2 (-80%)** | **0.03 (-97%)** | **~5 (GC cycling)** | **0.3 (-94%)** | **0.42 (1/24 calls)** | ~0.1 |
+| GC1 per 10 calls | 1 | **0.1 (-90%)** | **0.03 (-97%)** | **~5** | **0 (-100%)** | **0 (-100%)** | 0 |
+| GC2 per 10 calls | 0 (cold only) | — | — | — | — | **0 (-100%)** | 0 |
+| ThreadPool IO | 0 (sync) | **0** | **0** | **0** | **0** | **0** | > 0 (async) |
+| DB queries per request | ~33 | **~22** | **~18** | **~50 (20+3N)** | **~50 (unchanged)** | **~20+N (PackageTb 4→1)** | ~20 |
+| Max concurrent before pool exhaustion | ~20 | **~35** | **~40** | **~140+** | **~200+ (lower I/O hold time)** | **~200+** | ~400+ |
 
 **Phase 1 notes (2026-03-26):**
 - Latency dropped 44% — duplicate query collapse + Include(Amount) working
@@ -421,6 +422,13 @@ private static readonly Histogram GetSubOrderDuration = Metrics
   - GC cycling healthy at ~5 GC0/10 calls — 2.5 MB allocated per call, collected before accumulation
   - **Remaining bottleneck**: per-sub-order calls kept as-is: `GetStoreLocation`, `getPackageInfoByOrderAndSubOrder`, `GetPackageTb` — 3×N sequential calls (~900ms for N=10)
 
+**P0+P1 notes (2026-03-31) — GC management fixes:**
+- **P0 — EF.CompileQuery applied** (`_bulkSubOrderQuery` static field): bulk SubOrder query with 16 Include paths compiled once at first call. Cold start: 5,849ms / 106 MB allocated (one-time IL compilation). Steady-state: AllocatedKB drops to ~1,536 KB by call #5.
+- **P1 — GetPackageTb 4→1 query**: collapsed `Any()` + `Max(CreatedDate)` + `Max(UpdatedDate)` + `ToList()` into single `ToList()` + in-memory Max. Removes 3N DB round-trips per request.
+- **AsNoTracking added**: `GetStoreLocation`, `getPackageInfoByOrderAndSubOrder`, `GetPackageTb` all now use `AsNoTracking()`.
+- **Heap load test (Order.API-11.dmp)**: DynamicMethod 17,557 → 7,356 (-58%); total heap 112 MB → 90 MB (-20%); SubOrderMessageViewModel 836 → 50 (-94% — confirms no ChangeTracker leak under concurrency). Remaining 7,356 DynamicMethod = service-wide stable query footprint (no longer growing).
+- **Remaining bottleneck**: 3 × N sequential per-sub-order calls (GetStoreLocation + getPackageInfoByOrderAndSubOrder + GetPackageTb) = ~1,200ms for N=10. Phase 4 target.
+
 **Phase 4 notes (2026-03-27) — Applied to incident2.cs:**
 - **Implemented**: `GetSubOrderAsync` coordinator using `Task.WhenAll` with `IDbContextFactory`
 - **New async private methods**: `GetOrderHeaderAsync`, `GetOrderMessagePaymentsInternalAsync`, `GetOrderPromotionInternalAsync`, `GetRewardItemsBatchedAsync` — each accepts its own `DbContext` from the factory
@@ -431,6 +439,105 @@ private static readonly Histogram GetSubOrderDuration = Metrics
 - **Migration**: sync `GetSubOrder` preserved unchanged; callers migrate to `GetSubOrderAsync` one at a time
 - **Wire-up required**: `services.AddDbContextFactory<YourDbContext>(...)` in Program.cs + inject `IDbContextFactory` in constructor
 - **BotE impact**: latency ceiling drops from `~1,500ms (sequential)` to `~max(400ms, 300ms, 250ms, 200ms) = ~400ms` — estimated 73% reduction from Phase 3 baseline
+
+---
+
+### Heap Dump Analysis — Order.API-3.dmp (2026-03-31)
+
+**Dump taken after Phase 3 (AsNoTracking applied). Total: 1,327,781 objects, ~112 MB.**
+
+```
+Top heap consumers:
+  System.Byte[]                              94,262 objects   19.8 MB  (17.6%)  → HTTP/JSON buffers — normal
+  System.String                             157,652 objects   17.7 MB  (15.7%)  → SQL text, log strings — normal
+  System.Char[]                              20,709 objects    7.5 MB  (6.7%)   → String internals — normal
+  System.Reflection.Emit.DynamicILGenerator  17,557 objects    2.67 MB          ← NON-RECLAIMABLE
+  Microsoft.Data.SqlClient._SqlMetaData      13,663 objects    2.19 MB          ← SqlDataReader column descriptors
+  System.Reflection.Emit.DynamicMethod       17,557 objects    2.25 MB          ← NON-RECLAIMABLE
+  System.Int32[]                             22,641 objects    1.50 MB
+  System.Reflection.Emit.DynamicResolver     17,539 objects    1.26 MB          ← NON-RECLAIMABLE
+  Microsoft.Data.SqlClient.SqlBuffer          8,188 objects    524 KB           ← SqlDataReader raw data
+```
+
+**Finding 1 — EF compiled query cache: 17,557 entries (~6 MB non-reclaimable)**
+
+Each unique LINQ expression tree compiled at runtime = 1 DynamicMethod + 1 DynamicILGenerator + 1 DynamicResolver. With 16 Include paths via `AsSplitQuery()` in the bulk query (Pattern #13), and no static precompilation, the cache grows with each unique parameter combination. These objects live in static cache — GC cannot collect them.
+
+- Threshold: < 500 = healthy, > 2,000 = action required. 17,557 = critical.
+- Fix: extract `GetSubOrderMessage` bulk query as `static readonly Func<>` using `EF.CompileAsyncQuery` (Pattern #28)
+
+**Finding 2 — SqlClient buffers: 2.7 MB alive at snapshot**
+
+13,663 `_SqlMetaData` objects = column schema descriptors for ~13,663 columns of open result sets. 8,188 `SqlBuffer` objects = raw column data still held. The 3 per-sub-order calls kept as-is (`GetStoreLocation`, `getPackageInfoByOrderAndSubOrder`, `GetPackageTb`) each use raw ADO.NET — verify all use `await using` on `DbCommand` and `SqlDataReader`.
+
+**Finding 3 — ChangeTracker entities ABSENT (confirms AsNoTracking working)**
+
+Domain objects in heap:
+- `SubOrderMessageAddressViewModel`: 836 objects, 234 KB
+- `SubOrderItemDeliveryWindowModel`: ~50 objects, 14 KB
+
+No large EF proxy entity clusters. Phase 3 `AsNoTracking()` fully effective — the sawtooth pattern from the live log is gone.
+
+**GC improvement action plan (priority order)**:
+
+| Priority | Action | Expected Impact |
+|----------|--------|-----------------|
+| P0 | Add `EF.CompileAsyncQuery` static field for bulk GetSubOrderMessage query | Reduce DynamicMethod 17,557 → < 50; free ~6 MB static heap |
+| P1 | Verify `await using` on all ADO.NET calls in GetStoreLocation, getPackageInfoByOrderAndSubOrder, GetPackageTb | Eliminate SqlBuffer/SqlMetaData accumulation |
+| P2 | Phase 4 async parallel execution (Task.WhenAll) | Reduce request duration → heap released faster per request |
+| P3 | IMemoryCache on GetStoreLocation (5-min TTL, key = BU+SourceBU+SourceLoc) | Eliminate N identical queries per request |
+
+---
+
+### Heap Dump Analysis — Order.API-11.dmp (Load Test, 2026-03-31)
+
+**Dump taken after P0+P1 fixes under load test. Total: 782,396 objects, ~90 MB.**
+
+```
+Top heap consumers (heapstat-4.txt):
+  System.Byte[]                              42,251 objects    8.9 MB  → HTTP buffers — normal
+  System.String                              80,399 objects    6.3 MB  → SQL text, logs — normal
+  System.Char[]                              10,813 objects    1.7 MB  → normal
+  System.Reflection.Emit.DynamicILGenerator   7,356 objects    1.1 MB  ← stable (was 17,557)
+  System.Reflection.Emit.DynamicMethod        7,356 objects    942 KB  ← stable (was 17,557)
+  Microsoft.Data.SqlClient._SqlMetaData       6,242 objects    1.0 MB  ← concurrent load, GC-reclaimable
+  System.Reflection.Emit.DynamicResolver      7,335 objects    528 KB  ← stable (was 17,539)
+  Microsoft.Data.SqlClient.SqlBuffer          5,442 objects    348 KB  ← concurrent load, GC-reclaimable
+  Free                                        8,458 objects   32.6 MB  ← post-GC fragmentation, normal
+  SubOrderMessageViewModel                       50 objects   17.2 KB  ← only active requests (was 836)
+```
+
+**Side-by-side vs heapstat-3 (pre-fix):**
+
+| Metric | heapstat-3 | heapstat-4 | Change |
+|--------|-----------|-----------|--------|
+| Total objects | 1,327,781 | 782,396 | -41% |
+| Total heap | 112 MB | 90 MB | -20% |
+| DynamicMethod | 17,557 | **7,356** | **-58%** |
+| DynamicILGenerator | 17,557 | **7,356** | **-58%** |
+| DynamicResolver | 17,539 | **7,335** | **-58%** |
+| _SqlMetaData | 13,663 | 6,242 | -54% (load-proportional) |
+| SqlBuffer | 8,188 | 5,442 | -34% (load-proportional) |
+| SubOrderMessageViewModel | 836 | **50** | **-94%** |
+
+**Finding 1 — EF compiled query cache stabilised**
+
+Before: 17,557 DynamicMethod — same queries recompiled on every unique call variation → unbounded growth.
+After: 7,356 DynamicMethod — represents entire service's unique query footprint across all endpoints compiled once during load test. **Stable ceiling: will not grow further unless new query shapes are added.**
+
+7,356 × all Reflection.Emit types ≈ 3.2 MB total static cache. Acceptable for a service this size.
+
+**Finding 2 — No ChangeTracker leak under concurrency**
+
+SubOrderMessageViewModel: 836 → 50 (only active in-flight requests at snapshot time). `AsNoTracking()` confirmed effective under concurrent load. The sawtooth pattern and 260 MB concurrency risk from baseline are eliminated.
+
+**Finding 3 — Heap fragmentation (32.6 MB free)**
+
+Post-load-test GC fragmented the heap but all 32.6 MB is reusable without growing the process. Fragmented blocks: String (624 KB), Int32[] (1 MB), CancellationTokenSource (1.1 MB), Byte[] (790 KB). Normal pattern — no action needed.
+
+**Finding 4 — SqlBuffer / _SqlMetaData load-proportional (not a leak)**
+
+Under concurrent load, multiple SqlDataReaders are open simultaneously. These objects are GC-reclaimable and scale with concurrent request count. Confirmed not a leak: count is proportional to load, not growing between requests.
 
 ---
 
@@ -496,6 +603,7 @@ See `architecture-decision.md` for full ADR.
 | **Pattern** | Coordinator-Level Resolution → `references/patterns.md` #12 |
 | **Pattern** | Bulk Load Then Map → `references/patterns.md` #13 |
 | **Pattern** | Async Parallel DB Coordinator (new) → `references/patterns.md` #26 |
+| **Pattern** | EF Compiled Query Cache Management → `references/patterns.md` #28 |
 | **Pattern (KOS)** | P7, P16, P17, P18, P19, P20 |
 | **Decision** | Eager load via Include() chain over lazy Entry().Load() on hot-path read methods |
 | **Decision** | Resolve canonical OrderId once at coordinator level — not inside each sub-call |
@@ -506,6 +614,8 @@ See `architecture-decision.md` for full ADR.
 | **Tech Assets** | Stopwatch + GC instrumentation snippet, Prometheus histogram snippet, EF LogTo config snippet |
 | **Tech Assets** | `GetSubOrderAsync` + `MapPayments` + `MapPromotions` + `MapRewardItems` snippets (incident2.cs) |
 | **Tech Assets (KOS)** | TA7, TA8, TA9, TA10, TA11 |
+| **Heap Dump** | `heapstat-3.txt` — Order.API-3.dmp (2026-03-31, pre-fix): 17,557 DynamicMethod, SqlClient buffers, ChangeTracker absent |
+| **Heap Dump** | `heapstat-4.txt` — Order.API-11.dmp (2026-03-31, load test post-fix): DynamicMethod stable at 7,356 (-58%), heap 90 MB (-20%), SubOrderMessageViewModel 50 (-94%), no ChangeTracker leak under concurrency |
 
 ---
 

@@ -36,6 +36,7 @@
 | 25 | [DLQ with Reconciliation](#25-dlq-with-reconciliation) | Resilience | Dead letter queue + end-of-day financial reconciliation |
 | 26 | [Async Parallel DB Coordinator](#26-async-parallel-db-coordinator) | Performance | Fire independent DB calls in parallel using Task.WhenAll + IDbContextFactory |
 | 27 | [Per-Table Storage Hygiene](#27-per-table-storage-hygiene) | DB Performance | Tune per-table autovacuum thresholds + REINDEX CONCURRENTLY for large PostgreSQL tables |
+| 28 | [EF Compiled Query Cache Management](#28-ef-compiled-query-cache-management) | Performance | Prevent EF Core compiled query cache from growing unbounded — use static compiled queries |
 
 ---
 
@@ -1468,3 +1469,96 @@ VACUUM FULL (instead of REINDEX CONCURRENTLY)  → only in maintenance window; l
 **Real incident**: `stockadjustments` (spc_inventory, 2026-03-30). 702,783 dead rows (14.5%) — autovacuum never triggered because default threshold = 828,932. After manual VACUUM: heap clean but 63% index bloat (1.07 GB waste) remained. REINDEX CONCURRENTLY queued for all 6 indexes.
 
 **Related patterns**: none — this is a DB operations pattern, standalone.
+
+---
+
+## 28. EF Compiled Query Cache Management
+
+**Problem**: EF Core compiles every unique LINQ expression tree into IL at runtime and stores the result in a static `CompiledQueryCache`. Each unique expression tree = 1 `DynamicMethod` + 1 `DynamicILGenerator` + 1 `DynamicResolver` object held in static memory — never collected by GC. Under production load with many query variations, this cache grows into thousands of entries consuming 5–10 MB of non-reclaimable static heap.
+
+**Solution**: Precompile hot-path queries as static `Func<>` fields using `EF.CompileAsyncQuery` (or `EF.CompileQuery` for sync). The expression tree is compiled exactly once per process lifetime regardless of how many times the method is called or how many concurrent requests run.
+
+**When to USE**:
+- Any query called on a hot API path (called > 100× / minute)
+- Large Include chains with many navigation properties (each variation = new cache entry)
+- When heap dump (`dumpheap -stat`) shows DynamicMethod / DynamicILGenerator object count > 1,000
+- Batch queries with `Contains()` over ID lists (each unique set → unique expression tree)
+
+**When NOT to USE**:
+- One-off admin queries or background jobs called infrequently
+- Queries that change shape based on runtime conditions (the compiled signature must be fixed)
+- Very simple queries with no Includes (compilation cost is negligible)
+
+**Complexity**: Low
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| Cache entry created once — eliminates per-call compilation overhead | Query shape is fixed at compile time — cannot add/remove dynamic filters |
+| DynamicMethod/ILGenerator objects: N (per unique query) → 1 | All parameters must be passed as `Func<>` arguments — no closures |
+| Reduces static heap by 5–10 MB for hot-path queries | Requires static field — not injectable, harder to test in isolation |
+| Available as async: `EF.CompileAsyncQuery` | `IAsyncEnumerable` return for multi-row; `Task<T>` for single-row |
+
+**Your Stack (.NET + EF Core)**:
+```csharp
+// BEFORE: new expression tree compiled on every call (per unique parameter set)
+public async Task<List<SubOrderModel>> GetSubOrdersAsync(string[] ids)
+{
+    return await _context.SubOrders
+        .AsNoTracking()
+        .Include(so => so.Items).ThenInclude(i => i.Amount)
+        .Where(so => ids.Contains(so.SourceSubOrderId))
+        .ToListAsync();
+}
+// Heap: +1 DynamicMethod + 1 DynamicILGenerator per unique call
+
+// AFTER: compiled once, reused on every call
+private static readonly Func<AppDbContext, string[], IAsyncEnumerable<SubOrderModel>> _getSubOrdersBulk =
+    EF.CompileAsyncQuery((AppDbContext ctx, string[] ids) =>
+        ctx.SubOrders
+           .AsNoTracking()
+           .Include(so => so.Items).ThenInclude(i => i.Amount)
+           .Where(so => ids.Contains(so.SourceSubOrderId)));
+
+public async Task<List<SubOrderModel>> GetSubOrdersAsync(string[] ids)
+{
+    var results = new List<SubOrderModel>();
+    await foreach (var item in _getSubOrdersBulk(_context, ids))
+        results.Add(item);
+    return results;
+}
+// Heap: +1 DynamicMethod + 1 DynamicILGenerator total — never increases again
+```
+
+**Diagnosing from heap dump (`dotnet-dump analyze`)**:
+```
+// In dotnet-dump REPL:
+dumpheap -stat
+
+// Red flags in output:
+System.Reflection.Emit.DynamicMethod       > 1,000 objects → compiled query cache pressure
+System.Reflection.Emit.DynamicILGenerator  > 1,000 objects → (always matches DynamicMethod count)
+System.Reflection.Emit.DynamicResolver     > 1,000 objects → (always matches DynamicMethod count)
+
+// Healthy service: < 500 DynamicMethod objects
+// Incident: heapstat-3.txt showed 17,557 DynamicMethod objects (6 MB, non-reclaimable)
+```
+
+**Decision Rule**:
+```
+DynamicMethod count < 500        → healthy, no action needed
+DynamicMethod count 500–2,000    → investigate — which queries are not compiled statically?
+DynamicMethod count > 2,000      → apply EF.CompileAsyncQuery to top 5 hottest queries
+DynamicMethod count = DynamicILGenerator count → always true (1:1 relationship)
+
+Query called > 100×/min AND has Include chain → compile it as static Func<>
+Query with dynamic filters (optional .Where clauses) → cannot compile statically → accept cache growth
+```
+
+**Real incident (Order.API-3.dmp → Order.API-11.dmp, 2026-03-31)**:
+- Before fix (heapstat-3): 17,557 `DynamicMethod` objects — bulk query with 16 Include paths recompiled per unique call variation. Unbounded growth.
+- Fix applied: `_bulkSubOrderQuery = EF.CompileQuery(...)` static field. Cold start first call allocated 106 MB (one-time IL compilation). Steady-state AllocatedKB dropped from 1,808 KB → 1,536 KB per call.
+- Load test validation (heapstat-4): `DynamicMethod` count 17,557 → **7,356 (-58%)** at higher load. Count is **stable** — confirmed ceiling, not unbounded growth. Remaining 7,356 = service-wide unique query footprint across all endpoints.
+- Heap: 112 MB → 90 MB (-20%). SubOrderMessageViewModel: 836 → 50 (-94%) — no ChangeTracker leak under concurrency.
+
+**Related patterns**: #13 Bulk Load Then Map, #26 Async Parallel DB Coordinator

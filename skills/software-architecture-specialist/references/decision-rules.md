@@ -223,6 +223,59 @@ Real example: GetSubOrderAsync (incident2.cs) — Phase 4, applied 2026-03-27.
 ```
 
 ```
+EF compiled query cache thresholds:
+  DynamicMethod objects < 500       → healthy
+  DynamicMethod objects 500–2,000   → investigate which hot-path queries lack static compilation
+  DynamicMethod objects > 2,000     → apply EF.CompileAsyncQuery to top 5 hottest queries immediately
+
+  DynamicMethod count == DynamicILGenerator count == DynamicResolver count → always (1:1:1 per compiled query)
+  These objects are in static cache → GC CANNOT collect them → non-reclaimable heap
+
+  Diagnosis: dotnet-dump → dumpheap -stat → search for System.Reflection.Emit.Dynamic*
+  Fix: extract hot query to static readonly Func<> using EF.CompileAsyncQuery / EF.CompileQuery
+
+  Rule: any query called on a hot API path (> 100×/min) with Include chain → compile statically
+  Rule: dynamic filter queries (optional .Where) cannot be compiled statically → accept growth, mitigate by limiting filter combinations
+
+  Distinguishing unbounded growth from stable ceiling (load test validation):
+    Unbounded growth:  DynamicMethod count increases across multiple heap dumps taken at same load
+                       → same queries being recompiled on every call variation → apply EF.CompileQuery
+    Stable ceiling:    DynamicMethod count is same (or lower) across heap dumps at same or higher load
+                       → each unique query compiled once → no action needed
+    How to confirm:    Take two heap dumps 10 minutes apart under steady load; compare DynamicMethod count
+                       If delta ≈ 0 → stable; if delta grows linearly with requests → unbounded
+
+  Real incident (2026-03-31 load test):
+    Before fix: 17,557 DynamicMethod (unbounded — same bulk query recompiled per call variation)
+    After EF.CompileQuery fix under load test: 7,356 DynamicMethod (stable ceiling)
+    Remaining 7,356 = service-wide unique query footprint across all endpoints — expected, non-growing
+    Total static cache: ~3.2 MB — acceptable for a service with many endpoints
+```
+
+```
+.NET heap composition — what to expect in dumpheap -stat:
+  System.Byte[]                      → HTTP buffers, JSON output, network I/O — normal, GC-managed
+  System.String                      → SQL query strings, log messages, JSON keys — normal, GC-managed
+  System.Char[]                      → String internals, JsonReader — normal
+  System.Reflection.Emit.Dynamic*    → EF compiled query cache — NON-RECLAIMABLE — see threshold above
+  Microsoft.Data.SqlClient._SqlMetaData → DB column descriptors — per open SqlDataReader, dispose promptly
+  Microsoft.Data.SqlClient.SqlBuffer → Raw column data from SqlDataReader — dispose promptly
+  EF entity types in large quantity  → ChangeTracker accumulation — add AsNoTracking() immediately
+  IQueryable / IncludableQueryable   → EF query builder objects — GC-collected after materialization (normal)
+
+  SqlClient objects alive at snapshot time:
+    Count proportional to concurrent request count → load-proportional, GC-reclaimable, normal
+    Count stable / growing between snapshots at same load → potential leak → verify `await using` on all ADO calls
+  EF entity counts match expected N   → normal
+  EF entity counts >> expected N      → ChangeTracker leak — DbContext not disposed, or missing AsNoTracking()
+
+  Heap fragmentation (large Free block in dumpheap -stat):
+    Free block < 30% of total heap → normal post-GC, reusable without growing process
+    Free block > 50% of total heap → investigate — LOH fragmentation, consider GC.Collect(2, GCCollectionMode.Forced) in maintenance
+    Fragmented block types (String, Byte[], Int32[]) → normal buffers from concurrent request processing
+```
+
+```
 Map function extraction:
 When: async version of a method needs the same in-memory mapping as the sync version.
 Rule: extract the mapping (e.g. MapPayments, MapPromotions, MapRewardItems) to a private
@@ -520,11 +573,37 @@ Minimum instrumentation for a .NET hot-path method:
 ```
 
 ```
-GC pressure indicators:
+GC pressure indicators (live log):
 GC.Gen0 delta > 0 per request   → short-lived object churn (EF proxy objects, tracking overhead)
 GC.Gen1 delta > 0 per request   → memory pressure — objects surviving Gen0, investigate
 GC.Gen2 delta > 0 per request   → serious — large or long-lived allocations, treat as incident
 AsNoTracking() on read path      → reduces Gen0 pressure by eliminating EF change tracking objects
+
+Sawtooth MemDelta pattern (grows N KB/call then drops):
+  → EF ChangeTracker accumulating entities until DbContext disposed or GC fires
+  → Fix: AsNoTracking() on all read-only queries
+  → Confirmed safe when sawtooth disappears post-fix (heap stays flat)
+
+Concurrency risk formula:
+  concurrent_requests × AllocatedKB_per_call = live unrecollectable heap during burst
+  Example: 100 concurrent × 2,600 KB = 260 MB simultaneously held
+  If this approaches 70% of process memory limit → GC will fire stop-the-world Gen2 collections
+  Fix path: (1) AsNoTracking — eliminate tracking overhead, (2) compiled queries — reduce static heap,
+            (3) Phase 4 async parallel — reduce request duration so heap is released faster
+```
+
+```
+Heap dump analysis workflow (.dmp file):
+  1. dotnet-dump analyze <path/to/file.dmp>
+  2. dumpheap -stat                    → top types by total size, sorted ascending (largest at bottom)
+  3. Look for red flags (see .NET heap composition rule above)
+  4. For specific type: dumpheap -type <TypeName>  → lists all instances with addresses
+  5. For retention path: gcroot <address>          → who is keeping this object alive
+  6. For live strings: dumpheap -type System.String → check for unexpectedly large string sets
+
+  Export heapstat to file (before entering REPL):
+    dotnet-dump analyze <file.dmp> --command "dumpheap -stat" > heapstat.txt 2>&1
+    (or pipe via: echo "dumpheap -stat" | dotnet-dump analyze <file.dmp>)
 ```
 
 ```
