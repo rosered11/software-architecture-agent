@@ -380,3 +380,75 @@ Date:             2026-03-30
 
 ---
 
+### D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+
+```
+Title:            Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+Context:          heap dump (Order.API-3.dmp) showed 17,557 DynamicMethod objects consuming
+                  ~6 MB of non-reclaimable static heap. Cause: the Phase 3 bulk query with
+                  16 Include paths + AsSplitQuery was not precompiled — EF recompiled the
+                  expression tree on every unique parameter set.
+Problem:          Non-reclaimable static heap growing unboundedly. GC cannot reclaim
+                  DynamicMethod/DynamicILGenerator/DynamicResolver objects in CompiledQueryCache.
+Options:
+  A. EF.CompileQuery static field (chosen)
+     Extract bulk SubOrder query as private static readonly Func<DbContext, string[], string[], IEnumerable<T>>.
+     Compiled exactly once on first call. Subsequent calls use cached IL.
+     Cold start: ~106 MB / 5,849ms (one-time). Steady-state: no new DynamicMethod per call.
+  B. Leave as-is
+     Cache grows unbounded. Under load: thousands of DynamicMethod objects, 6–10+ MB static waste.
+  C. Remove AsSplitQuery
+     Eliminates split-query entries but reintroduces cartesian join explosion with 16 Include paths.
+     Not viable — N×16 rows returned.
+Decision:         Option A — EF.CompileQuery static field. EF Core 10 confirmed to support
+                  AsSplitQuery in compiled queries.
+Expected Outcome: DynamicMethod count reduced from 17,557 to ~50 (just this query's 16 split entries).
+Actual Outcome:   DynamicMethod count 17,557 → 7,356 at higher load (load test). Stable ceiling
+                  confirmed — remaining 7,356 = other queries across all service endpoints
+                  each compiled once. Total static cache ~3.2 MB. No further growth.
+                  AllocatedKB per call: 1,808 KB → 1,536 KB (-15%). P50: 1,579ms → 1,224ms (-22%).
+Related Knowledge:  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Related Pattern:    → P22: EF Compiled Query Cache Management
+Related Incidents:  → I1: GetSubOrder API Latency Spike
+Related Tech Assets:→ TA15: EF.CompileQuery Static Field Template
+Date:             2026-03-31
+```
+
+---
+
+### D14: GetPackageTb — Consolidate 4 Queries to 1 + AsNoTracking on Per-Sub-Order Calls
+
+```
+Title:            GetPackageTb — Consolidate 4 Queries to 1 + AsNoTracking on Per-Sub-Order Calls
+Context:          Code review of the 3 remaining per-sub-order methods (GetStoreLocation,
+                  getPackageInfoByOrderAndSubOrder, GetPackageTb) triggered by heap dump
+                  SqlBuffer accumulation investigation. Found GetPackageTb issuing 4 sequential
+                  queries per sub-order: Any() + Max(CreatedDate) + Max(UpdatedDate) + ToList().
+                  All 3 methods also missing AsNoTracking() on read-only paths.
+Problem:          GetPackageTb: 4N DB round-trips instead of N. For N=10 sub-orders = 40 queries
+                  instead of 10. Any() + Max queries add latency and hold SqlDataReader connections.
+                  Missing AsNoTracking() on 3 methods generates unnecessary tracked entity copies.
+Options:
+  A. Single ToList() + in-memory Max (chosen)
+     Load all rows once with AsNoTracking(). Compute Max(CreatedDate) and Max(UpdatedDate)
+     in-memory using LINQ. Apply filter in-memory. Zero additional DB round-trips.
+  B. Collapse to single OrderByDescending().Take() query
+     Works if only the single latest row is needed. But original logic keeps all rows
+     matching both MaxCreatedDate AND MaxUpdatedDate — multiple rows possible.
+     Risk of behaviour change — chose Option A for safe equivalence.
+Decision:         Option A — single ToList() + in-memory Max. Behaviour-safe refactor.
+                  AsNoTracking() added to GetStoreLocation, getPackageInfoByOrderAndSubOrder,
+                  GetPackageTb simultaneously.
+Actual Outcome:   GetPackageTb: 4N → N queries (-75% query reduction for this method).
+                  P50 improvement contribution: part of 1,579ms → 1,224ms (-22%) total.
+                  AllocatedKB: 1,808 KB → 1,536 KB (-15%) — AsNoTracking reducing tracking overhead.
+                  GC1 per 30 calls: dropped to 0 (was 0.3 after indexes).
+Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
+                  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Related Pattern:    → P22: EF Compiled Query Cache Management
+Related Incidents:  → I1: GetSubOrder API Latency Spike
+Date:             2026-03-31
+```
+
+---
+

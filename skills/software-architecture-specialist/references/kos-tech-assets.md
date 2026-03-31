@@ -556,3 +556,115 @@ Related Decision:   → D12: REINDEX CONCURRENTLY vs VACUUM FULL
 
 ---
 
+### TA15: EF.CompileQuery Static Field Template
+
+```
+Name:             EF.CompileQuery Static Field Template
+Type:             Code Snippet
+Language:         C#
+Stack:            .NET / EF Core 7.0+ (AsSplitQuery requires 7.0+)
+Description:      Static compiled query template for hot-path EF Core queries with
+                  Include chains. Eliminates DynamicMethod/DynamicILGenerator accumulation
+                  in the EF CompiledQueryCache. Replace YourDbContext and entity/field names.
+// Snippet:
+// Step 1: Add static field at class level (compiled once on first call)
+// Replace: YourDbContext, YourEntity, YourFilterField
+private static readonly Func<YourDbContext, string[], string[], IEnumerable<YourEntity>>
+    _bulkQuery = EF.CompileQuery(
+        (YourDbContext ctx, string[] ids1, string[] ids2) =>
+            ctx.YourEntities
+               .AsNoTracking()
+               .Include(e => e.NavigationA)
+               .Include(e => e.NavigationB).ThenInclude(b => b.ChildC)
+               // ... add all Include paths ...
+               .AsSplitQuery()
+               .Where(e => ids1.Contains(e.Field1) && ids2.Contains(e.Field2)));
+
+// Step 2: Replace the inline query in the method body
+var results = _bulkQuery(
+    _context,
+    listOfIds1.ToArray(),
+    listOfIds2.ToArray()
+).ToList();
+
+// For async path: use EF.CompileAsyncQuery → returns IAsyncEnumerable<T>
+private static readonly Func<YourDbContext, string[], string[], IAsyncEnumerable<YourEntity>>
+    _bulkQueryAsync = EF.CompileAsyncQuery(
+        (YourDbContext ctx, string[] ids1, string[] ids2) =>
+            ctx.YourEntities.AsNoTracking()
+               .Include(e => e.NavigationA)
+               .AsSplitQuery()
+               .Where(e => ids1.Contains(e.Field1)));
+
+// Usage:
+var results = new List<YourEntity>();
+await foreach (var item in _bulkQueryAsync(_context, ids1.ToArray(), ids2.ToArray()))
+    results.Add(item);
+
+// Verify impact: dotnet-dump analyze <file.dmp>
+// dumpheap -stat | grep DynamicMethod
+// Expected: count drops to service-wide unique footprint (stable ceiling)
+Related Knowledge:  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Related Pattern:    → P22: EF Compiled Query Cache Management
+Related Decision:   → D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+```
+
+---
+
+### TA16: dotnet-dump Heap Analysis Workflow
+
+```
+Name:             dotnet-dump Heap Analysis Workflow
+Type:             Runbook / Command Reference
+Language:         bash / dotnet CLI
+Stack:            .NET (any version)
+Description:      Step-by-step commands to take a memory dump, run dumpheap -stat,
+                  export to file, and interpret results. Covers both .dmp (full dump)
+                  and .gcdump (GC-only) paths.
+// Snippet:
+# ── Capture dump ──────────────────────────────────────────────────────────────
+
+# Option A: dotnet-dump (full memory dump — includes all heap detail)
+dotnet tool install -g dotnet-dump
+dotnet-dump collect -p <PID> -o ./Order.API-$(date +%s).dmp
+
+# Option B: dotnet-gcdump (GC-only — lighter, heapstat only)
+dotnet tool install -g dotnet-gcdump
+dotnet-gcdump collect -p <PID> -o ./heap.gcdump
+dotnet-gcdump report heap.gcdump --report-type HeapStat   # only valid report type
+
+# ── Analyze .dmp file ─────────────────────────────────────────────────────────
+
+# Interactive REPL
+dotnet-dump analyze ./Order.API.dmp
+
+# Inside REPL — key commands:
+dumpheap -stat                          # all types sorted by total size (largest at bottom)
+dumpheap -type DynamicMethod            # list all DynamicMethod instances with addresses
+dumpheap -type SubOrderMessageViewModel # list domain entity instances
+gcroot <address>                        # who is keeping object at <address> alive
+exit
+
+# ── Export heapstat to file (non-interactive) ─────────────────────────────────
+# Windows:
+echo dumpheap -stat | dotnet-dump analyze ./Order.API.dmp > heapstat.txt 2>&1
+
+# ── Interpret output ──────────────────────────────────────────────────────────
+# Read bottom-up (largest total size at bottom of file)
+# Red flags: DynamicMethod > 2000, Free > 50% of heap, EF entity type > 1000 objects
+# Healthy: DynamicMethod < 500, Free < 30%, domain objects proportional to active requests
+
+# ── Compare two dumps (leak detection) ───────────────────────────────────────
+# Dump 1: baseline (steady state)
+# Dump 2: 10 min later at same load
+# Compare DynamicMethod count:
+#   delta ≈ 0   → stable ceiling (fix confirmed)
+#   delta grows → unbounded growth → apply EF.CompileQuery
+Related Knowledge:  → K29: .NET Heap Dump Analysis — Reading dumpheap -stat
+                    → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Related Pattern:    → P22: EF Compiled Query Cache Management
+Related Decision:   → D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+```
+
+---
+

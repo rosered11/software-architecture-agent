@@ -3,7 +3,7 @@
 ### Need to sync all deatil into KOS
 
 ```
-All details update must always be recorded in KOS.
+All details update must always be recorded in KOS and all related update.
 ```
 
 ### I still working it?

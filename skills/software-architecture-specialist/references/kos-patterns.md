@@ -551,3 +551,34 @@ Source:           stockadjustments incident, spc_inventory, 2026-03-30
 
 ---
 
+### P22: EF Compiled Query Cache Management
+
+```
+Name:             EF Compiled Query Cache Management
+Category:         .NET Performance / EF Core
+Stack:            .NET / EF Core 7.0+ (AsSplitQuery support in compiled queries)
+Summary:          Precompile hot-path EF Core queries as static Func<> fields using
+                  EF.CompileQuery or EF.CompileAsyncQuery. Eliminates per-call DynamicMethod
+                  allocation in EF's static CompiledQueryCache. Non-reclaimable cache entries
+                  are created once at first call and reused for the process lifetime.
+When to Use:      Query called > 100×/min on a hot API path.
+                  dumpheap -stat shows DynamicMethod count > 2000.
+                  Query has a fixed shape (no dynamic filter additions at runtime).
+                  EF Core 7.0+ (required for AsSplitQuery in compiled queries).
+When NOT to Use:  Query shape changes dynamically (optional .Where clauses based on runtime flags).
+                  One-off or infrequent queries (compilation cost is negligible).
+                  EF Core < 7.0 with AsSplitQuery (throws at runtime — upgrade or remove split).
+Complexity:       Low
+Decision Rule:    DynamicMethod count > 2000 AND query is on hot path     → apply EF.CompileQuery
+                  Count stable across load test dumps (delta ≈ 0)          → ceiling reached, no action
+                  Count grows linearly with requests                        → unbounded, fix immediately
+                  Query has optional filters                                → cannot compile statically
+Based on Knowledge:  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Used in Incidents:   → I1: GetSubOrder API Latency Spike
+Used in Decisions:   → D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+Related Tech Assets: → TA15: EF.CompileQuery Static Field Template
+Source:           Order.API-3.dmp + Order.API-11.dmp load test analysis, 2026-03-31
+```
+
+---
+

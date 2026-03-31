@@ -597,23 +597,23 @@ See `architecture-decision.md` for full ADR.
 | Type | Record |
 |------|--------|
 | **Knowledge** | N+1 Query Problem, Batch Query Pattern, EF Core Best Practices, Connection Pool Math, GC pressure from EF tracking |
-| **Knowledge (KOS)** | K20, K25 |
+| **Knowledge (KOS)** | K25, K28, K29 |
 | **Pattern** | Batch Query → `references/patterns.md` #1 |
 | **Pattern** | Eager Graph Loading → `references/patterns.md` #11 |
 | **Pattern** | Coordinator-Level Resolution → `references/patterns.md` #12 |
 | **Pattern** | Bulk Load Then Map → `references/patterns.md` #13 |
 | **Pattern** | Async Parallel DB Coordinator (new) → `references/patterns.md` #26 |
 | **Pattern** | EF Compiled Query Cache Management → `references/patterns.md` #28 |
-| **Pattern (KOS)** | P7, P16, P17, P18, P19, P20 |
+| **Pattern (KOS)** | P7, P16, P17, P18, P19, P20, P22 |
 | **Decision** | Eager load via Include() chain over lazy Entry().Load() on hot-path read methods |
 | **Decision** | Resolve canonical OrderId once at coordinator level — not inside each sub-call |
 | **Decision** | Option A (Batch Refactor) Phase 1-3 complete; Option B (Async Parallel) Phase 4 applied 2026-03-27 |
 | **Decision** | Use IDbContextFactory over shared _context for parallel async paths — thread safety |
 | **Knowledge** | EF Core DbContext is not thread-safe → IDbContextFactory required for parallel tasks |
-| **Decision (KOS)** | D8, D9, D10, D11 |
+| **Decision (KOS)** | D8, D9, D10, D11, D13, D14 |
 | **Tech Assets** | Stopwatch + GC instrumentation snippet, Prometheus histogram snippet, EF LogTo config snippet |
 | **Tech Assets** | `GetSubOrderAsync` + `MapPayments` + `MapPromotions` + `MapRewardItems` snippets (incident2.cs) |
-| **Tech Assets (KOS)** | TA7, TA8, TA9, TA10, TA11 |
+| **Tech Assets (KOS)** | TA7, TA8, TA9, TA10, TA11, TA15, TA16 |
 | **Heap Dump** | `heapstat-3.txt` — Order.API-3.dmp (2026-03-31, pre-fix): 17,557 DynamicMethod, SqlClient buffers, ChangeTracker absent |
 | **Heap Dump** | `heapstat-4.txt` — Order.API-11.dmp (2026-03-31, load test post-fix): DynamicMethod stable at 7,356 (-58%), heap 90 MB (-20%), SubOrderMessageViewModel 50 (-94%), no ChangeTracker leak under concurrency |
 

@@ -1604,3 +1604,127 @@ Source:           stockadjustments incident, spc_inventory, 2026-03-30; PostgreS
 
 ---
 
+### K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+
+```
+Title:            EF Core Compiled Query Cache and DynamicMethod Accumulation
+Category:         .NET / EF Core
+Difficulty:       Intermediate
+Summary:          EF Core compiles every unique LINQ expression tree into IL at runtime using
+                  System.Reflection.Emit. Each unique query shape produces one DynamicMethod +
+                  one DynamicILGenerator + one DynamicResolver object stored in a static
+                  CompiledQueryCache. These objects are non-reclaimable by GC — they live for
+                  the process lifetime. Without static precompilation, the same hot-path query
+                  recompiles on every call variation, growing the cache unboundedly.
+Deep Dive:        EF Core compiled query cache lifecycle:
+                    1. LINQ expression tree is constructed from lambda on first call
+                    2. EF Core hashes the expression tree (shape + parameter types)
+                    3. If not in cache: compile to IL via Reflection.Emit (expensive)
+                    4. Cache: DynamicMethod + DynamicILGenerator + DynamicResolver (all static, non-GC)
+                    5. On subsequent calls with same shape: cache hit, IL invoked directly
+
+                  Unbounded growth causes:
+                    - Dynamic query construction (optional .Where chains) → unique tree per combination
+                    - AsSplitQuery with 16 Include paths, not compiled statically → N entries per call
+
+                  Static compilation with EF.CompileQuery / EF.CompileAsyncQuery:
+                    - One static Func<DbContext, TParam, IEnumerable<T>> field per query shape
+                    - Compiled exactly once on first call, reused forever
+                    - Remaining DynamicMethod count = service-wide unique query footprint (stable ceiling)
+
+                  Diagnosis via dotnet-dump:
+                    dumpheap -stat → count System.Reflection.Emit.DynamicMethod
+                    Threshold: < 500 healthy | 500–2000 investigate | > 2000 apply EF.CompileQuery
+                    Stable vs unbounded: compare count across two dumps at same load — delta ≈ 0 = stable
+Example:          // BEFORE: recompiles per call
+                  var result = ctx.SubOrder.AsNoTracking()
+                      .Include(...).AsSplitQuery()
+                      .Where(x => ids.Contains(x.SourceOrderId)).ToList();
+
+                  // AFTER: compiled once
+                  private static readonly Func<AppDbContext, string[], IEnumerable<SubOrderModel>>
+                      _q = EF.CompileQuery((AppDbContext ctx, string[] ids) =>
+                          ctx.SubOrder.AsNoTracking()
+                              .Include(...).AsSplitQuery()
+                              .Where(x => ids.Contains(x.SourceOrderId)));
+Trade-offs:       Pros: Non-reclaimable static heap fixed to one allocation per unique shape.
+                       Eliminates per-call expression compilation overhead.
+                  Cons: Query shape must be fixed at compile time — no dynamic filter additions.
+                       First call still pays compilation cost (cold start).
+                       AsSplitQuery in compiled queries requires EF Core 7.0+.
+Decision Rule:    DynamicMethod count > 2000 AND hot-path query → apply EF.CompileQuery
+                  Query has optional/conditional .Where clauses → cannot compile statically
+                  EF Core version < 7 + AsSplitQuery → remove AsSplitQuery or upgrade first
+Related Patterns: → P22: EF Compiled Query Cache Management
+Related Decisions:→ D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+Related Incidents:→ I1: GetSubOrder API Latency Spike
+Related Tech Assets: → TA15: EF.CompileQuery Static Field Template
+Source:           Order.API-3.dmp + Order.API-11.dmp heap analysis, 2026-03-31
+```
+
+---
+
+### K29: .NET Heap Dump Analysis — Reading dumpheap -stat
+
+```
+Title:            .NET Heap Dump Analysis — Reading dumpheap -stat
+Category:         .NET Observability
+Difficulty:       Intermediate
+Summary:          dumpheap -stat in dotnet-dump lists all managed heap types sorted by total size
+                  (ascending — largest at bottom). Each line: MethodTable | Count | TotalSize | TypeName.
+                  Knowing what each type family means allows rapid diagnosis of memory problems
+                  without deep GC expertise.
+Deep Dive:        Type families and what they indicate:
+
+                  System.Byte[] / System.String / System.Char[]
+                    → HTTP buffers, JSON output, SQL query text, log messages.
+                    → GC-reclaimable. Normal for an API service. No action unless unusually large.
+
+                  System.Reflection.Emit.DynamicMethod / DynamicILGenerator / DynamicResolver
+                    → EF Core compiled query cache. NON-RECLAIMABLE (static, lives until process exit).
+                    → Count must match 1:1:1. > 2000 = too many unique query shapes being compiled.
+                    → Fix: EF.CompileQuery / EF.CompileAsyncQuery static fields.
+
+                  Microsoft.Data.SqlClient._SqlMetaData / SqlBuffer / SqlParameter
+                    → Column descriptors + raw data from open SqlDataReader objects.
+                    → GC-reclaimable. Proportional to concurrent request count — normal under load.
+                    → If count grows between snapshots at same load → verify `await using` on ADO.NET.
+
+                  EF entity types (SubOrderModel, OrderModel, etc.) in large quantity
+                    → ChangeTracker accumulation. EF holding entity + snapshot copy.
+                    → Fix: AsNoTracking() on all read-only queries.
+                    → Confirmed absent = AsNoTracking() working correctly.
+
+                  Free (large block, e.g. 32 MB)
+                    → Post-GC fragmentation. Heap space reclaimed but not yet returned to OS.
+                    → Reusable without growing process. Normal after load test.
+                    → Free > 50% of heap → investigate LOH fragmentation.
+
+                  AutoMapper.PropertyMap / System.Linq.Expressions.*
+                    → Startup-time mapping compilation cache. Static. Expected to be large.
+
+                  Load test vs single-request dump interpretation:
+                    Single request → transient per-request objects (SqlBuffer, TaskStateMachine)
+                    Load test      → all concurrent request objects visible simultaneously
+                    Compare counts proportional to concurrent requests → confirms GC-reclaimable
+                    Compare counts equal across load levels → confirms static/leaked
+Example:          heapstat-3 vs heapstat-4 comparison (Order.API):
+                    DynamicMethod: 17,557 → 7,356 at higher load = stable ceiling (fix confirmed)
+                    SubOrderMessageViewModel: 836 → 50 = AsNoTracking working under concurrency
+                    SqlBuffer: 8,188 → 5,442 at lower load = load-proportional, not a leak
+Trade-offs:       Pros: Fast diagnosis without profiler. Works on production .dmp files.
+                  Cons: Snapshot in time — misses transient allocations between GC cycles.
+                       Does not show who is holding references (use gcroot <address> for that).
+Decision Rule:    Always read dumpheap -stat bottom-up (largest first).
+                  Take two dumps 10 min apart at same load to distinguish leak from load-proportional.
+                  If DynamicMethod count grows between dumps → unbounded EF cache → apply EF.CompileQuery.
+Related Knowledge:→ K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Related Patterns: → P22: EF Compiled Query Cache Management
+Related Incidents:→ I1: GetSubOrder API Latency Spike
+Related Tech Assets: → TA16: dotnet-dump heapstat Analysis Workflow
+Source:           Order.API-3.dmp + Order.API-11.dmp, 2026-03-31
+```
+
+---
+
+
