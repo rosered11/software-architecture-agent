@@ -78,14 +78,14 @@ When analyzing a production problem or performance issue:
 7. PATTERN            — What reusable pattern applies?
 8. DECISION RULE      — When should this pattern be used in future?
 9. KNOWLEDGE CAPTURE  — Close the loop. Offer to:
-                        (a) Add incident to references/incident-log.md
+                        (a) Add incident to references/kos-incident.md
                         (b) Extract new pattern → references/patterns.md
                         (c) Extract new rule  → references/decision-rules.md
                         Never skip this step — an unlogged incident generates no reusable knowledge.
 ```
 
 > 📖 For real incident examples with full root cause, fix, before/after code, and results,
-> read `references/incident-log.md`.
+> read `references/kos-incident.md`.
 
 ---
 
@@ -164,7 +164,7 @@ Watch out for:    [Risks to monitor]
 
 When the user asks for a runbook, or after completing an Incident Analysis:
 
-1. **Check `references/incident-log.md`** first — if the incident is already logged, use its Root Cause, Fix, and Prevention to populate the runbook directly
+1. **Check `references/kos-incident.md`** first — if the incident is already logged, use its Root Cause, Fix, and Prevention to populate the runbook directly
 2. **Generate all 8 sections** — Header, Overview, Alert Condition, Detection, Diagnosis Tree, Fix Procedures, Rollback, Post-Incident
 3. **Make Diagnosis Tree specific** — branch on the actual root causes known for this system, not generic placeholders
 4. **Suggest the save path** — `runbooks/[system-name]-[problem-slug].md`

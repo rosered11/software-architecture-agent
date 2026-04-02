@@ -46,7 +46,7 @@ Every runbook has 8 sections. All are required.
 | Owner | [Team or person responsible] |
 | Last Updated | [YYYY-MM-DD] |
 | Last Tested | [YYYY-MM-DD or "Never — test on next occurrence"] |
-| Related Incident | [Link to incident-log.md entry if exists] |
+| Related Incident | [Link to kos-incident.md entry if exists] |
 | Related KOS | [Knowledge / Pattern / Decision Log entries] |
 
 ---
@@ -314,7 +314,7 @@ Complete this after the issue is fully resolved:
 | Owner | Backend Platform Team |
 | Last Updated | 2024-XX-XX |
 | Last Tested | Never — test on next occurrence |
-| Related Incident | incident-log.md → GetSubOrder API Latency Spike |
+| Related Incident | kos-incident.md → GetSubOrder API Latency Spike |
 | Related KOS | Knowledge: N+1 Query Problem, Batch Query Pattern |
 
 ---
@@ -408,7 +408,7 @@ Expected after fix: ≤ 10 queries per GetSubOrder call.
 
 When generating a runbook from an incident:
 
-1. **Read `references/incident-log.md`** if the incident is already logged — use Root Cause, Fix, and Prevention fields to populate the runbook directly
+1. **Read `references/kos-incident.md`** if the incident is already logged — use Root Cause, Fix, and Prevention fields to populate the runbook directly
 2. **Populate all 8 sections** — use `[TO FILL — ...]` for anything unknown rather than skipping
 3. **Make the Diagnosis Tree specific** — generic trees are useless on-call at 2am
 4. **Every Fix Procedure needs**: commands, expected resolution time, and risk statement

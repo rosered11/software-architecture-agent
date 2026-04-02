@@ -43,8 +43,8 @@ KOS_KNOWLEDGE    = ROOT / "skills/software-architecture-specialist/references/ko
 KOS_PATTERNS     = ROOT / "skills/software-architecture-specialist/references/kos-patterns.md"
 KOS_DECISIONS    = ROOT / "skills/software-architecture-specialist/references/kos-decisions.md"
 KOS_TECH_ASSETS  = ROOT / "skills/software-architecture-specialist/references/kos-tech-assets.md"
-KOS_SPLIT_PATHS  = [KOS_KNOWLEDGE, KOS_PATTERNS, KOS_DECISIONS, KOS_TECH_ASSETS]
-INCIDENT_PATH= ROOT / "skills/software-architecture-specialist/references/incident-log.md"
+INCIDENT_PATH    = ROOT / "skills/software-architecture-specialist/references/kos-incident.md"
+KOS_SPLIT_PATHS  = [KOS_KNOWLEDGE, KOS_PATTERNS, KOS_DECISIONS, KOS_TECH_ASSETS, INCIDENT_PATH]
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -133,7 +133,8 @@ def extract_code_block(section_text: str) -> str | None:
 
 def parse_kos_system_design() -> dict[str, list[dict]]:
     """
-    Parse KOS split files (kos-knowledge/patterns/decisions/tech-assets.md) into records.
+    Parse all KOS split files into records.
+    Handles ### K#:, ### P#:, ### D#:, ### TA#:, ### I#: headers uniformly.
     Falls back to legacy kos-system-design.md if split files are not present.
     """
     sources = [p for p in KOS_SPLIT_PATHS if p.exists()]
@@ -145,17 +146,18 @@ def parse_kos_system_design() -> dict[str, list[dict]]:
         "patterns": [],
         "decisions": [],
         "tech_assets": [],
+        "incidents": [],
     }
 
-    # Split on section headers (### K1:, ### P1:, ### D1:, ### TA1:)
-    sections = re.split(r"\n(?=### (?:K|P|D|TA)\d+:)", text)
+    # Split on section headers (### K1:, ### P1:, ### D1:, ### TA1:, ### I1:)
+    sections = re.split(r"\n(?=### (?:K|P|D|TA|I)\d+:)", text)
 
     for section in sections:
-        header_m = re.match(r"### (K|P|D|TA)(\d+):\s+(.+)", section)
+        header_m = re.match(r"### (K|P|D|TA|I)(\d+):\s+(.+)", section)
         if not header_m:
             continue
 
-        prefix   = header_m.group(1)   # K / P / D / TA
+        prefix   = header_m.group(1)   # K / P / D / TA / I
         number   = header_m.group(2)
         title    = header_m.group(3).strip()
         kos_id   = f"{prefix}{number}"
@@ -174,67 +176,12 @@ def parse_kos_system_design() -> dict[str, list[dict]]:
             if snippet:
                 fields["Snippet"] = snippet
 
-        db_map = {"K": "knowledge", "P": "patterns", "D": "decisions", "TA": "tech_assets"}
+        db_map = {"K": "knowledge", "P": "patterns", "D": "decisions", "TA": "tech_assets", "I": "incidents"}
         result[db_map[prefix]].append(fields)
 
     return result
 
 
-def parse_incident_log() -> list[dict]:
-    """
-    Parse incident-log.md — extracts the overview table fields for each incident.
-    """
-    text = INCIDENT_PATH.read_text(encoding="utf-8")
-    incidents = []
-    index = 1
-
-    # Find each incident section
-    for section in re.split(r"\n## \d+\.", text)[1:]:
-        # Title from first line
-        title_m = re.match(r"\s*(.+)", section)
-        title = title_m.group(1).strip() if title_m else f"Incident {index}"
-
-        # Overview table: | Field | Value |
-        overview: dict = {}
-        for row in re.finditer(r"\|\s*\*\*(.+?)\*\*\s*\|\s*(.+?)\s*\|", section):
-            overview[row.group(1).strip()] = row.group(2).strip()
-
-        # Symptoms section
-        symptoms_m = re.search(r"### Symptoms\n(.*?)(?=\n###)", section, re.DOTALL)
-        symptoms = symptoms_m.group(1).strip() if symptoms_m else ""
-
-        # Root Cause
-        rc_m = re.search(r"### Root Cause\n(.*?)(?=\n###)", section, re.DOTALL)
-        root_cause = rc_m.group(1).strip() if rc_m else ""
-
-        # Lesson Learned
-        lesson_m = re.search(r"### Lesson Learned\n(.*?)(?=\n###|\Z)", section, re.DOTALL)
-        lesson = lesson_m.group(1).strip() if lesson_m else ""
-
-        # Prevention checklist
-        prevention_m = re.search(r"### Prevention\n(.*?)(?=\n###|\Z)", section, re.DOTALL)
-        prevention = prevention_m.group(1).strip() if prevention_m else ""
-
-        incidents.append({
-            "_id":                 f"I{index}",
-            "_title":              title,
-            "Title":               overview.get("Title", title),
-            "Severity":            overview.get("Severity", ""),
-            "System":              overview.get("System", ""),
-            "Status":              overview.get("Status", ""),
-            "Date":                overview.get("Date Identified", ""),
-            "Problem":             symptoms[:2000],
-            "Root Cause":          root_cause[:2000],
-            "Lesson Learned":      lesson[:2000],
-            "Prevention":          prevention[:2000],
-            "Related Knowledge":   overview.get("Knowledge (KOS)", ""),
-            "Related Pattern":     overview.get("Pattern (KOS)", ""),
-            "Related Decisions":   overview.get("Decision (KOS)", ""),
-            "Related Tech Assets": overview.get("Tech Assets (KOS)", ""),
-        })
-        index += 1
-
-    return incidents
 
 # ── Notion Helpers ────────────────────────────────────────────────────────────
 
@@ -875,14 +822,13 @@ def main():
 
     # Parse source files
     kos_data = parse_kos_system_design()
-    incidents = parse_incident_log()
 
     records_map = {
         "knowledge":   kos_data["knowledge"],
         "patterns":    kos_data["patterns"],
         "decisions":   kos_data["decisions"],
         "tech_assets": kos_data["tech_assets"],
-        "incidents":   incidents,
+        "incidents":   kos_data["incidents"],
     }
 
     # id_maps accumulates as each DB syncs: {db_name: {kos_id: page_id}}

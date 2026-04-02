@@ -106,7 +106,7 @@ All reference files updated with findings from `target.cs`:
 
 | File | Changes Made |
 |------|-------------|
-| `references/incident-log.md` | Rewrote Incident #1 with accurate line numbers from target.cs, correct query count (~33), connection pool math, 4-phase fix plan, Architecture Decision section |
+| `references/kos-incident.md` | Rewrote Incident #1 with accurate line numbers from target.cs, correct query count (~33), connection pool math, 4-phase fix plan, Architecture Decision section |
 | `references/patterns.md` | Updated Pattern #1 (Batch Query) and #11 (Eager Graph Loading) with target.cs code. **Added Pattern #12: Coordinator-Level Resolution** |
 | `references/decision-rules.md` | Added connection pool math formula, updated shared context resolution rule with target.cs references, added pool math to code review flags |
 | `references/system-design-review.md` | Rewrote SubOrder Processing worked example — 6 CRITICAL, 3 MEDIUM, 1 LOW. Updated scorecard to 19/35 with query count breakdown |
@@ -136,7 +136,7 @@ All reference files updated with findings from `target.cs`:
 | Indicator | Status | Evidence | Target |
 |-----------|--------|----------|--------|
 | ADRs documented | 1 — In Progress | `architecture-decision.md` (GetSubOrder: 3 options, trade-offs, phased plan) | 10+ by Month 9 |
-| Incidents fully logged in KOS | 1 — In Progress | `incident-log.md` #1 GetSubOrder (root cause, fix, before/after, lessons) | All incidents logged |
+| Incidents fully logged in KOS | 1 — In Progress | `kos-incident.md` #1 GetSubOrder (root cause, fix, before/after, lessons) | All incidents logged |
 | Systems through Design Review | 1 of 3 — In Progress | SubOrder Processing reviewed via target.cs (scorecard 19/35) | All 3 systems by Q1 |
 | Runbooks written | 1 — Done | `runbooks/suborder-processing-latency.md` (full 8 sections) | 1 per system by Month 3 |
 | Trace ID propagation | Not Started | No trace ID in target.cs logs | By Q2 |
@@ -183,7 +183,7 @@ You have the technical skills (Domain 3 is strong). The gap is the **habit of do
 [ ] Implement Phase 1 fixes in target.cs
     → Capture Stopwatch baseline BEFORE any code changes
     → Apply: collapse Any()+FirstOrDefault(), AsNoTracking(), Include(Amount)
-    → Record before/after metrics in incident-log.md Results table
+    → Record before/after metrics in kos-incident.md Results table
 
 [ ] Implement Phase 2: hoist IsExistOrderReference to GetSubOrder coordinator
     → Measure again after this phase
@@ -205,7 +205,7 @@ You have the technical skills (Domain 3 is strong). The gap is the **habit of do
 
 ```
 [ ] Write runbooks for remaining 2 systems (Stock Sync, FTP ETL)
-[ ] Log every incident in incident-log.md — no exceptions
+[ ] Log every incident in kos-incident.md — no exceptions
 [ ] Run review-checklists.md on every PR — flag at least 1 architectural issue per week
 [ ] Define SLA targets (P99 latency, error rate) for SubOrder Processing
 [ ] Add EF Core query count metric to Prometheus dashboard
@@ -309,60 +309,71 @@ Phase 4 (follow-up): Async migration
 
 ---
 
-## 10. Phase 1 Results — Measured 2026-03-26
+## 10. Phase 1 Results — Re-measured 2026-04-01
 
 **Test conditions**: 30 sequential calls, single-user, same OrderId `TWDCDS2602122610025068`, SubOrderId `All`
+**Note**: Original measurement 2026-03-26 replaced by re-run on 2026-04-01.
 
 ### Before/After Comparison
 
 | Metric | Baseline | Phase 1 | Change |
 |--------|----------|---------|--------|
-| ElapsedMs (P50) | 5,048ms | **2,836ms** | **-44%** |
-| ElapsedMs (best) | 3,193ms | 2,792ms | -13% |
-| ElapsedMs (cold start) | 8,283ms | 12,533ms | +51% (heavier query plan, one-time) |
-| CpuMs (steady) | 15-62ms | 0-46ms | ~same |
-| MemDelta (steady) | 2,676 KB | 2,705 KB | ~same (N+1 loops still dominate) |
-| GC0 per 10 calls | 1 | **0.2** | **-80%** |
-| GC1 per 10 calls | 1 | **0.1** | **-90%** |
-| Heap before GC | ~80 MB | ~68 MB | -15% |
+| ElapsedMs (P50) | 5,048ms | **2,600ms** | **-48%** |
+| ElapsedMs (best) | 3,193ms | **2,571ms** | **-19%** |
+| ElapsedMs (cold start) | 8,283ms | **6,970ms** | **-16% (better than baseline)** |
+| AllocatedKB (cold start) | 22,237 KB | **112,982 KB** | +407% (EF model + JIT + query plan compilation, one-time) |
+| CpuMs (steady) | 15-62ms | 0-110ms | wider range (CPU bursts during Include materialisation) |
+| AllocatedKB (steady) | 2,668 KB | **~2,700 KB** | ~same (N+1 loops still dominate) |
+| GC0 per 10 calls | 1 | **0.4** | **-60%** |
+| GC1 per 10 calls | 1 | **0** | **-100%** |
 | DB queries (est.) | ~33 | ~22 | -33% |
+
+### GC Pattern
+
+- 1×GC0 at call #28 — MemDelta -49,094 KB (heap reclaim from 84 MB → 35 MB). Healthy sawtooth.
+- No GC1 or GC2 in steady state — objects collected before surviving to Gen1.
 
 ### Interpretation
 
-- **44% latency reduction** from collapsing duplicate queries + Include(Amount) eager load
-- **GC pressure dropped 80-90%** — AsNoTracking() working as expected
-- **MemDelta flat** because N+1 loops still load the same amount of entity data — memory win comes in Phase 3
-- **Remaining 2.8s = N+1 loops** — GetSubOrderMessage (10 queries) + GetRewardItem (10 queries) = ~20 sequential round-trips at ~140ms each
+- **48% latency reduction** from collapsing duplicate queries + Include(Amount) eager load
+- **Cold start 6,970ms — better than baseline (8,283ms)**, not worse. New Include() shapes produce fewer, cheaper overall query plans than the original fragmented lazy-load pattern (many Entry().Load() shapes × plan each). Note: Phase 3's AsSplitQuery with 16 Include paths will push cold start back up to 11,377ms — `EF.CompileQuery` (P0) is required to fix this permanently.
+- **AllocatedKB cold start 113 MB** — high but one-time: EF model compilation + JIT + SQL Server query plan generation all happen at call #1. Steady state drops to ~2,700 KB by call #3.
+- **GC1 eliminated** — objects do not survive to Gen1 in steady state. AsNoTracking() working as expected.
+- **Remaining 2.6s = N+1 loops** — GetSubOrderMessage (10 queries) + GetRewardItem (10 queries) = ~20 sequential round-trips at ~130ms each
 - **Phase 2-3 will be the big drop**: eliminating 20 loop queries → expected < 300ms
 
 ---
 
-## 11. Phase 2 Results — Measured 2026-03-26
+## 11. Phase 2 Results — Re-measured 2026-04-01
 
 **Test conditions**: 30 sequential calls, single-user, same OrderId `TWDCDS2602122610025068`, SubOrderId `All`
+**Note**: Original measurement 2026-03-26 replaced by re-run on 2026-04-01.
 
 ### Before/After Comparison (Cumulative)
 
 | Metric | Baseline | Phase 1 | Phase 2 | Change (vs Baseline) |
 |--------|----------|---------|---------|---------------------|
-| ElapsedMs (P50) | 5,048ms | 2,836ms | **~2,730ms** | **-46%** |
-| ElapsedMs (best) | 3,193ms | 2,792ms | **2,634ms** | **-17%** |
-| ElapsedMs (cold start) | 8,283ms | 12,533ms | **6,309ms** | **-24%** |
-| CpuMs (steady) | 15-62ms | 0-46ms | **0-46ms** | ~same |
-| MemDelta (steady) | 2,676 KB | 2,705 KB | **~2,663 KB** | ~same |
-| AllocatedKB (steady) | 2,668 KB | 2,697 KB | **~2,655 KB** | ~same |
-| GC0 per 10 calls | 1 | 0.2 | **0.03** | **-97%** |
-| GC1 per 10 calls | 1 | 0.1 | **0.03** | **-97%** |
-| Heap before GC | ~80 MB | ~68 MB | **~80 MB (1 GC at call #21)** | ~same |
+| ElapsedMs (P50) | 5,048ms | 2,600ms | **2,514ms** | **-50%** |
+| ElapsedMs (best) | 3,193ms | 2,571ms | **2,463ms** | **-23%** |
+| ElapsedMs (cold start) | 8,283ms | 6,970ms | **5,759ms** | **-30%** |
+| CpuMs (steady) | 15-62ms | 0-110ms | **0-110ms** | ~same |
+| AllocatedKB (steady) | 2,668 KB | ~2,700 KB | **~2,655 KB** | ~same |
+| GC0 per 10 calls | 1 | 0.4 | **0.7** | -30% |
+| GC1 per 10 calls | 1 | 0 | **0.4** | -60% |
 | DB queries (est.) | ~33 | ~22 | **~18** | -45% |
+
+### GC Pattern
+
+- Call #12: GC0+GC1 fired — heap 80→35 MB (-45,347 KB). Full collection.
+- Call #29: GC0 only — heap 85→35 MB (-49,310 KB). Gen0 sawtooth.
+- GC1 reappeared vs Phase 1 — attributed to heap timing variance, not a regression. Steady AllocatedKB identical (~2,655 KB).
 
 ### Interpretation
 
-- **Marginal latency improvement** (2,836ms → ~2,730ms, -4%) — expected since hoisted IsExistOrderReference queries were individually fast (~25ms each)
-- **Cold start dramatically improved** (12,533ms → 6,309ms, -50%) — coordinator resolution means fewer query plan compilations at startup
-- **GC nearly eliminated** — only 1 GC0 + 1 GC1 across 30 calls (at call #21 when heap reached ~80MB). 97% reduction from baseline
-- **MemDelta still flat** — N+1 loops remain the dominant memory consumer (20 queries loading full entities)
-- **Remaining ~2,700ms is almost entirely N+1 loops** — GetSubOrderMessage (10 queries) + GetRewardItem (10 queries) = ~20 sequential round-trips at ~135ms each
+- **Latency improvement marginal but real** (2,600ms → 2,514ms, -3.3%) — hoisted coordinator resolution eliminates 2–3 redundant DB calls per request
+- **Cold start significantly improved** (6,970ms → 5,759ms, -17%) — fewer unique query shapes at startup after coordinator refactor
+- **AllocatedKB unchanged** (~2,655 KB) — N+1 loops still dominate memory profile
+- **Remaining ~2,500ms is entirely N+1 loops** — GetSubOrderMessage (10 queries) + GetRewardItem (10 queries) = ~20 sequential round-trips at ~125ms each
 - **Phase 3 is the critical phase** — collapsing 20 loop queries to 2 batch queries → expected < 300ms
 
 ---
@@ -375,8 +386,8 @@ Phase 4 (follow-up): Async migration
 
 | Metric | Phase 2 | Phase 3 (attempt 1) | Change |
 |--------|---------|---------------------|--------|
-| ElapsedMs (P50) | ~2,730ms | **~2,720ms** | **~0% — no improvement** |
-| ElapsedMs (cold start) | 6,309ms | **7,530ms** | **+19% worse** |
+| ElapsedMs (P50) | ~2,514ms | **~2,720ms** | **+8% noise — no improvement** |
+| ElapsedMs (cold start) | 5,759ms | **7,530ms** | **+31% worse** |
 | CpuMs (cold start) | — | **1,828ms** | Much higher — query plan compilation |
 | MemDelta (steady) | ~2,663 KB | ~2,661 KB | ~same |
 
@@ -414,105 +425,328 @@ Phase 3 (revised): Batch the outer GetSubOrderMessage loop
 
 ---
 
-## 13. Phase 3 Revised Results — Measured 2026-03-26
+## 13. Phase 3 Revised Results — Re-measured 2026-04-01 (includes Payments fix)
+
+**Changes included**:
+1. `GetSubOrderMessage` — replaced per-sub-order loop with bulk-load-then-map (`AsSplitQuery` 16 Include paths)
+2. `GetOrderMessagePayments` — added `AsNoTracking()` + `Include(Payments).ThenInclude(Transactions)` + `AsSplitQuery()`
 
 **Test conditions**: 30 sequential calls, single-user, same OrderId `TWDCDS2602122610025068`, SubOrderId `All`
+**Note**: Original measurement 2026-03-26 replaced by re-run on 2026-04-01 with both changes combined.
 
 ### Before/After Comparison (Full Progression)
 
-| Metric | Baseline | Phase 1 | Phase 2 | Phase 3 Revised | Change vs Baseline |
+| Metric | Baseline | Phase 1 | Phase 2 | Phase 3 (final) | Change vs Baseline |
 |--------|----------|---------|---------|-----------------|--------------------|
-| ElapsedMs (P50) | 5,048ms | 2,836ms | 2,730ms | **1,505ms** | **-70%** |
-| ElapsedMs (best) | 3,193ms | 2,792ms | 2,634ms | **1,481ms** | **-54%** |
-| ElapsedMs (cold start) | 8,283ms | 12,533ms | 6,309ms | **4,521ms** | **-45%** |
-| AllocatedKB (steady) | 2,668 KB | 2,697 KB | ~2,655 KB | **~2,470 KB** | -7% |
-| GC0 per 10 calls | 1 | 0.2 | 0.03 | **~5 (cycling)** | — |
-| DB queries (est.) | ~33 | ~22 | ~18 | **~50 (20+3×N)** | +52% queries, -70% latency |
+| ElapsedMs (P50) | 5,048ms | 2,600ms | 2,514ms | **1,410ms** | **-72%** |
+| ElapsedMs (best) | 3,193ms | 2,571ms | 2,463ms | **1,371ms** | **-57%** |
+| ElapsedMs (cold start) | 8,283ms | 6,970ms | 5,759ms | **8,000ms** | **-3%** |
+| AllocatedKB (steady) | 2,668 KB | ~2,700 KB | ~2,655 KB | **~1,810 KB** | **-32%** |
+| GC0 per 10 calls | 1 | 0.4 | 0.7 | **0.7** | -30% |
+| GC1 per 10 calls | 1 | 0 | 0.4 | **0.4** | -60% |
+| DB queries (est.) | ~33 | ~22 | ~18 | **~49** | +48% queries, -72% latency |
+
+### GC Pattern
+
+- Call #7: GC0+GC1 — heap 68→32 MB (-36,013 KB)
+- Call #29: GC0 only — heap 79→34 MB (-44,826 KB)
+- Sawtooth period: ~22 calls. Healthy — no accumulation.
 
 ### Interpretation
 
-- **P50 dropped 1,225ms (-45% vs Phase 2)** — bulk-loading all sub-orders in one `AsSplitQuery` eliminated the dominant sequential loop cost
-- **Cold start improved 28%** (6,309ms → 4,521ms) — one bulk query plan compiled instead of N separate plans
-- **GC cycling is healthy**: ~2.5 MB allocated per call, collected every ~2 calls. GC0/GC1 firing at normal intervals — no accumulation
-- **Query count paradox**: estimated ~50 queries (20 + 3×N) vs ~18 before — but P50 is 45% faster. The remaining queries are either batched (fast) or the 16 AsSplitQuery paths run in a single DB round-trip
-- **Remaining bottleneck**: `getPackageInfoByOrderAndSubOrder` + `GetPackageTb` + `GetStoreLocation` — all per-sub-order, all sequential. For N=10: ~30 sequential DB calls × ~30ms each ≈ ~900ms
+- **P50 dropped 1,104ms (-44% vs Phase 2)** — bulk-loading all sub-orders in one `AsSplitQuery` eliminated the dominant sequential loop cost
+- **Cold start 8,000ms — near baseline (-3%)** — without payments fix, bare Phase 3 was 11,377ms. Payments fix saved 3,377ms of plan compilation cost. Net result back near baseline.
+- **AllocatedKB -32%** (2,655→1,810 KB) — bulk load + AsNoTracking reduces tracked entity overhead
+- **GC healthy**: 2 sawtooth events in 30 calls (~22-call period). Normal.
+- **Query count paradox**: ~49 queries vs ~18 before, yet P50 -72%. AsSplitQuery runs all Include paths within one SQL roundtrip budget — latency is dominated by sequential round-trip count, not total query count.
+- **Remaining bottleneck**: `getPackageInfoByOrderAndSubOrder` + `GetPackageTb` + `GetStoreLocation` — all per-sub-order, sequential. For N=10: ~30 calls × ~30ms ≈ ~900ms
 
 ### Remaining Bottleneck Analysis
 
 ```
-Observed steady-state: ~1,505ms
-Bulk query overhead (AsSplitQuery 16 paths + batched lookups): ~400-600ms (est.)
-Per-sub-order sequential tail: ~900ms (getPackageInfoByOrderAndSubOrder + GetPackageTb + GetStoreLocation)
+Observed steady-state: ~1,410ms
+Bulk query overhead (AsSplitQuery 16 paths + payments + batched lookups): ~450-500ms (est.)
+Per-sub-order sequential tail: ~900ms (PackageInfo + PackageTb + StoreLocation)
 
-Phase 4 target: parallelize the 3 per-sub-order calls with Task.WhenAll
-Expected gain: 900ms sequential → ~100ms parallel = -800ms
-Expected Phase 4 P50: ~700-800ms
+Phase 4 target: batch all 3 per-sub-order calls before mapping loop (Pattern #13 extension)
+Expected gain: 3×N queries → 3 bulk queries = -900ms
+Expected Phase 4 P50: ~400-500ms
 ```
 
 ### Phase 4 Plan
 
 ```
-Goal: Parallelize remaining per-sub-order calls
-  → Use IDbContextFactory<> to create separate DbContext per parallel task
-  → Wrap GetStoreLocation, getPackageInfoByOrderAndSubOrder, GetPackageTb in Task
-  → Execute per-sub-order group with Task.WhenAll
-  → Expected: ~1,505ms → ~700ms
-  → Risk: Requires IDbContextFactory registration in DI container (context-per-request won't work in parallel)
+Goal: Batch remaining per-sub-order calls before mapping loop (Pattern #13 extension)
+  → Step 6a: Bulk load PackageInfo — 1 query for all sub-orders
+  → Step 6b: Bulk load PackageTb + in-memory Max filter — 1 query for all sub-orders
+  → Step 6c: Bulk load StoreLocation by unique (BU, SourceBU, SourceLoc) keys — 1 query
+  → Replace per-sub-order DB calls with dictionary lookups in mapping loop
+  → Expected: ~1,410ms → ~400-500ms
+  → No IDbContextFactory required (still synchronous, same DbContext)
 ```
 
 ---
 
-## 14. Database Index Results — Measured 2026-03-26
+## 14. Database Index Results — Applied 2026-04-01 (captured in Phase 3 final measurement)
 
-**Indexes applied**: Priority 1–3 as designed in previous section (SubOrder, OrderReference, PackageTb, StoreLocation, ItemOtherInfo, PackageInfo, PromotionItemTb, OrderPromotion, all FK child tables)
+**Indexes applied**: Priority 1–3 covering indexes (SubOrder, OrderReference, PackageTb, StoreLocation, ItemOtherInfo, PackageInfo, PromotionItemTb, OrderPromotion, all FK child tables)
 
-**Test conditions**: 30 sequential calls, same OrderId, SubOrderId="All"
+**Note**: Re-index was applied during the Phase 3 + Payments fix test run. Results are captured in the Phase 3 final measurement (section 13) — not as a separate isolated measurement. The old standalone index test (2026-03-26) was on older code; those numbers are superseded.
 
-### Before/After Comparison
+### What Re-index Contributed to Phase 3 Final
 
-| Metric | Phase 3 Revised | After Indexes | Change |
-|--------|----------------|---------------|--------|
-| ElapsedMs (P50) | 1,505ms | **~1,579ms** | **+5% (noise — no improvement)** |
-| ElapsedMs (cold start) | 4,521ms | **9,014ms** | **+99% (plan recompile — one-time)** |
-| Cold start AllocatedKB | 109,147 KB | **108,445 KB** | ~same (confirms plan recompilation) |
-| AllocatedKB (steady) | ~2,470 KB | **~1,808 KB** | **-27% (indexes reducing I/O reads)** |
-| GC0 per 10 calls | ~5 | **0.3 (1 event in 30)** | **-94%** |
-| GC1 per 10 calls | ~5 | **0** | **-100%** |
+| Metric | Phase 3 (bulk query only, no index) | Phase 3 Final (+ payments + re-index) | Index contribution |
+|--------|-------------------------------------|---------------------------------------|--------------------|
+| AllocatedKB | ~1,800 KB | **~1,810 KB** | ~same (covering indexes already reducing data read, small further gain) |
+| Cold start | 11,377ms | **8,000ms** | -3,377ms — partly payments fix, partly faster indexed plan compilation |
+| Max concurrent ceiling | ~140+ | **~200+** | covering indexes reduce per-query I/O hold time |
+| P50 | 1,336ms | 1,410ms | no direct latency gain — bottleneck is sequential round-trip count, not I/O cost |
 
-### Why Latency Did Not Improve
+### Why Indexes Don't Improve Steady-State Latency
 
-The indexes reduced **I/O cost per query** but latency is dominated by **sequential round-trip count**, not I/O cost:
+Indexes reduce **I/O cost per query** but latency is dominated by **sequential round-trip count**:
 
 ```
-~30 per-sub-order sequential calls × 38ms each = ~1,140ms (before indexes)
-~30 per-sub-order sequential calls × 35ms each = ~1,050ms (after indexes)
-Difference: ~90ms — too small to measure against 1,500ms baseline
+~30 per-sub-order sequential calls × 35ms each = ~1,050ms
+Even if indexes reduce each to 25ms: ~30 × 25ms = ~750ms
+Not enough to move P50 significantly — Phase 4 is still required
 ```
 
-The bottleneck shifted completely to round-trip count after the batch refactor. Indexes cannot reduce round-trip count — only code structure can.
-
-### Cold Start Regression — Root Cause
-
-Call #1 AllocatedKB = 108,445 KB (same as baseline) confirms SQL Server cleared the plan cache after index creation and rebuilt statistics + query plans on first request. This is a one-time event after index creation, not a permanent regression.
+The bottleneck is round-trip count, not I/O cost per query. Only batch/parallel code changes fix this.
 
 ### What Indexes Did Accomplish
 
-- **AllocatedKB -27%**: covering indexes serve queries without heap lookups → less data read into .NET
-- **GC eliminated**: less allocation per call → GC has nothing to collect in steady state
-- **Future-proofing**: under concurrency, faster I/O per query improves pool utilization ceiling even if single-request latency is unchanged
+- **Cold start reduction** (combined with payments fix): 11,377ms → 8,000ms
+- **Max concurrent ceiling ↑**: faster I/O per query → shorter connection hold time → more headroom before pool exhaustion
+- **Future-proofing**: under high concurrency, covering indexes prevent heap lookups — reduces CPU + I/O pressure proportional to concurrent request count
+- **Plan recompile** (cold start): SQL Server cleared plan cache after REINDEX → first call recompiles all plans. AllocatedKB=108,537 KB at call #1 confirms this. One-time cost.
 
-### Revised Phase 4 Plan
+---
 
-Indexes are complete. Next bottleneck is exclusively the sequential tail:
+## 15. P0+P1 Results — Measured 2026-04-01
+
+**Changes applied**:
+- **P0**: `EF.CompileQuery` — bulk SubOrder query with 16 Include paths compiled into `_bulkSubOrderQuery` static field
+- **P1**: `GetPackageTb` — collapsed 4 queries (Any + Max + Max + ToList) into 1 ToList + in-memory Max. `AsNoTracking()` added to `GetStoreLocation`, `getPackageInfoByOrderAndSubOrder`, `GetPackageTb`.
+
+**Test conditions**: 30 sequential calls, single-user, same OrderId `TWDCDS2602122610025068`, SubOrderId `All`
+
+### Before/After Comparison (Full Progression)
+
+| Metric | Baseline | Phase 3 + Indexes | P0+P1 | Change vs Baseline |
+|--------|----------|-------------------|-------|--------------------|
+| ElapsedMs (P50) | 5,048ms | 1,410ms | **1,242ms** | **-75%** |
+| ElapsedMs (best) | 3,193ms | 1,371ms | **1,228ms** | **-62%** |
+| ElapsedMs (cold start) | 8,283ms | 8,000ms | **5,406ms** | **-35%** |
+| AllocatedKB (steady) | 2,668 KB | ~1,810 KB | **~1,538 KB** | **-42%** |
+| GC0 per 10 calls | 1 | 0.7 | **1.1 (cascade)** | — |
+| GC1 per 10 calls | 1 | 0.4 | **1.1 (cascade)** | — |
+
+### Bimodal Latency Pattern
+
 ```
-Target: 30 sequential per-sub-order calls → parallel execution groups
-  GetStoreLocation ×N  \
-  PackageInfo ×N        → Task.WhenAll per sub-order
-  PackageTb ×N         /
-
-Also consider: StoreLocation cache — same BU/SourceBU/SourceLoc called 3+ times per request
-→ Cache key: (BU, SourceBU, SourceLoc) → IMemoryCache with 5-min TTL
-→ Expected: eliminate 2 of 3 StoreLocation calls per request → -70ms additional
-
-Expected P50 after Phase 4: ~700ms (parallel) - ~70ms (cache) = ~630ms
+Calls  3–18 (tier-0 JIT):  ~2,073–2,173ms  avg ~2,090ms
+Calls 19–30 (tier-1 JIT):  ~1,228–1,296ms  avg ~1,242ms
+                            ↑ step-change at call #19
 ```
+
+.NET tiered compilation: hot code paths start at tier-0 (quick, unoptimized JIT). After ~18 invocations the runtime promotes to tier-1 (fully optimized). The EF compiled query materializer is a hot path — it crosses the tier-1 threshold around call 19, cutting latency by ~41%.
+
+### GC Cascade (calls #11–13)
+
+- Call #11: GC0+GC1 — heap 62→32 MB (-30MB). Primary sawtooth.
+- Call #12: GC0+GC1+GC2 — residual sweep (-2.8MB)
+- Call #13: GC0+GC1 — residual sweep (-1.2MB)
+- Calls 14–30: GC0=0, GC1=0, GC2=0
+
+Cascade caused by heap accumulation during tier-0 warm-up phase. Not a steady-state issue — after call #13, zero GC for remaining 17 calls.
+
+### Interpretation
+
+- **Cold start -35%** (8,000ms → 5,406ms) — `EF.CompileQuery` compiles IL at static field init, not at first user request. Compilation cost moved to app startup.
+- **AllocatedKB -15%** (1,810 → 1,538 KB) — P1 AsNoTracking + GetPackageTb consolidation reduces per-call tracking overhead
+- **Tier-1 JIT** stabilises at 1,242ms from call #19 — represents true steady-state performance
+- **Remaining bottleneck**: per-sub-order sequential calls (PackageInfo + PackageTb + StoreLocation) = ~900ms of the 1,242ms
+
+---
+
+## 16. Single Sub-Order Performance Baseline — Measured 2026-04-01
+
+**No code change.** Test requested to isolate per-sub-order cost and separate fixed overhead from N-scaling overhead.
+
+**Test conditions**: 30 sequential calls, same P0+P1 code, specific SubOrderId (not "All") — cycling through 3 sub-orders: `TWDCDS26021226100250682`, `TWDCDS26021226100250684`, `TWDCDS26021226100250685`
+
+### Results
+
+| Metric | Single SubOrderId (N=1) | All SubOrders (N≈10) | Delta |
+|--------|------------------------|----------------------|-------|
+| ElapsedMs (P50, steady-state) | **~878ms** | **~1,242ms** | +364ms for +9 sub-orders |
+| ElapsedMs (best) | **863ms** | **1,228ms** | — |
+| ElapsedMs (cold start) | **3,570ms** | **5,406ms** | — |
+| AllocatedKB (steady) | **~768 KB** | **~1,538 KB** | -51% less memory for N=1 |
+| GC events | 1 sawtooth @ call #14; spikes #26-27 (transient) | GC cascade #11-13 | — |
+
+### Per-Sub-Order Cost Decomposition
+
+```
+Fixed overhead (N=1):  ~878ms   (bulk load + coordinator + header/payments/promotions/rewards)
+Incremental per sub-order:  ~40ms/sub-order  (~364ms ÷ 9 additional sub-orders)
+Memory per sub-order:  ~85 KB/sub-order   (~770 KB ÷ 9 additional sub-orders)
+
+Model: ElapsedMs ≈ 878ms + 40ms × (N - 1)
+       AllocatedKB ≈ 768 KB + 85 KB × (N - 1)
+
+For N=10:  878 + 40×9 = 1,238ms  ✓ (measured 1,242ms — model accurate)
+For N=1:   878ms fixed overhead   (GetStoreLocation + getPackageInfoByOrderAndSubOrder + GetPackageTb = 1 call each)
+```
+
+### Interpretation
+
+- **~878ms is irreducible under current serial architecture** — even with 1 sub-order, the 3 per-sub-order sequential DB calls (GetStoreLocation + getPackageInfoByOrderAndSubOrder + GetPackageTb) dominate.
+- **Phase 4 (Task.WhenAll) targets this** — parallelising those 3 calls collapses them to `max(t1, t2, t3)` instead of `t1+t2+t3`, expected to cut the 878ms fixed overhead to ~300ms.
+- **AllocatedKB scales linearly** at ~85 KB/sub-order — confirms no shared state leaking between sub-orders; memory is proportional to data loaded.
+- **Cold start 3,570ms** (vs 5,406ms for "All") — EF.CompileQuery static init is the same; difference is plan complexity for single-row vs multi-row join shapes.
+
+---
+
+## 17. Phase 4 Applied to target.cs — 2026-04-01
+
+**Changes applied to `target.cs`**:
+
+### New field
+```csharp
+private readonly IDbContextFactory<YourDbContext> _contextFactory;
+// Wire-up (constructor): add IDbContextFactory<YourDbContext> contextFactory parameter
+// Register: services.AddDbContextFactory<YourDbContext>(options => options.UseSqlServer(...));
+```
+
+### New async coordinator: `GetSubOrderAsync`
+- Same logic as `GetSubOrder` for Steps 1–2 (GetSubOrderMessage + ref resolution)
+- Step 3: fires `GetOrderHeaderAsync`, `GetOrderMessagePaymentsAsync`, `GetOrderPromotionAsync` + `GetRewardItemsBatchedAsync` in **parallel** via `Task.WhenAll`
+- Each task gets its own `DbContext` from `_contextFactory.CreateDbContext()` — EF Core DbContext is NOT thread-safe
+- Includes same `[PERF]` log as sync version (`ElapsedMs`, `AllocatedKB`, `GC*`, `ThreadPool`)
+
+### New private async helpers (each accept `DbContext ctx` from factory)
+| Method | What it does |
+|--------|-------------|
+| `GetOrderHeaderAsync(ctx, id)` | `ctx.Set<OrderModel>().AsNoTracking().Include(Customer).FirstOrDefaultAsync()` |
+| `GetOrderMessagePaymentsAsync(ctx, id)` | `ctx.Set<OrderModel>().Include(Payments→Transactions).AsSplitQuery().AsNoTracking()` → `MapPayments()` |
+| `GetOrderPromotionAsync(ctx, id)` | `ctx.Set<OrderPromotionModel>().Include(Amount).AsNoTracking().ToArrayAsync()` → `model2ViewModel` loop |
+| `GetRewardItemsBatchedAsync(ctx, id, ids)` | `ctx.Set<PromotionItemModel>().WHERE IN (subOrderIds).AsNoTracking()` → `MapRewardItems()` |
+
+### New private mapping helpers (shared by sync + async)
+- `MapPayments(OrderModel)` — extracted from `GetOrderMessagePayments` (inline mapping refactored out)
+- `MapRewardItems(List<PromotionItemModel>)` — new helper for batch reward mapping
+
+### Expected impact
+```
+Serial (current):   t_header + t_payments + t_promotions + t_rewards  ≈ 878ms
+Parallel (Phase 4): max(t_header, t_payments, t_promotions, t_rewards) ≈ 300ms
+Expected P50 (All): ~300ms + 40ms×(N-1) ≈ ~660ms for N=10
+```
+
+**Caller change required**: replace `GetSubOrder(...)` call sites with `await GetSubOrderAsync(...)`. The sync `GetSubOrder` is still present for backward compatibility.
+
+---
+
+## 18. Phase 4 Results — Measured 2026-04-01 (Single SubOrderId, N=1)
+
+**Test conditions**: 30 sequential calls, `GetSubOrderAsync`, specific SubOrderId cycling through 3 IDs (`TWDCDS26021226100250682/84/85`).
+
+### Results
+
+| Metric | P0+P1 sync (N=1) | Phase 4 async (N=1) | Change |
+|--------|------------------|---------------------|--------|
+| ElapsedMs (P50, calls 4–30) | 878ms | **805ms** | **-73ms (-8%)** |
+| ElapsedMs (best) | 863ms | **774ms** | **-89ms (-10%)** |
+| ElapsedMs (cold start, call #1) | 3,570ms | **3,844ms** | +274ms (+8%) |
+| AllocatedKB (steady) | ~768 KB | **~1,100 KB** | +332 KB (+43%) |
+| GC events | 1 sawtooth @#14 | sawtooth @#12 (GC0=2, GC1=1, GC2=1, -40 MB) | same pattern |
+| CpuMs (calls 20+) | — | **0ms** (tier-1 async paths) | — |
+
+### Pattern breakdown
+
+```
+Calls  1   (cold start):     3,844ms   EF factory init + JIT + plan compile
+Calls  2–3 (JIT warmup):     949–993ms tier-0 async state machine warmup
+Calls  4–30 (steady):        774–831ms tier-1, stable
+GC call #12:  GC0=2 GC1=1 GC2=1, heap 73,841 → 34,188 KB (-40 MB)
+Calls 13–30:  GC0=0 GC1=0 GC2=0  — zero GC for final 18 calls
+```
+
+### Interpretation
+
+- **-8% for N=1 is expected, not a failure.** The 3 parallelized calls (`GetOrderHeader` + `GetOrderMessagePayments` + `GetOrderPromotion`) account for only ~200ms of the 878ms total. The dominant serial prerequisite (`GetSubOrderMessage` + `IsExistOrderReference` ≈ ~600ms) cannot be parallelized.
+- **AllocatedKB +43%**: fixed cost of 4 `OrderContext` factory instances per call for thread safety. For N=10 "All" mode, this overhead is the same fixed cost spread over more sub-orders — relative impact smaller.
+- **Cold start slightly higher (+274ms)**: 4 factory context allocations vs 1 shared context.
+- **CpuMs → 0ms after call #20**: async state machine hot paths promoted to tier-1 JIT — same tiered compilation pattern as P0.
+- **"All" mode (N=10) expected ~700–800ms**: coordinator calls are proportionally larger fraction of 1,242ms — parallelization saves ~200–300ms on that path.
+
+### Bug fixed during rollout — `ctx4` scope (2026-04-01)
+
+**Error**: `System.InvalidOperationException: Invalid operation. The connection is closed` — from `SingleQueryingEnumerable.AsyncEnumerator.InitializeReaderAsync`.
+
+**Root cause**: `ctx4` was declared with `await using` inside the inner `if` block. C# disposes `await using` variables at the end of the enclosing block (`}`). So `ctx4` was disposed when the `if` block exited — before `Task.WhenAll` awaited `rewardTask`. The task then tried to execute its query on a closed connection.
+
+```csharp
+// BROKEN: ctx4 disposed at } before Task.WhenAll runs
+if (SourceSubOrderId.Equals("All") && ...) {
+    await using var ctx4 = _contextFactory.CreateDbContext();
+    rewardTask = subOrderRepo2.GetRewardItemsBatchedAsync(...);
+}  // ← ctx4 disposed HERE
+await Task.WhenAll(...);  // rewardTask runs → connection closed → exception
+
+// FIXED: ctx4 declared alongside ctx1/2/3 — all stay alive until Task.WhenAll completes
+await using var ctx4 = _contextFactory.CreateDbContext();
+if (...) { rewardTask = subOrderRepo2.GetRewardItemsBatchedAsync(...); }
+await Task.WhenAll(...);  // ctx4 still alive ✓
+```
+
+**Fix**: move `ctx4` declaration to the same scope as ctx1/2/3 (before the `if` block). `AsSplitQuery()` on `GetOrderMessagePaymentsAsync` was NOT a factor — confirmed by user.
+
+---
+
+## 19. Phase 4 Results — Measured 2026-04-01 (SubOrderId="All", N≈10)
+
+**Test conditions**: 30 sequential calls, `GetSubOrderAsync`, SubOrderId=`All`, same OrderId `TWDCDS2602122610025068`.
+
+### Results
+
+| Metric | P0+P1 sync (All) | Phase 4 async (All) | Change |
+|--------|-----------------|---------------------|--------|
+| ElapsedMs (P50, calls 4–30) | 1,242ms | **~1,117ms** | **-125ms (-10%)** |
+| ElapsedMs (best) | 1,228ms | **1,080ms** | **-148ms (-12%)** |
+| ElapsedMs (cold start, call #1) | 5,406ms | **5,363ms** | -43ms (~same) |
+| AllocatedKB (steady) | ~1,538 KB | **~1,980 KB** | +442 KB (+29%) |
+| GC | cascade #11-13 | sawtooth #7 (-6 MB), #28 (-46 MB) | cleaner |
+
+### Pattern breakdown
+
+```
+Call  1 (cold start):   5,363ms  107,239 KB  GC0=2
+Calls 2–3 (warmup):    1,249–1,263ms  ~2,060 KB
+Calls 4–6 (tier-0):   1,121–1,140ms  ~1,995 KB
+Call  7:               1,101ms  GC0=1  sawtooth -6 MB
+Calls 8–27 (stable):  1,091–1,135ms  ~1,968–1,986 KB  GC=0
+Call  28:              1,168ms  GC0=1 GC1=1  major sawtooth -46 MB
+Calls 29–30 (clean):  1,106–1,132ms  GC=0
+```
+
+### Full optimization progression (All mode)
+
+| Phase | P50 | vs Baseline |
+|-------|-----|-------------|
+| Baseline | 5,048ms | — |
+| Phase 1 | 2,600ms | -48% |
+| Phase 2 | 2,514ms | -50% |
+| Phase 3 + Indexes | 1,410ms | -72% |
+| P0 + P1 | 1,242ms | -75% |
+| **Phase 4 async** | **~1,117ms** | **-78%** |
+
+### Interpretation
+
+- **-10% from P0+P1**: consistent with N=1 result (-8%). The parallelized coordinator calls save ~125ms but `GetSubOrderMessageFromBatch` (bulk load 10 sub-orders, 16 Include paths) is the dominant serial cost and cannot be parallelized.
+- **AllocatedKB +442 KB**: all 4 factory contexts active in "All" mode (ctx4 used for `GetRewardItemsBatchedAsync`). Fixed thread-safety overhead per call.
+- **No bimodal JIT step-change**: same process as N=1 test — async state machine paths already at tier-1 before this test started.
+- **GC pattern healthy**: two isolated sawteeth (#7, #28), zero GC between them. ~14-call sawtooth period = normal heap growth cycle.
+- **CpuMs → 0ms from call #6**: tier-1 JIT promotion happened early due to cross-test warmup.

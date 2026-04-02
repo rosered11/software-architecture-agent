@@ -176,7 +176,7 @@ The ability to communicate architectural decisions to non-technical stakeholders
 
 [ ] Apply batch + chunk pattern to FTP ETL pipeline
     → Profile current performance first
-    → Document before/after metrics in incident-log.md (even as a proactive finding)
+    → Document before/after metrics in kos-incident.md (even as a proactive finding)
 
 [ ] Build one new pattern from scratch
     → Identify a recurring problem in your systems

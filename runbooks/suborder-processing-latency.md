@@ -9,7 +9,7 @@
 | Owner | Backend Platform Team |
 | Last Updated | 2026-03-25 |
 | Last Tested | Never — test on next occurrence |
-| Related Incident | `references/incident-log.md` → #1 GetSubOrder API Latency Spike |
+| Related Incident | `references/kos-incident.md` → #1 GetSubOrder API Latency Spike |
 | Related KOS | Knowledge: N+1 Query Problem, Batch Query Pattern, Connection Pool Math |
 | Related Pattern | `references/patterns.md` → #1 Batch Query, #11 Eager Graph Loading, #12 Coordinator-Level Resolution |
 | Related ADR | `architecture-decision.md` → Option A (Batch Refactor) now, Option B (Async) follow-up |
@@ -322,7 +322,7 @@ Complete this after the issue is fully resolved:
     [ ] Connection pool utilization: before ___ → after ___
     [ ] GC.Gen0 delta: before ___ → after ___
 [ ] KOS updated:
-    [ ] Incident record updated in references/incident-log.md with actual Results
+    [ ] Incident record updated in references/kos-incident.md with actual Results
     [ ] Knowledge record created if new concept learned
     [ ] Pattern record updated if pattern was applied
     [ ] decision-rules.md updated if new threshold discovered

@@ -42,7 +42,7 @@ The intended rhythm is:
 ```
 Write code → paste for Code Review → fix BLOCKs before merging
 
-Hit a production issue → Incident Analysis → add to incident-log.md → generate Runbook
+Hit a production issue → Incident Analysis → add to kos-incident.md → generate Runbook
 
 Make an architecture choice → write ADR using the Decision format → log in Notion KOS
 
@@ -54,13 +54,13 @@ Ask "what should I focus on?" → Career Roadmap progress check → 1 concrete n
 The real power comes from keeping the reference files updated. After every significant incident or decision:
 
 ```
-1. Add the incident to  references/incident-log.md
+1. Add the incident to  references/kos-incident.md
 2. Add new patterns to  references/patterns.md
 3. Add new rules to     references/decision-rules.md
 4. Commit to git        → your knowledge is versioned
 ```
 
-The skill becomes more useful the more you feed it. Six months from now, incident-log.md is your personal evidence base. A year from now, decision-rules.md reflects your own architectural instincts, not just the defaults that ship today.
+The skill becomes more useful the more you feed it. Six months from now, kos-incident.md is your personal evidence base. A year from now, decision-rules.md reflects your own architectural instincts, not just the defaults that ship today.
 
 ### Hook Sync to Notion
  From now on, every time Claude edits a file under skills/software-architecture-specialist/references/, the hook fires automatically

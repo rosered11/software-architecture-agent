@@ -5,7 +5,7 @@ Reads tool event JSON from stdin.
 Routes to kos_sync.py --db <target> based on which source file was edited.
 
 Only two files feed Notion:
-  incident-log.md       → --db i   (Incidents DB only)
+  kos-incident.md       → --db i   (Incidents DB only)
   kos-system-design.md  → (no --db, full sync: K + P + D + TA)
 
 All other references/ files are Claude-only knowledge — no Notion sync needed.
@@ -20,7 +20,7 @@ fp = data.get("tool_input", {}).get("file_path", "").replace("\\", "/")
 
 # Map filename → optional --db argument (None = full sync)
 FILE_DB_MAP = {
-    "incident-log.md":      ["--db", "i"],
+    "kos-incident.md":       ["--db", "i"],
     "kos-knowledge.md":     ["--db", "k"],
     "kos-patterns.md":      ["--db", "p"],
     "kos-decisions.md":     ["--db", "d"],
