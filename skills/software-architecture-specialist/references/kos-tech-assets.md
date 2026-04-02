@@ -317,6 +317,7 @@ private async Task<OrderModel> GetOrderHeaderAsync(DbContext ctx, string id)
 }
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P16: Async Parallel DB Coordinator
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---
@@ -345,6 +346,7 @@ _logger.LogInformation(
 
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P17: Batch Query (WHERE IN)
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---
@@ -377,6 +379,7 @@ using (_latency.WithLabels("success").NewTimer())
 
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P16: Async Parallel DB Coordinator
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---
@@ -404,6 +407,7 @@ optionsBuilder.LogTo(
 
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P18: Eager Graph Loading
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---
@@ -448,6 +452,7 @@ private static List<RewardItemModel> MapRewardItems(List<RewardItem> rows) =>
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P16: Async Parallel DB Coordinator
                    → P20: Bulk Load Then Map
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---
@@ -607,6 +612,7 @@ await foreach (var item in _bulkQueryAsync(_context, ids1.ToArray(), ids2.ToArra
 Related Knowledge:  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
 Related Pattern:    → P22: EF Compiled Query Cache Management
 Related Decision:   → D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---
@@ -664,6 +670,7 @@ Related Knowledge:  → K29: .NET Heap Dump Analysis — Reading dumpheap -stat
                     → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
 Related Pattern:    → P22: EF Compiled Query Cache Management
 Related Decision:   → D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Query
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 ```
 
 ---

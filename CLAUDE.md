@@ -56,6 +56,11 @@ After significant incidents or architecture decisions, update:
 All 5 files use the same format: `### PREFIX#: Title` + KV block + optional rich markdown below.
 Commit after each update so knowledge is versioned.
 
+**Cross-linking rule — run after every new record:**
+After saving a new record, go back and add its ID to the Related fields of every record it references.
+Common missed back-links: new P# → update I# Related Pattern + D# Related Pattern; new D# → update I# Related Decisions.
+Full checklist in `kos-decisions.md` under `## DECISION RULES → KOS Cross-Linking`.
+
 ## Notion Sync — CRITICAL
 
 A PostToolUse hook (`sync/hook_filter.py`) syncs `kos-*.md` files to Notion automatically on every Edit/Write.

@@ -14,7 +14,7 @@
 Title:               GetSubOrder API Latency Spike — Timeout Under High Concurrency
 Severity:            High
 System:              SubOrder Processing
-Status:              Fixed — Applied 2026-03-27
+Status:              In Progress — Phase 5 applied 2026-04-02 (741ms); P3 IMemoryCache pending
 Date:                2026-03-25
 Problem:             API timeout under high concurrent load. ~33 DB queries per request
                      (N+1 loops, redundant reference resolution, lazy loading in loops).
@@ -33,7 +33,7 @@ Prevention:          Code review: DB call in loop, Entry().Load() in loop, Any()
                      in sibling calls. Always capture baseline metrics before touching hot paths.
                      Validate connection pool math: queries × hold_time × concurrent < pool_size.
 Related Knowledge:   → K25, K28, K29
-Related Pattern:     → P7, P16, P17, P18, P19, P20, P22
+Related Pattern:     → P7, P16, P17, P18, P19, P20, P22, P27
 Related Decisions:   → D8, D9, D10, D11, D13, D14, D15
 Related Tech Assets: → TA7, TA8, TA9, TA10, TA11, TA15, TA16
 ```
@@ -301,29 +301,50 @@ await Task.WhenAll(headerTask, paymentsTask, promotionTask, rewardTask ?? Task.C
 
 ---
 
+**Phase 5 (Follow-up PR) — Parallel bulk SubOrder load**
+
+Split `_bulkSubOrderQuery` (27 sequential AsSplitQuery queries) into two independent compiled queries
+run in parallel via `Task.WhenAll` + `IDbContextFactory`:
+
+```csharp
+// _bulkSubOrderHeaderQuery: Addresses, Remarks, Promotions, Fee (~9 split queries)
+// _bulkSubOrderItemsQuery:  Items + all financial/fulfillment sub-graphs (~13 split queries)
+await using var ctxHeader = contextFactory.CreateDbContext();
+await using var ctxItems  = contextFactory.CreateDbContext();
+var headerTask = Task.Run(() => _bulkSubOrderHeaderQuery(ctxHeader, orderIdsArr, subOrderIdsArr).ToList());
+var itemsTask  = Task.Run(() => _bulkSubOrderItemsQuery(ctxItems,  orderIdsArr, subOrderIdsArr).ToList());
+await Task.WhenAll(headerTask, itemsTask);
+```
+
+BotE prediction: ~900ms → ~455ms (parallel max). Actual Step 3: ~524ms.
+Gap (~69ms vs predicted): PostgreSQL connection pool contention — two parallel tasks competing for pool slots simultaneously.
+Total: **1,117ms → 741ms (-34%)**. Cold start req #1 = 6,620ms (EF.CompileQuery JIT, one-time).
+
+---
+
 #### Observability — Before/After Measurement
 
 **Baseline captured 2026-03-25** — 30 sequential calls, single-user, SubOrderId `All`:
 
-| Metric | Baseline | Target (Phase 3) | Target (Phase 4) | Actual (Phase 4) |
-|--------|----------|------------------|------------------|------------------|
-| ElapsedMs (P50) | **5,048ms** | < 300ms | < 100ms | **1,117ms (-78%)** |
-| ElapsedMs (best) | 3,193ms | — | — | **1,080ms (-66%)** |
-| AllocatedKB per call | 2,668 KB | < 1,500 KB | < 1,500 KB | **~1,980 KB** (+4 ctx) |
-| DB query count | ~33 | ~7 | ~7 (parallel) | **~20** |
-| Max concurrent (pool) | ~20 | ~200+ | ~400+ | **~400+** |
+| Metric | Baseline | Target (Phase 3) | Target (Phase 4) | Actual (Phase 4) | Actual (Phase 5) |
+|--------|----------|------------------|------------------|------------------|------------------|
+| ElapsedMs (P50) | **5,048ms** | < 300ms | < 100ms | **1,117ms (-78%)** | **741ms (-85%)** |
+| ElapsedMs (best) | 3,193ms | — | — | **1,080ms (-66%)** | **723ms (-77%)** |
+| AllocatedKB per call | 2,668 KB | < 1,500 KB | < 1,500 KB | **~1,980 KB** (+4 ctx) | **~2,020 KB** (+2 ctx) |
+| DB query count | ~33 | ~7 | ~7 (parallel) | **~20** | **~20** (2 parallel bulk) |
+| Max concurrent (pool) | ~20 | ~200+ | ~400+ | **~400+** | **~400+** |
 
 ---
 
 #### Results
 
-| Metric | Baseline | Phase 1 | Phase 2 | Phase 3+Idx | P0+P1 | Phase 4 |
-|--------|----------|---------|---------|-------------|-------|---------|
-| ElapsedMs (P50) | **5,048ms** | 2,600ms (-48%) | 2,514ms (-50%) | 1,410ms (-72%) | 1,242ms (-75%) | **1,117ms (-78%)** |
-| ElapsedMs (best) | 3,193ms | 2,571ms | 2,463ms | 1,371ms | 1,228ms | **1,080ms** |
-| AllocatedKB | 2,668 KB | ~2,700 KB | ~2,655 KB | ~1,810 KB (-32%) | ~1,538 KB (-42%) | ~1,980 KB |
-| DB queries | ~33 | ~22 | ~18 | ~49¹ | ~20+N | **~20** |
-| Max concurrent | ~20 | ~35 | ~40 | ~200+ | ~200+ | **~400+** |
+| Metric | Baseline | Phase 1 | Phase 2 | Phase 3+Idx | P0+P1 | Phase 4 | Phase 5 |
+|--------|----------|---------|---------|-------------|-------|---------|---------|
+| ElapsedMs (P50) | **5,048ms** | 2,600ms (-48%) | 2,514ms (-50%) | 1,410ms (-72%) | 1,242ms (-75%) | **1,117ms (-78%)** | **741ms (-85%)** |
+| ElapsedMs (best) | 3,193ms | 2,571ms | 2,463ms | 1,371ms | 1,228ms | **1,080ms** | **723ms** |
+| AllocatedKB | 2,668 KB | ~2,700 KB | ~2,655 KB | ~1,810 KB (-32%) | ~1,538 KB (-42%) | ~1,980 KB | ~2,020 KB |
+| DB queries | ~33 | ~22 | ~18 | ~49¹ | ~20+N | **~20** | **~20** (2∥) |
+| Max concurrent | ~20 | ~35 | ~40 | ~200+ | ~200+ | **~400+** | **~400+** |
 
 ¹ Phase 3 query count temporarily higher due to AsSplitQuery bulk load (16 Include paths × N sub-orders split into separate queries) — but single-pass bulk, not per-sub-order loop.
 
@@ -362,10 +383,11 @@ Top heap consumers:
 
 | Priority | Action | Expected Impact |
 |----------|--------|-----------------|
-| P0 | `EF.CompileAsyncQuery` static field for bulk GetSubOrderMessage query | DynamicMethod 17,557 → < 50; free ~6 MB static heap |
-| P1 | Verify `await using` on all ADO.NET calls | Eliminate SqlBuffer/SqlMetaData accumulation |
-| P2 | Phase 4 async parallel (Task.WhenAll) | Reduce request duration → heap released faster |
-| P3 | IMemoryCache on GetStoreLocation (5-min TTL) | Eliminate N identical queries per request |
+| P0 | `EF.CompileAsyncQuery` static field for bulk GetSubOrderMessage query | ✅ Done — DynamicMethod 17,557 → 7,356; freed ~3 MB |
+| P1 | Verify `await using` on all ADO.NET calls | ✅ Done — SqlBuffer/SqlMetaData halved under load |
+| P2 | Phase 4 async parallel (Task.WhenAll) coordinator | ✅ Done — 1,117ms |
+| P3 | Phase 5 parallel bulk SubOrder (split compiled queries) | ✅ Done — 741ms (-34% from Phase 4) |
+| P4 | IMemoryCache on GetStoreLocation (5-min TTL) | ⬜ Next — eliminate N identical queries per request |
 
 ---
 

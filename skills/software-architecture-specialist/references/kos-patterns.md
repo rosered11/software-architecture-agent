@@ -394,6 +394,7 @@ When NOT to Use:  Query can be routed to single shard (use direct routing instea
 Complexity:       Medium
 Based on Knowledge:  → Database Sharding Strategies (K16)
                     → Consistent Hashing (K3)
+Used in Incidents:   → I1: GetSubOrder API Latency Spike
 ```
 
 **Problem**: A query cannot be served from a single node — data is partitioned across multiple shards and must be aggregated to answer.
@@ -1222,7 +1223,8 @@ Results:
 
 AllocatedKB overhead: +332 KB (N=1) / +442 KB (All) — 4 factory `OrderContext` instances per call.
 
-Remaining bottleneck: `GetSubOrderMessageFromBatch` (serial bulk load, 16 Includes, AsSplitQuery) ≈ ~900ms of 1,117ms total. Cannot be parallelized — all parallel tasks depend on its result. Next lever: `IMemoryCache` on `GetStoreLocation` (5-min TTL).
+**Phase 5 result**: `GetSubOrderMessageFromBatch` bulk load split into two parallel compiled queries — see P27.
+1,117ms → 741ms (-34%). Remaining floor: ~216ms serial (Steps 1, 2, 4, 5). Next lever: `IMemoryCache` on `GetStoreLocation` (5-min TTL).
 
 **Pitfall: `await using var` scope inside conditional block**
 ```
@@ -1269,6 +1271,7 @@ Complexity:       Low
 BotE Impact:      N queries × avg_latency → 1 query × avg_latency  (e.g. 10×20ms → 20ms)
 Decision Rule:    Loop over a fixed set of IDs hitting the DB? → Batch query first.
 Based on Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
+Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 2, 2026-03-27
 ```
 
@@ -1359,6 +1362,7 @@ Complexity:       Low
 Decision Rule:    Read-only + navigation property accessed? → .Include().AsNoTracking()
                   Hot path + EF tracking overhead visible in profiler? → AsNoTracking mandatory
 Based on Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
+Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 1, 2026-03-27
 ```
 
@@ -1466,6 +1470,7 @@ When to Use:      Multiple sub-methods need the same derived value (e.g. canonic
 When NOT to Use:  Sub-methods intentionally need independent resolution (e.g. for isolation).
 Complexity:       Low
 Decision Rule:    Two+ sub-methods resolve the same value? → Resolve once, pass down.
+Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 1, 2026-03-27
 ```
 
@@ -1543,6 +1548,7 @@ When NOT to Use:  Dataset is too large to hold in memory.
 Complexity:       Low
 Decision Rule:    Mapping loop hits DB per item? → Bulk load by parent key, then Dictionary lookup.
 Based on Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
+Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 3, 2026-03-27
 ```
 
@@ -1910,7 +1916,123 @@ Query with dynamic filters (optional .Where clauses) → cannot compile statical
 - Healthy ceiling: DynamicMethod count stabilizes at N×(unique query shapes across all endpoints) — stable is fine, unbounded growth is the problem
 - AsSplitQuery + CompileQuery: supported in EF Core 10. Generates multiple compiled split queries, one per Include batch
 
-**Related patterns**: P20 Bulk Load Then Map, P16 Async Parallel DB Coordinator
+**Related patterns**: P20 Bulk Load Then Map, P16 Async Parallel DB Coordinator, P27 Parallel Split Compiled Query
 **Related decisions**: D13 (EF.CompileQuery static field — decision record with full heap dump incident data)
+
+---
+
+### P27: Parallel Split Compiled Query
+
+```
+Name:             Parallel Split Compiled Query
+Category:         .NET Performance / EF Core
+Stack:            .NET / EF Core 7.0+ / IDbContextFactory
+Summary:          When a single AsSplitQuery compiled query generates too many sequential SQL queries
+                  (each Include path = 1 SQL), split the Include graph into two independent compiled
+                  queries (header group + items group) and run both in parallel via Task.WhenAll +
+                  two independent DbContext instances from IDbContextFactory.
+When to Use:      A single bulk query has 10+ Include paths → 10+ sequential SQL queries.
+                  The Include paths fall into two natural groups with no shared navigation.
+                  Step dominates latency (> 50% of total request time).
+                  BotE: N_includes × avg_query_ms > 300ms → worth splitting.
+When NOT to Use:  Fewer than 8 Include paths (split overhead > gain).
+                  Include paths share navigation roots (cannot cleanly separate).
+                  Connection pool is already saturated (parallel tasks compete for slots → regression).
+Complexity:       Medium
+Decision Rule:    AsSplitQuery query time > 400ms AND includes ≥ 10 → split and parallelize
+                  Pool saturation (active_connections ≈ pool_max) → do NOT parallelize, fix pool first
+                  Gap between BotE and actual > 20% → pool contention suspected, increase MaxPoolSize
+Based on Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
+Used in Incidents:   → I1: GetSubOrder API Latency Spike (Phase 5)
+Used in Decisions:   → D8: IDbContextFactory, D11: Incremental Refactor, D13: EF.CompileQuery static field, D15: await using scope rule
+Related Pattern:     → P16: Async Parallel DB Coordinator, P20: Bulk Load Then Map, P22: EF Compiled Query Cache Management
+Source:           target.cs Phase 5, 2026-04-02. 1,117ms → 741ms (-34%).
+```
+
+**Problem**: A single AsSplitQuery compiled query with 16 Include paths generates ~27 sequential SQL queries at ~35ms each ≈ 900ms. These are I/O-bound and independent — the database executes them one at a time because they share a single `DbContext` connection.
+
+**Solution**: Split the Include graph into two groups that have no shared navigation paths. Run each group as a separate compiled query on its own `DbContext` instance (from `IDbContextFactory`) in parallel via `Task.WhenAll`. Merge the two result sets by key after both complete.
+
+**Split strategy**:
+```
+Header group  (P27a): base entity + scalar collections (Addresses, Remarks, Promotions, Fee)
+Items group   (P27b): deep nested items graph (Items → Amount → Taxes, FulFillment, Payments, Promotions...)
+
+Rule for splitting: group Includes that share the same root navigation (Items.* together, Fee.* together, etc.)
+Never split across a shared navigation root — EF will re-query the join differently and may produce inconsistent results.
+```
+
+**Implementation**:
+```csharp
+// Two static compiled query fields — each covers one Include group
+private static readonly Func<OrderContext, string[], string[], IEnumerable<SubOrderModel>>
+    _bulkSubOrderHeaderQuery = EF.CompileQuery(
+        (OrderContext ctx, string[] orderIds, string[] subOrderIds) =>
+            ctx.SubOrder.AsNoTracking()
+                .Include(x => x.Addresses).Include(x => x.Remarks)
+                .Include(x => x.Promotions).ThenInclude(p => p.Amount)
+                .Include(x => x.Fee).ThenInclude(f => f.Amount)...
+                .AsSplitQuery()
+                .Where(x => x.IsActive
+                    && orderIds.Contains(x.SourceOrderId)
+                    && subOrderIds.Contains(x.SourceSubOrderid)));
+
+private static readonly Func<OrderContext, string[], string[], IEnumerable<SubOrderModel>>
+    _bulkSubOrderItemsQuery = EF.CompileQuery(
+        (OrderContext ctx, string[] orderIds, string[] subOrderIds) =>
+            ctx.SubOrder.AsNoTracking()
+                .Include(x => x.Items).ThenInclude(i => i.Amount)...
+                .AsSplitQuery()
+                .Where(x => x.IsActive
+                    && orderIds.Contains(x.SourceOrderId)
+                    && subOrderIds.Contains(x.SourceSubOrderid)));
+
+// Run in parallel — each on its own DbContext from the factory
+await using var ctxHeader = contextFactory.CreateDbContext();
+await using var ctxItems  = contextFactory.CreateDbContext();
+var headerTask = Task.Run(() => _bulkSubOrderHeaderQuery(ctxHeader, orderIdsArr, subOrderIdsArr).ToList());
+var itemsTask  = Task.Run(() => _bulkSubOrderItemsQuery(ctxItems,  orderIdsArr, subOrderIdsArr).ToList());
+await Task.WhenAll(headerTask, itemsTask);
+
+// Merge by composite key
+var headerByKey = headerTask.Result.ToDictionary(s => (s.SourceOrderId, s.SourceSubOrderid));
+var itemsByKey  = itemsTask.Result.ToDictionary(s => (s.SourceOrderId, s.SourceSubOrderid));
+
+// Map: headerSO for base fields + scalar collections; itemsSO for nested items graph
+foreach (var pair in subOrderPairs)
+{
+    if (!headerByKey.TryGetValue((pair.LoadOrderId, pair.LoadSubOrderId), out var headerSO)) continue;
+    itemsByKey.TryGetValue((pair.LoadOrderId, pair.LoadSubOrderId), out var itemsSO);
+    var itemModels = itemsSO?.Items ?? Enumerable.Empty<SubOrderItemModel>();
+    // ... map headerSO fields + itemModels into ViewModel
+}
+```
+
+**Results (target.cs, 2026-04-02)**:
+
+| Metric | Before (Phase 4) | After (Phase 5) | Delta |
+|--------|-----------------|-----------------|-------|
+| Step 3 (bulk load) | ~900ms | ~524ms | -42% |
+| Total ElapsedMs P50 | 1,117ms | 741ms | **-34%** |
+| CpuMs (warm) | ~400ms | ~15-200ms | CPU pressure cut |
+| AllocatedKB | ~1,980 KB | ~2,020 KB | +40 KB (2 extra ctx) |
+| Cold start (req #1) | — | 6,620ms | EF.CompileQuery JIT, one-time |
+
+**BotE analysis**:
+- Predicted: max(9, 13) × 35ms ≈ 455ms
+- Actual: ~524ms
+- Gap: ~69ms — PostgreSQL connection pool contention (2 parallel tasks competing for pool slots)
+- If gap persists: increase `MaxPoolSize` or check `pg_stat_activity` active connections during load
+
+**Trade-offs**:
+| Pros | Cons |
+|------|------|
+| ~42% reduction on the dominant bottleneck step | Two DbContext instances per call (+~40 KB alloc) |
+| CPU pressure reduced (less sequential I/O holding thread) | Split point must be chosen carefully — wrong split causes inconsistent results |
+| Cold start paid once (JIT compilation) | Pool contention risk at very high concurrency |
+| Stable memory allocation warm | Merge step adds O(N) dictionary lookup |
+
+**Related patterns**: P16 Async Parallel DB Coordinator, P20 Bulk Load Then Map, P22 EF Compiled Query Cache Management
+**Related decisions**: D8 (IDbContextFactory), D11 (Bulk Load Then Map choice), D13 (EF.CompileQuery), D15 (await using scope rule)
 
 ---

@@ -264,10 +264,12 @@ Watch out for:    Connection pool growth: N parallel tasks × concurrent request
                   NOT inside nested if/for/while blocks — disposed at block exit, before Task.WhenAll runs.
                   See D15 for the scope pitfall rule.
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
-Related Pattern:    → P26: Async Parallel DB Coordinator
+Related Pattern:    → P16: Async Parallel DB Coordinator
+                    → P27: Parallel Split Compiled Query
 Related Decision:   → D15: await using var Scope Rule (pitfall when using this pattern)
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-03-27
-Measured:         2026-04-01
+Measured:         2026-04-02
 ```
 
 ---
@@ -341,18 +343,21 @@ Decision:         Option B — incremental approach.
                   Incremental diffs are easier to review, test, and roll back independently.
 Expected Outcome: Phase 1–3: ~1,500ms → ~750ms. Phase 4: ~750ms → ~400ms. Total: -73%.
 Actual Outcome:   Phase 1–3: 5,048ms → 1,242ms (-75%). Phase 4: 1,242ms → 1,117ms (-10%, "All" N≈10).
-                  Total: 5,048ms → 1,117ms (-78%). Best observed single run: 1,080ms.
-                  Phase 4 gain smaller than estimated — GetSubOrderMessageFromBatch (serial bulk load,
-                  16 Includes, AsSplitQuery) dominates ~900ms of 1,117ms total; cannot be parallelized.
-                  Next lever: IMemoryCache on GetStoreLocation (5-min TTL) to break below 1,000ms.
+                  Phase 5: 1,117ms → 741ms (-34%) — parallel bulk SubOrder (split compiled queries).
+                  Total: 5,048ms → 741ms (-85%). Best observed single run: 723ms.
+                  Phase 4 gain smaller than estimated — GetSubOrderMessageFromBatch dominated ~900ms.
+                  Phase 5 split into _bulkSubOrderHeaderQuery + _bulkSubOrderItemsQuery run via Task.WhenAll.
+                  Actual Step 3 reduction: ~900ms → ~524ms (BotE predicted ~455ms; ~69ms gap = pool contention).
+                  Next lever: IMemoryCache on GetStoreLocation (5-min TTL) to break below 500ms.
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P17: Batch Query (WHERE IN)
                    → P18: Eager Graph Loading
                    → P19: Coordinator-Level Resolution
                    → P20: Bulk Load Then Map
-                   → P26: Async Parallel DB Coordinator
+                   → P16: Async Parallel DB Coordinator
+                   → P27: Parallel Split Compiled Query
 Date:             2026-03-27
-Measured:         2026-04-01
+Measured:         2026-04-02
 ```
 
 ---
@@ -499,7 +504,8 @@ Rule:             await using var ctx declared inside if/for/while block → dis
 Actual Outcome:   Bug confirmed by connection closed error. Fix (Option B) resolved error completely.
                   Restored full Phase 4 async parallel behaviour with zero connection errors.
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
-Related Pattern:    → P26: Async Parallel DB Coordinator
+Related Pattern:    → P16: Async Parallel DB Coordinator
+                    → P27: Parallel Split Compiled Query
 Related Decision:   → D8: Use IDbContextFactory for Parallel GetSubOrderAsync
 Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-04-01
@@ -520,6 +526,7 @@ Date:             2026-04-01
 
 | Domain | Rules |
 |--------|-------|
+| [KOS Cross-Linking](#kos-cross-linking) | Bidirectional link checklist — run after every new record |
 | [DB Query & Performance](#db-query--performance) | N+1 threshold, batch size, chunking, AsNoTracking |
 | [PostgreSQL Storage & Vacuum](#postgresql-storage--vacuum) | Autovacuum tuning, dead tuple thresholds, REINDEX |
 | [EF Core](#ef-core) | When to use Include vs batch, projection, split query |
@@ -538,6 +545,37 @@ Date:             2026-04-01
 | [Geospatial Indexing](#geospatial-indexing) | Geohash vs Quadtree, precision levels |
 | [Financial Systems](#financial-systems) | Double-entry ledger, idempotency, PCI-DSS, reconciliation |
 | [Scalability Thresholds](#scalability-thresholds-back-of-envelope-reference) | QPS formula, storage estimation, availability budgets |
+
+---
+
+### KOS Cross-Linking
+
+```
+When adding a NEW record (I#, K#, P#, D#, TA#), always run this checklist before saving:
+
+[ ] 1. Does the new record reference existing records?
+       → Add them to the new record's Related/Used in/Based on KV fields.
+
+[ ] 2. Do those existing records need back-links to the new record?
+       → Open each referenced file and add the new record's ID to their Related fields.
+       → Common missed back-links:
+           New P# added  → update I# Related Pattern
+           New P# added  → update D# Related Pattern
+           New I# added  → update K# Used in Incidents
+           New D# added  → update I# Related Decisions
+           New TA# added → update I# Related Tech Assets and P# Related Tech Assets
+
+[ ] 3. Typo-check all IDs in Related fields (e.g. P26 vs P16 — a typo that points to a non-existent record)
+       → Grep for the ID to confirm it exists before saving.
+
+[ ] 4. Measured/Date fields current?
+       → Update Measured date on any D# whose Actual Outcome changed.
+       → Update Status on I# if the incident progressed.
+
+Root cause of missed links: new record outbound links are written while writing —
+existing record inbound links require going back and editing already-saved files.
+The only fix is a forced review pass over all referenced records after the new record is saved.
+```
 
 ---
 
@@ -865,6 +903,13 @@ Rule:
 Real incident (target.cs): Phase 3 attempt 1 — replaced 21 Entry().Load() with Include + AsSplitQuery
   inside the per-sub-order loop. Result: ~0% latency change, +19% worse cold start. Reverted.
   Fix: batch the outer loop itself (Bulk Load Then Map). P50: 2,730ms → 1,505ms (-45%).
+
+Phase 5 incident (target.cs): _bulkSubOrderQuery had 16 Include paths → ~27 sequential AsSplitQuery
+  queries at ~35ms each ≈ 900ms total. Fix: split into _bulkSubOrderHeaderQuery (~9 queries) +
+  _bulkSubOrderItemsQuery (~13 queries) and run both in parallel via Task.WhenAll + IDbContextFactory.
+  Result: ~900ms → ~524ms (-42%). Gap vs BotE (~455ms): pool contention — 2 parallel tasks competing
+  for connection pool slots simultaneously. Total request: 1,117ms → 741ms (-34%).
+  Rule: if AsSplitQuery bulk query still dominates latency → split by Include group and parallelize.
 ```
 
 ```

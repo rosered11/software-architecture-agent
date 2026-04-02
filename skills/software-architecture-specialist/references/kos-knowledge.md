@@ -1513,6 +1513,8 @@ Related Patterns: → P16: Async Parallel DB Coordinator
                   → P17: Batch Query (WHERE IN)
                   → P18: Eager Graph Loading
                   → P20: Bulk Load Then Map
+                  → P27: Parallel Split Compiled Query
+Related Incidents:→ I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 4, 2026-03-27; EF Core Microsoft documentation
 ```
 
