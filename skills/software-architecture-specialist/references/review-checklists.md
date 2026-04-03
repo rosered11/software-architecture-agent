@@ -1,4 +1,4 @@
-# 🔎 Code Review Checklists
+# 🔍 Code Review Checklists
 
 > Read this file automatically whenever Code Review mode is triggered —
 > i.e. when the user pastes code and asks for a review, says "review this",
@@ -19,7 +19,7 @@
 ### Output Format
 
 ```
-🔎 Mode: Code Review
+🔍 Mode: Code Review
 Technologies detected: [list]
 Checklists run: [list]
 
@@ -113,7 +113,7 @@ BLOCK — Same reference resolver called 2+ times for same ID in one request
     for the same SourceOrderId within one parent method
   Risk: Each call fires 2-3 queries independently — pure redundancy that compounds under concurrency.
   Fix: Resolve once at the coordinator (parent method), pass resolved ID to sub-calls.
-  See: patterns.md #12 Coordinator-Level Resolution
+  See: kos-patterns.md #12 Coordinator-Level Resolution
   Real example (target.cs:55-57): GetOrderHeader, GetOrderMessagePayments, GetOrderPromotion
     each call IsExistOrderReference independently = 6-9 redundant queries per request.
 
@@ -143,7 +143,7 @@ BLOCK — No retry limit — infinite retry on error
 BLOCK — Non-idempotent handler with no deduplication
   Pattern: handler that inserts/creates without checking for existing record
   Risk: At-least-once delivery = duplicates. Double inserts, double charges, double events.
-  Fix: Add idempotency key check before processing (see decision-rules.md)
+  Fix: Add idempotency key check before processing (see kos-decisions.md)
 
 WARN — No DLQ routing for permanent errors
   Pattern: all errors retried the same way regardless of error type
@@ -268,12 +268,12 @@ BLOCK — No input validation before processing
 WARN — Missing idempotency key on mutating POST endpoint
   Pattern: POST endpoint that creates/charges with no idempotency key mechanism
   Risk: Retry from client = duplicate record / double charge
-  Fix: Accept Idempotency-Key header, check before processing (see decision-rules.md)
+  Fix: Accept Idempotency-Key header, check before processing (see kos-decisions.md)
 
 WARN — No timeout on downstream calls (DB, HTTP, Kafka)
   Pattern: HttpClient call or DB query with no explicit timeout configured
   Risk: Slow dependency hangs the request thread indefinitely
-  Fix: Set explicit timeouts — 5s internal, 15s external (see decision-rules.md)
+  Fix: Set explicit timeouts — 5s internal, 15s external (see kos-decisions.md)
 
 WARN — Returning 200 with null body instead of 404
   Pattern: return Ok(null) or return Ok(new { data = null }) when resource not found
@@ -301,7 +301,7 @@ Run when: code processes files, batch imports, staging tables, or sync jobs.
 BLOCK — Processing entire file in memory
   Pattern: File.ReadAllBytes() or reading full FTP file into a List<> before processing
   Risk: Files > 100MB cause OOM exception or memory pressure on the service
-  Fix: Stream the file — read and process in chunks (see decision-rules.md: chunk size rules)
+  Fix: Stream the file — read and process in chunks (see kos-decisions.md: chunk size rules)
 
 BLOCK — No transaction boundary on batch insert
   Pattern: inserting records one by one with no wrapping transaction
@@ -311,7 +311,7 @@ BLOCK — No transaction boundary on batch insert
 BLOCK — Writing directly to main DB without staging
   Pattern: FTP/external data written directly to production tables
   Risk: Dirty data, duplicates, or malformed records corrupt production
-  Fix: Always write to staging first, validate, then apply (see patterns.md: Staging → Validate → Apply)
+  Fix: Always write to staging first, validate, then apply (see kos-patterns.md: Staging → Validate → Apply)
 
 WARN — No idempotency on file reprocessing
   Pattern: re-running the sync job on the same file produces duplicate records
@@ -348,7 +348,7 @@ BLOCK — Synchronous DB calls in high-concurrency endpoint
 BLOCK — No rate limiting on expensive endpoint
   Pattern: Endpoint hitting DB or external API with no rate limit per client
   Risk: One client can exhaust the connection pool for all other clients (thundering herd)
-  Fix: Add Token Bucket per user/resource using Redis (patterns.md #14)
+  Fix: Add Token Bucket per user/resource using Redis (kos-patterns.md #14)
        Return HTTP 429 with Retry-After header on rejection
 
 BLOCK — Shared DbContext across concurrent operations
@@ -463,7 +463,7 @@ BLOCK — No double-entry ledger
 BLOCK — Raw card data handled by your service
   Pattern: Code receives, stores, or transmits credit card numbers or CVVs
   Risk: PCI-DSS Level 1 compliance required — major audit burden and breach liability
-  Fix: Use PSP hosted payment page (patterns.md #24) — card data never reaches your server
+  Fix: Use PSP hosted payment page (kos-patterns.md #24) — card data never reaches your server
 
 BLOCK — No reconciliation process
   Pattern: Financial system with no end-of-day comparison against PSP settlement files
@@ -483,11 +483,11 @@ WARN — No compensation on partial payment failure
 WARN — PSP HTTP call with no timeout or circuit breaker
   Pattern: Synchronous PSP call on the critical payment path with no timeout
   Risk: PSP slowdown hangs all payment requests → connection pool exhaustion
-  Fix: Explicit timeout (15s for external PSP) + Circuit Breaker (patterns.md #9)
+  Fix: Explicit timeout (15s for external PSP) + Circuit Breaker (kos-patterns.md #9)
 
 SUGGEST — Financial state not event-sourced
   Pattern: Payment state stored only as current mutable status (PENDING → PAID → REFUNDED)
   Why: No audit trail, cannot answer "what happened at 14:32?", cannot replay on bug fix
-  Option: Append payment events to immutable log (patterns.md #19)
+  Option: Append payment events to immutable log (kos-patterns.md #19)
           PaymentInitiated → CardCharged → PaymentSettled → Refunded
 ```

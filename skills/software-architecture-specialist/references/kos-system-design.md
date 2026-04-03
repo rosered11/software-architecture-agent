@@ -6,68 +6,6 @@
 
 ---
 
-## Index
-
-### Knowledge Records
-| # | Title | Domain | Difficulty |
-|---|-------|--------|------------|
-| K1 | [Back-of-the-Envelope Estimation](#k1-back-of-the-envelope-estimation) | Scalability | Beginner |
-| K2 | [CAP Theorem](#k2-cap-theorem) | Distributed Systems | Intermediate |
-| K3 | [Consistent Hashing](#k3-consistent-hashing) | Distributed Systems | Intermediate |
-| K4 | [Rate Limiting Algorithms](#k4-rate-limiting-algorithms) | API Design | Intermediate |
-| K5 | [Distributed Unique ID Generation — Snowflake](#k5-distributed-unique-id-generation--snowflake) | Distributed Systems | Intermediate |
-| K6 | [Quorum Consensus (N, W, R)](#k6-quorum-consensus-n-w-r) | Distributed Systems | Advanced |
-| K7 | [Vector Clocks & Conflict Resolution](#k7-vector-clocks--conflict-resolution) | Distributed Systems | Advanced |
-| K8 | [Gossip Protocol for Failure Detection](#k8-gossip-protocol-for-failure-detection) | Distributed Systems | Intermediate |
-| K9 | [Geospatial Indexing — Geohash & Quadtree](#k9-geospatial-indexing--geohash--quadtree) | Distributed Systems | Intermediate |
-| K10 | [Event Sourcing](#k10-event-sourcing) | Architecture | Advanced |
-| K11 | [Distributed Transactions — 2PC, Saga, TC/C](#k11-distributed-transactions--2pc-saga-tcc) | Distributed Systems | Advanced |
-| K12 | [Stream vs Batch Processing](#k12-stream-vs-batch-processing) | Data Pipeline | Intermediate |
-| K13 | [Fanout Strategies — Push vs Pull vs Hybrid](#k13-fanout-strategies--push-vs-pull-vs-hybrid) | Architecture | Intermediate |
-| K14 | [WebSocket vs HTTP Polling vs Long Polling](#k14-websocket-vs-http-polling-vs-long-polling) | API Design | Intermediate |
-| K15 | [CDN Strategy & Cache Layers](#k15-cdn-strategy--cache-layers) | Scalability | Intermediate |
-| K16 | [Database Sharding Strategies](#k16-database-sharding-strategies) | DB Performance | Intermediate |
-| K17 | [LSM Tree & SSTables](#k17-lsm-tree--sstables) | DB Performance | Advanced |
-| K18 | [Message Queue Internals — WAL, Partitions, ISR](#k18-message-queue-internals--wal-partitions-isr) | Event-Driven | Advanced |
-| K19 | [Erasure Coding vs Replication](#k19-erasure-coding-vs-replication) | Distributed Systems | Advanced |
-| K20 | [Idempotency in Distributed Systems](#k20-idempotency-in-distributed-systems) | Resilience | Intermediate |
-| K21 | [Trie Data Structure for Autocomplete](#k21-trie-data-structure-for-autocomplete) | Data | Intermediate |
-| K22 | [Time-Series Database Design](#k22-time-series-database-design) | DB Performance | Intermediate |
-| K23 | [Double-Entry Ledger System](#k23-double-entry-ledger-system) | Architecture | Advanced |
-| K24 | [Matching Engine & Order Book Design](#k24-matching-engine--order-book-design) | Architecture | Advanced |
-
-### Pattern Records
-| # | Name | Category |
-|---|------|----------|
-| P1 | [Token Bucket Rate Limiting](#p1-token-bucket-rate-limiting) | API Design |
-| P2 | [Consistent Hashing Ring](#p2-consistent-hashing-ring) | Scalability |
-| P3 | [Fanout on Write (Push Model)](#p3-fanout-on-write-push-model) | Architecture |
-| P4 | [Fanout on Read (Pull Model)](#p4-fanout-on-read-pull-model) | Architecture |
-| P5 | [Hybrid Fanout](#p5-hybrid-fanout) | Architecture |
-| P6 | [Event Sourcing Pattern](#p6-event-sourcing-pattern) | Architecture |
-| P7 | [Scatter-Gather](#p7-scatter-gather) | Distributed Systems |
-| P8 | [Write-Ahead Log (WAL)](#p8-write-ahead-log-wal) | Resilience |
-| P9 | [Geohash Bucketing](#p9-geohash-bucketing) | Data |
-| P10 | [Snowflake ID Generation](#p10-snowflake-id-generation) | Distributed Systems |
-| P11 | [Hosted Payment Page](#p11-hosted-payment-page) | API Design |
-| P12 | [Dead Letter Queue (DLQ) with Reconciliation](#p12-dead-letter-queue-dlq-with-reconciliation) | Resilience |
-| P13 | [Saga Pattern](#p13-saga-pattern) | Resilience |
-| P14 | [Transactional Outbox](#p14-transactional-outbox) | Messaging |
-| P15 | [Idempotency Key](#p15-idempotency-key) | Resilience |
-
-### Decision Log
-| # | Title |
-|---|-------|
-| D1 | [Database type selection for different workloads](#d1-database-type-selection-for-different-workloads) |
-| D2 | [Real-time connection strategy](#d2-real-time-connection-strategy) |
-| D3 | [Storage strategy: Replication vs Erasure Coding](#d3-storage-strategy-replication-vs-erasure-coding) |
-| D4 | [Distributed transaction strategy](#d4-distributed-transaction-strategy) |
-| D5 | [Rate limiter algorithm selection](#d5-rate-limiter-algorithm-selection) |
-| D6 | [ID generation strategy at scale](#d6-id-generation-strategy-at-scale) |
-| D7 | [Pull vs Push model for metrics collection](#d7-pull-vs-push-model-for-metrics-collection) |
-
----
-
 ## KNOWLEDGE RECORDS
 
 ---
@@ -676,7 +614,7 @@ Deep Dive:        1. TWO-PHASE COMMIT (2PC):
                   When to use: Small number of resources (2-3 DBs), internal services,
                   latency is acceptable, rollback is cheap
 
-                  2. SAGA PATTERN (existing in patterns.md — extended here):
+                  2. SAGA PATTERN (existing in kos-patterns.md — extended here):
                   Choreography: Each service publishes events, next service listens
                   Orchestration: Central orchestrator sends commands, waits for replies
                   Compensating transactions: On failure, reverse each completed step
@@ -1165,7 +1103,7 @@ Decision Rule:    Financial events (payment, order)? → ack=all + min.insync.re
                   Need ordered processing per entity? → Partition by entity key
 Related Concepts: → Stream vs Batch Processing
                   → Event Sourcing
-                  → Retry + DLQ (patterns.md #5)
+                  → Retry + DLQ (kos-patterns.md #5)
 Related Patterns:  → P14: Transactional Outbox
                   → P12: Dead Letter Queue (DLQ) with Reconciliation
 Source:           System Design Interview Vol. 2, Chapter on Distributed Message Queue

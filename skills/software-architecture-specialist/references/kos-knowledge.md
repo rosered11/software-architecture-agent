@@ -612,7 +612,7 @@ Deep Dive:        1. TWO-PHASE COMMIT (2PC):
                   When to use: Small number of resources (2-3 DBs), internal services,
                   latency is acceptable, rollback is cheap
 
-                  2. SAGA PATTERN (existing in patterns.md — extended here):
+                  2. SAGA PATTERN (existing in kos-patterns.md — extended here):
                   Choreography: Each service publishes events, next service listens
                   Orchestration: Central orchestrator sends commands, waits for replies
                   Compensating transactions: On failure, reverse each completed step
@@ -1101,7 +1101,7 @@ Decision Rule:    Financial events (payment, order)? → ack=all + min.insync.re
                   Need ordered processing per entity? → Partition by entity key
 Related Concepts: → Stream vs Batch Processing
                   → Event Sourcing
-                  → Retry + DLQ (patterns.md #5)
+                  → Retry + DLQ (kos-patterns.md #5)
 Related Patterns:  → P14: Transactional Outbox
                   → P12: Dead Letter Queue (DLQ) with Reconciliation
 Source:           System Design Interview Vol. 2, Chapter on Distributed Message Queue
@@ -1513,7 +1513,7 @@ Related Patterns: → P16: Async Parallel DB Coordinator
                   → P17: Batch Query (WHERE IN)
                   → P18: Eager Graph Loading
                   → P20: Bulk Load Then Map
-                  → P27: Parallel Split Compiled Query
+                  → P23: Parallel Split Compiled Query
 Related Incidents:→ I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 4, 2026-03-27; EF Core Microsoft documentation
 ```

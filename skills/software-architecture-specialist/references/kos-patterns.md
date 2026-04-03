@@ -31,21 +31,6 @@ Used in Decisions:  → D5: Rate limiter algorithm selection
 Related Tech Assets:→ Redis INCR + EXPIRE pattern
 ```
 
-**Problem**: API endpoints receive burst traffic that exhausts downstream resources (DB connections, third-party API quotas) or monopolises the system for other users.
-
-**Solution**: Assign each client (user ID, API key, or resource key) a bucket of capacity C tokens refilled at rate R per second. Each request consumes 1 token. Reject with HTTP 429 if empty.
-
-**When to USE**:
-- Any public or partner-facing API
-- Endpoints that call expensive downstream services (DB, external APIs)
-- When burst traffic is legitimate (allow it up to capacity, then throttle)
-
-**When NOT to USE**:
-- Need constant-rate output regardless of input (use Leaking Bucket instead)
-- Rate limit is per-second-exact with no tolerance for burst
-
-**Complexity**: Low
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -100,21 +85,6 @@ Based on Knowledge:  → Consistent Hashing (K3)
 Related Tech Assets:→ Sorted map / BST implementation of ring
 ```
 
-**Problem**: Adding or removing nodes in a distributed cache or data store remaps most keys with traditional mod-N hashing, causing a cache stampede or massive data rebalancing.
-
-**Solution**: Map both server IDs and keys onto a hash ring (0–2^32). Assign 100–200 virtual nodes per physical server. For each key, walk clockwise to find the owning server. On topology change, only adjacent keys on the ring are remapped (k/n total vs ~all keys with mod-N).
-
-**When to USE**:
-- Distributed cache with dynamic node count (autoscaling, failures)
-- Data partitioning where servers join/leave regularly
-- Load balancing across stateful servers requiring key affinity
-
-**When NOT to USE**:
-- Fixed, static server count (mod-N is simpler)
-- When you need exact control over which key goes where
-
-**Complexity**: Medium
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -164,21 +134,6 @@ Based on Knowledge:  → Fanout Strategies (K13)
 Used in Decisions:  → D2: Real-time connection strategy
 ```
 
-**Problem**: Followers need to see a new post in their feed with minimal read latency, but building the feed at read time is too slow.
-
-**Solution**: On post creation, immediately write the post ID to all followers' feed caches. Feed reads are O(1) — just fetch from pre-computed Redis list per user.
-
-**When to USE**:
-- Users have bounded follower counts (< ~10,000)
-- Feed read frequency >> write frequency
-- Majority of followers are active (cache writes are not wasted)
-
-**When NOT to USE**:
-- Celebrity users with millions of followers (write amplification: 1 post → millions of cache writes)
-- Most followers are inactive (wasted writes to rarely-read caches)
-
-**Complexity**: Medium
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -213,21 +168,6 @@ Complexity:       Low (write path) / High (read path)
 Based on Knowledge:  → Fanout Strategies (K13)
 ```
 
-**Problem**: Pre-computing feeds for all followers wastes resources — especially for high-follower celebrities where 1 post triggers millions of cache writes.
-
-**Solution**: Post is written only to the author's post store. When a user requests their feed, the system fetches recent posts from all followed users, merges, and sorts them. Optionally cache the merged result per user with a short TTL.
-
-**When to USE**:
-- Author has very high follower counts (celebrities)
-- Low active-user ratio (most users don't read regularly)
-- Feed freshness is critical — cannot tolerate staleness
-
-**When NOT to USE**:
-- Users follow many highly active users (fan-in too large at read time)
-- Low latency is required on every feed read
-
-**Complexity**: Low (write) / High (read merge)
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -261,20 +201,6 @@ Complexity:       High (dual path + classification logic + feed merge)
 Based on Knowledge:  → Fanout Strategies (K13)
                     → CDN Strategy & Cache Layers (K15)
 ```
-
-**Problem**: Pure push wastes compute for celebrities; pure pull makes reads slow for regular users. Neither alone works for a platform with both.
-
-**Solution**: Classify users by follower count. Below threshold: fanout on write (push). Above threshold (celebrities): fanout on read (pull). At feed assembly time, merge the pre-computed feed (regular users' posts) with freshly-fetched celebrity posts.
-
-**When to USE**:
-- Social platform with power-law follower distribution (a few users have millions, most have hundreds)
-- Both fast read AND efficient write are required
-
-**When NOT to USE**:
-- Uniform follower distribution (either pure push or pure pull is simpler)
-- Celebrity threshold is hard to define (start with > 10,000 followers)
-
-**Complexity**: High (dual path + threshold classification + merge logic)
 
 **Trade-offs**:
 | Pros | Cons |
@@ -318,23 +244,6 @@ Based on Knowledge:  → Event Sourcing (K10)
 Related Tech Assets:→ Append-only event table schema
                     → Snapshot + replay recovery pattern
 ```
-
-**Problem**: Traditional CRUD loses history. You cannot audit what happened, replay to recover from bugs, or derive different read models from the same source data.
-
-**Solution**: Instead of storing current state, store an immutable append-only log of every state-change event. Current state = replay of all events (or snapshot + replay of events since snapshot). Build read projections from the event stream.
-
-**When to USE**:
-- Financial systems requiring full audit trail
-- Systems needing temporal queries ("what was the state at time T?")
-- Systems where a bug fix requires reprocessing historical data
-- Systems needing multiple read models from the same source (CQRS)
-
-**When NOT to USE**:
-- Simple CRUD with no audit/replay requirement (adds complexity for no gain)
-- Real-time systems where event schema evolution is too complex to maintain
-- Small systems where snapshot + versioned DB is sufficient
-
-**Complexity**: High
 
 **Trade-offs**:
 | Pros | Cons |
@@ -397,21 +306,6 @@ Based on Knowledge:  → Database Sharding Strategies (K16)
 Used in Incidents:   → I1: GetSubOrder API Latency Spike
 ```
 
-**Problem**: A query cannot be served from a single node — data is partitioned across multiple shards and must be aggregated to answer.
-
-**Solution**: 1. Coordinator receives the query. 2. **Scatter**: broadcast sub-queries to all relevant shards in parallel. 3. **Gather**: collect responses, merge/sort/reduce. 4. Return merged result.
-
-**When to USE**:
-- Top-K queries across sharded data (leaderboard, trending)
-- Search across multiple index shards
-- Aggregations (SUM, MAX) where data is partitioned by key
-
-**When NOT to USE**:
-- Query can be routed to a single shard using the shard key (direct routing is always better)
-- Fan-out is too wide (N shards = latency bounded by slowest shard)
-
-**Complexity**: Medium
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -450,21 +344,6 @@ Complexity:       Medium
 Based on Knowledge:  → Event Sourcing (K10)
                     → LSM Tree & SSTables (K17)
 ```
-
-**Problem**: In-memory state is lost on crash. Rebuilding state from scratch after every restart is too slow (full replay of all history).
-
-**Solution**: Before modifying in-memory state, append the change to a sequential log on durable storage. On crash recovery, load the latest snapshot and replay only the WAL entries since the snapshot.
-
-**When to USE**:
-- Any system with in-memory state that must survive crashes
-- Databases (PostgreSQL, MySQL), message queues (Kafka segment files), matching engines
-- Financial systems requiring deterministic crash recovery
-
-**When NOT to USE**:
-- Stateless systems (nothing to restore)
-- Systems where WAL replay would take too long without snapshots (add periodic snapshots)
-
-**Complexity**: Medium
 
 **Trade-offs**:
 | Pros | Cons |
@@ -520,22 +399,6 @@ When NOT to Use:  Very high update frequency (e.g., moving vehicles — use quad
 Complexity:       Low
 Based on Knowledge:  → Geospatial Indexing (K9)
 ```
-
-**Problem**: Nearby location search over millions of businesses requires spatial indexing — scanning all records by lat/lon is O(n) and impractical.
-
-**Solution**: Encode each business location as a geohash string (e.g., "9q9p1y"). Index this string column. For a user at location L, compute the geohash at precision P, compute the 8 neighboring cells, query `WHERE geohash IN (9 cells)`, then filter by exact distance.
-
-**When to USE**:
-- Nearby search (restaurants, drivers, points of interest)
-- Static or semi-static locations updated infrequently
-- Scale up to hundreds of millions of records
-
-**When NOT to USE**:
-- Constantly moving entities at high frequency (>1 update/second per entity) — use Quadtree or H3
-- Arbitrary polygon regions — use Google S2
-- Precision requirements finer than ~100m — use higher precision but be aware of 8-neighbor requirement
-
-**Complexity**: Low
 
 **Trade-offs**:
 | Pros | Cons |
@@ -603,22 +466,6 @@ Based on Knowledge:  → Distributed Unique ID Generation (K5)
 Related Patterns:    → P15: Idempotency Key (Snowflake IDs pair well as idempotency keys — globally unique + time-ordered)
 ```
 
-**Problem**: Multiple distributed services need globally unique, time-sortable IDs without coordination, without a central DB sequence, and without the 128-bit bulk of UUID.
-
-**Solution**: Compose a 64-bit integer from timestamp (41 bits, ms precision), datacenter ID (5 bits), machine ID (5 bits), and per-ms sequence counter (12 bits). No coordination needed — each machine generates IDs independently.
-
-**When to USE**:
-- High-throughput ID generation across distributed services
-- Need time-sortable IDs (enables range queries: find all orders after ID X)
-- Want to avoid DB auto-increment bottleneck or UUID size overhead
-
-**When NOT to USE**:
-- Need strictly sequential IDs with no gaps (use DB sequence)
-- Machine count exceeds 1,024 (expand machine bits)
-- Clock synchronization is unreliable (consider ULID instead)
-
-**Complexity**: Low
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -651,14 +498,6 @@ Non-guessable, random?                     → UUID v4
 Strictly sequential, single server?        → DB auto-increment
 Clock unreliable across nodes?             → ULID (monotonic, NTP-independent)
 ```
-
-**KOS Summary**:
-- 64-bit integer: [41-bit timestamp ms][5-bit datacenter][5-bit machine][12-bit sequence]
-- Max 4,096 IDs/ms per machine — sufficient for all but the highest-throughput systems
-- Epoch: custom start date (not Unix epoch) to maximize usable 69-year range
-- Time-sortability enables `WHERE id > X` range queries without timestamp column
-- Critical dependency: NTP sync. Clock drift → duplicate IDs → use sequence overflow guard + wait loop
-- Store as `BIGINT` in PostgreSQL — no UUID column, no JOIN overhead from 128-bit keys
 
 **Related patterns**: P15 Idempotency Key (Snowflake IDs pair well as idempotency keys — globally unique + time-ordered)
 
@@ -697,21 +536,6 @@ Related Patterns:    → P15: Idempotency Key (token capture must be idempotent)
                      → P12: DLQ with Reconciliation (PSP settlement reconciliation)
 ```
 
-**Problem**: Processing raw credit card data requires PCI-DSS Level 1 compliance — a costly, time-consuming, and high-risk audit burden for most teams.
-
-**Solution**: Redirect the user to the PSP's (Stripe, PayPal, Braintree) hosted payment form. The PSP collects card data directly and returns a payment token to your system. Your system only handles the token — never touches raw card data.
-
-**When to USE**:
-- Any system processing card payments
-- Team lacks dedicated security/compliance expertise for PCI-DSS
-- Speed to market matters more than fully custom payment UI
-
-**When NOT to USE**:
-- Need fully custom, branded payment experience (use PSP's JavaScript SDK instead — still PCI-scope-reduced)
-- Enterprise with existing PCI-DSS L1 infrastructure (direct API may be more efficient)
-
-**Complexity**: Low
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -734,14 +558,6 @@ Related Patterns:    → P15: Idempotency Key (token capture must be idempotent)
 - New team building payments? → Hosted Payment Page first, always
 - Need custom UI + still avoid PCI? → PSP JavaScript SDK (card data goes PSP, not your server)
 - Already PCI-compliant and need control? → Direct PSP API with your own form
-
-**KOS Summary**:
-- PCI-DSS scope reduction: your server never touches raw card data — only handles the token returned by PSP
-- Flow: create session → redirect user to PSP page → PSP tokenizes → redirect back with token → capture charge
-- Always store `idempotency_key` + result before redirecting — prevents double-charge on network retry
-- Webhook verification mandatory: validate PSP webhook signature before updating order status
-- Failure mode: PSP redirect failure → show user "payment pending" state, never "failed" — PSP may have charged
-- Azure AD B2C stack: PSP token stored against user profile; never log or persist raw card fields
 
 **Related patterns**: P15 Idempotency Key (mandatory — token capture must be idempotent)
 
@@ -780,21 +596,6 @@ Related Patterns:    → P15: Idempotency Key (replay safety)
                      → P11: Hosted Payment Page (PSP reconciliation)
 Source:           Financial consumer pattern, Go + Kafka stack
 ```
-
-**Problem**: Some Kafka messages permanently fail processing (bad payload, downstream permanently unavailable). Without a DLQ they block the partition or cause silent data loss. For financial systems, missed events cause balance discrepancies that are never detected.
-
-**Solution**: After max retries with exponential backoff, route failed messages to a Dead Letter Queue topic. Alert on DLQ depth > 0. For financial systems: add end-of-day reconciliation — compare internal ledger totals against PSP/partner settlement files and alert on any discrepancy.
-
-**When to USE**:
-- Any Kafka consumer processing financial or critical events
-- Any system where missed messages need an audit trail
-- Any system with at-least-once delivery and downstream side effects
-
-**When NOT to USE**:
-- Non-critical events where silent loss is acceptable (discard instead of DLQ)
-- Events with TTL that are useless once stale (drop, not DLQ)
-
-**Complexity**: Low–Medium
 
 **Trade-offs**:
 | Pros | Cons |
@@ -838,16 +639,6 @@ func processWithDLQ(msg kafka.Message) {
 - Critical business events (order, inventory)? → DLQ mandatory
 - Analytics/logs? → DLQ optional (consider dropping instead)
 
-**KOS Summary**:
-- DLQ topic naming convention: `{original_topic}.DLQ` — keeps consumer group and alert routing simple
-- Max retries: 3 with exponential backoff (1s, 4s, 16s). Permanent errors skip retries immediately
-- Alert threshold: DLQ depth > 0 for 5 min → page on-call. DLQ should always be empty in healthy state
-- Replay rule: fix the consumer code first, then replay — replaying broken consumer doubles the damage
-- Replay must be idempotent: same message processed twice must produce same result (use idempotency key)
-- Reconciliation cadence: end-of-day (financial). Compare internal ledger vs PSP settlement file by currency
-- Unmatched transactions → create investigation record + escalate immediately (never silently ignore)
-- Go stack: use `isPermanentError()` to classify errors before retry loop — avoid retrying 400-class errors
-
 **Related patterns**: P15 Idempotency Key (replay safety), P11 Hosted Payment Page (PSP reconciliation)
 
 ---
@@ -889,25 +680,9 @@ Based on Knowledge:  → Distributed Transactions — 2PC, Saga, TC/C (K11)
                     → Idempotency in Distributed Systems (K20)
 ```
 
-**Problem**: A business operation spans multiple services (e.g., place order → reserve inventory → charge payment). If one step fails, you need to undo the previous steps — but there's no distributed transaction.
-
-**Solution**: Each service does its local transaction and publishes an event. The next service listens and acts. On failure, compensating transactions are triggered in reverse.
-
 **Types**:
 - **Choreography**: Services react to each other's events (decentralized)
 - **Orchestration**: A saga orchestrator directs each step (centralized)
-
-**When to USE**:
-- Multi-service transaction with rollback requirements
-- Long-running business processes
-- You can define compensating actions for each step
-
-**When NOT to USE**:
-- Single-service operations (just use a DB transaction)
-- When steps can't be compensated (irreversible actions)
-- Simple workflows with no failure recovery need
-
-**Complexity**: High
 
 **Trade-offs**:
 | Pros | Cons |
@@ -953,22 +728,6 @@ Complexity:       Medium (outbox table + relay process or CDC setup)
 Based on Knowledge:  → Message Queue Internals — WAL, Partitions, ISR (K18)
                     → Event Sourcing (K10)
 ```
-
-**Problem**: Writing to DB and publishing a Kafka event are two separate operations. If the service crashes between them, one side is missing — data inconsistency.
-
-**Solution**: Write the event to an `outbox` table in the same DB transaction as the domain change. A separate background worker polls the outbox and publishes to Kafka, then marks as sent.
-
-**When to USE**:
-- You need guaranteed at-least-once event delivery
-- DB write and event publish must be atomic
-- Cross-service communication where consistency matters
-
-**When NOT to USE**:
-- Fire-and-forget notifications (email, push) where loss is acceptable
-- When you already have a transactional messaging system
-- Low-volume systems where 2PC overhead is acceptable
-
-**Complexity**: Medium
 
 **Trade-offs**:
 | Pros | Cons |
@@ -1040,21 +799,6 @@ Based on Knowledge:  → Idempotency in Distributed Systems (K20)
                     → Distributed Transactions — 2PC, Saga, TC/C (K11)
 ```
 
-**Problem**: Retries (HTTP or event-driven) can cause the same operation to execute twice — double charges, duplicate orders, double inventory deductions.
-
-**Solution**: Assign a unique key to each operation. Before processing, check if the key was already processed. If yes, return the cached result without re-executing.
-
-**When to USE**:
-- Any operation that must be retried (payment, order creation)
-- Kafka consumers (at-least-once delivery = duplicates possible)
-- HTTP endpoints called by unreliable clients
-
-**When NOT to USE**:
-- Pure reads (idempotent by nature)
-- Operations where duplicates are harmless
-
-**Complexity**: Low
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -1122,25 +866,6 @@ Used in Decisions:   → D8: Use IDbContextFactory for Parallel GetSubOrderAsync
                      → D15: await using var Scope Rule
 Source:           target.cs GetSubOrderAsync Phase 4, 2026-04-01
 ```
-
-**Problem**: A coordinator method fires multiple independent DB calls sequentially — total latency = sum of all call times. Under high concurrency, threads block during I/O and the connection pool exhausts.
-
-**Solution**: Resolve any shared context first (reference lookup, auth), then fire all independent DB calls concurrently via `Task.WhenAll`, each using its own `DbContext` from `IDbContextFactory`. Assemble results in memory after all tasks complete.
-
-**When to USE**:
-- Coordinator method calls 2+ independent DB operations sequentially (no data dependency between them)
-- Hot-path API endpoint under concurrent load
-- I/O wait % > 80% (threads blocking on DB, not CPU-bound)
-- Sequential latency > 300ms and at least 2 calls can run in parallel
-- .NET + EF Core stack with `IDbContextFactory` available
-
-**When NOT to USE**:
-- Calls have data dependencies (one result feeds the next query)
-- Single DB call — parallelism adds overhead with zero benefit
-- Legacy sync-only codebase where async migration risk is too high
-- Low concurrency (< 10 req/s) — sequential async is sufficient
-
-**Complexity**: Medium
 
 **Trade-offs**:
 | Pros | Cons |
@@ -1223,7 +948,7 @@ Results:
 
 AllocatedKB overhead: +332 KB (N=1) / +442 KB (All) — 4 factory `OrderContext` instances per call.
 
-**Phase 5 result**: `GetSubOrderMessageFromBatch` bulk load split into two parallel compiled queries — see P27.
+**Phase 5 result**: `GetSubOrderMessageFromBatch` bulk load split into two parallel compiled queries — see P23.
 1,117ms → 741ms (-34%). Remaining floor: ~216ms serial (Steps 1, 2, 4, 5). Next lever: `IMemoryCache` on `GetStoreLocation` (5-min TTL).
 
 **Pitfall: `await using var` scope inside conditional block**
@@ -1274,21 +999,6 @@ Based on Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFact
 Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 2, 2026-03-27
 ```
-
-**Problem**: DB calls inside loops cause N+1 queries — latency grows linearly with record count.
-
-**Solution**: Collect all IDs first, fetch in one `IN` query, map results in memory with a dictionary.
-
-**When to USE**:
-- You have a loop that calls the DB per item
-- N > 100 records expected
-- Read-heavy hot paths (APIs, message processors)
-
-**When NOT to USE**:
-- N is provably < 50 and always will be
-- Data must be fetched with complex per-item conditions that can't be batched
-
-**Complexity**: Low
 
 **Trade-offs**:
 | Pros | Cons |
@@ -1365,23 +1075,6 @@ Based on Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFact
 Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 1, 2026-03-27
 ```
-
-**Problem**: EF Core navigation properties loaded lazily inside a loop cause one DB round-trip per property per entity — query count grows as O(n × relations). This is invisible at low volume and catastrophic at scale.
-
-**Solution**: Move all navigation property loads into the `Include()` / `ThenInclude()` chain on the root query. EF Core (with `AsSplitQuery()`) fetches the full object graph in a fixed number of queries regardless of entity count.
-
-**When to USE**:
-- A method loops over a collection and accesses navigation properties per item
-- The number of entities is unbounded or can grow with order/request size
-- Hot-path read methods where latency matters
-- Any `Entry().Reference().Load()` or `Entry().Collection().Load()` currently inside a loop
-
-**When NOT to USE**:
-- Navigation property is rarely needed (< 10% of calls) — lazy or conditional load is cheaper
-- Graph is extremely deep (5+ levels) and most branches are unused — consider projection instead
-- Single entity lookup where the property is only sometimes needed
-
-**Complexity**: Low
 
 **Trade-offs**:
 | Pros | Cons |
@@ -1474,22 +1167,6 @@ Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 1, 2026-03-27
 ```
 
-**Problem**: Multiple sibling methods independently resolve the same shared context (e.g., looking up a canonical ID, resolving a reference mapping) — each one hits the DB separately for the same answer.
-
-**Solution**: Resolve the shared context once at the coordinator (parent method) level and pass the resolved value down to all sub-calls.
-
-**When to USE**:
-- Two or more sibling methods resolve the same ID / reference / lookup
-- The resolution is deterministic and doesn't change within the request scope
-- The coordinator already has the input needed to perform the resolution
-
-**When NOT to USE**:
-- Each sub-call genuinely needs a different resolution (different input)
-- The resolved value changes between calls (e.g., updated by a concurrent write)
-- The sub-call is used independently in other contexts where the coordinator doesn't exist
-
-**Complexity**: Low
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -1552,24 +1229,7 @@ Used in Incidents:   → I1: GetSubOrder API Latency Spike
 Source:           incident2.cs Phase 3, 2026-03-27
 ```
 
-**Problem**: A method loops over N records, calling the DB once per record — the **outer loop** is the bottleneck, not the queries inside each iteration. Each iteration may load a full entity graph with its own network round-trip, making latency scale as O(N).
-
 **This is distinct from P17 (Batch Query)**: P17 batches a single supporting lookup inside a loop. P20 eliminates the outer loop itself — the entire entity graph for all N records is loaded in one query, then all mapping is done in memory.
-
-**Solution**: Collect all IDs → bulk-load ALL entities with full Include chain in one query + `AsSplitQuery()` → batch all supporting lookups → map ViewModels in memory (zero per-record DB calls in the mapping phase).
-
-**When to USE**:
-- A method loops N times and each iteration issues 5+ DB queries
-- N is bounded (e.g., 5–50 sub-orders) — not unbounded streaming data
-- The full entity graph can fit in memory for N records
-- The method is on a hot read path (API endpoint, not background job)
-
-**When NOT to USE**:
-- N is unbounded or N > 500 (memory risk — use chunked streaming instead)
-- Entity graph is sparse and most Include paths will load nothing (projection is better)
-- Per-record conditions are unique and can't be expressed as a bulk `Contains()` query
-
-**Complexity**: High (significant refactor — method structure changes completely)
 
 **Trade-offs**:
 | Pros | Cons |
@@ -1916,12 +1576,12 @@ Query with dynamic filters (optional .Where clauses) → cannot compile statical
 - Healthy ceiling: DynamicMethod count stabilizes at N×(unique query shapes across all endpoints) — stable is fine, unbounded growth is the problem
 - AsSplitQuery + CompileQuery: supported in EF Core 10. Generates multiple compiled split queries, one per Include batch
 
-**Related patterns**: P20 Bulk Load Then Map, P16 Async Parallel DB Coordinator, P27 Parallel Split Compiled Query
+**Related patterns**: P20 Bulk Load Then Map, P16 Async Parallel DB Coordinator, P23 Parallel Split Compiled Query
 **Related decisions**: D13 (EF.CompileQuery static field — decision record with full heap dump incident data)
 
 ---
 
-### P27: Parallel Split Compiled Query
+### P23: Parallel Split Compiled Query
 
 ```
 Name:             Parallel Split Compiled Query
@@ -1955,8 +1615,8 @@ Source:           target.cs Phase 5, 2026-04-02. 1,117ms → 741ms (-34%).
 
 **Split strategy**:
 ```
-Header group  (P27a): base entity + scalar collections (Addresses, Remarks, Promotions, Fee)
-Items group   (P27b): deep nested items graph (Items → Amount → Taxes, FulFillment, Payments, Promotions...)
+Header group  (P23a): base entity + scalar collections (Addresses, Remarks, Promotions, Fee)
+Items group   (P23b): deep nested items graph (Items → Amount → Taxes, FulFillment, Payments, Promotions...)
 
 Rule for splitting: group Includes that share the same root navigation (Items.* together, Fee.* together, etc.)
 Never split across a shared navigation root — EF will re-query the join differently and may produce inconsistent results.

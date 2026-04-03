@@ -393,12 +393,12 @@ Additional checks:
 
 ### Real-Time / Stateful Connection System
 
-Additional checks for systems using WebSocket, SSE, long polling, or persistent connections:
+Additional checks beyond the core sections:
 
 ```
 [ ] Connection protocol is appropriate for the use case
     Risk: Using polling when WebSocket is needed = high latency or wasted requests
-    Check (patterns.md #16–18 / K14):
+    Check (kos-patterns.md #16–18 / K14):
       Bidirectional, low latency (chat, location)?  → WebSocket
       One-way push, infrequent (notifications)?     → Long Polling or SSE
       Periodic pull, > 5s interval?                 → Short Polling

@@ -265,7 +265,7 @@ Watch out for:    Connection pool growth: N parallel tasks × concurrent request
                   See D15 for the scope pitfall rule.
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P16: Async Parallel DB Coordinator
-                    → P27: Parallel Split Compiled Query
+                    → P23: Parallel Split Compiled Query
 Related Decision:   → D15: await using var Scope Rule (pitfall when using this pattern)
 Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-03-27
@@ -355,7 +355,7 @@ Related Pattern:    → P17: Batch Query (WHERE IN)
                    → P19: Coordinator-Level Resolution
                    → P20: Bulk Load Then Map
                    → P16: Async Parallel DB Coordinator
-                   → P27: Parallel Split Compiled Query
+                   → P23: Parallel Split Compiled Query
 Date:             2026-03-27
 Measured:         2026-04-02
 ```
@@ -505,7 +505,7 @@ Actual Outcome:   Bug confirmed by connection closed error. Fix (Option B) resol
                   Restored full Phase 4 async parallel behaviour with zero connection errors.
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P16: Async Parallel DB Coordinator
-                    → P27: Parallel Split Compiled Query
+                    → P23: Parallel Split Compiled Query
 Related Decision:   → D8: Use IDbContextFactory for Parallel GetSubOrderAsync
 Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-04-01

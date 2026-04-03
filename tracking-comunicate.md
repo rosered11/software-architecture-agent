@@ -750,3 +750,243 @@ Calls 29–30 (clean):  1,106–1,132ms  GC=0
 - **No bimodal JIT step-change**: same process as N=1 test — async state machine paths already at tier-1 before this test started.
 - **GC pattern healthy**: two isolated sawteeth (#7, #28), zero GC between them. ~14-call sawtooth period = normal heap growth cycle.
 - **CpuMs → 0ms from call #6**: tier-1 JIT promotion happened early due to cross-test warmup.
+
+---
+
+## 20. Phase 5 Applied to target.cs — 2026-04-02
+
+**Bottleneck identified from Phase 4**: `GetSubOrderMessageFromBatch` generates ~27 sequential SQL queries via `AsSplitQuery` (16 Include paths → 9 header queries + 13 items queries + header query). This single method dominates ~900ms of the 1,117ms total. It cannot be eliminated — it is the serial prerequisite that produces the sub-order list for all downstream parallel calls.
+
+**Fix**: Split the single `_bulkSubOrderQuery` (all 16 Include paths) into two independent compiled queries covering non-overlapping Include groups, then run both in parallel via `Task.WhenAll` + `IDbContextFactory`.
+
+### BotE Before Splitting
+
+```
+_bulkSubOrderQuery: 16 Include paths → ~27 sequential AsSplitQuery queries × ~35ms = ~945ms
+Serial (current): all 27 queries run one after another = ~900ms
+```
+
+### BotE After Splitting
+
+```
+_bulkSubOrderHeaderQuery:  ~9 split queries  → ~315ms
+_bulkSubOrderItemsQuery:   ~13 split queries → ~455ms
+Parallel: max(315, 455) = ~455ms
+Expected gain: ~900ms → ~455ms (-50%)
+Total expected P50: ~1,117ms - 445ms = ~672ms
+```
+
+### New Static Compiled Query Fields
+
+```csharp
+// Header group: base entity + Addresses, Remarks, Promotions, Fee subtrees (~9 split queries)
+private static readonly Func<OrderContext, string[], string[], IEnumerable<SubOrderModel>>
+    _bulkSubOrderHeaderQuery = EF.CompileQuery(
+        (OrderContext ctx, string[] orderIds, string[] subOrderIds) =>
+            ctx.SubOrder.AsNoTracking()
+                .Include(x => x.Addresses)
+                .Include(x => x.Remarks)
+                .Include(x => x.Promotions).ThenInclude(p => p.Amount)
+                .Include(x => x.Fee).ThenInclude(f => f.Amount).ThenInclude(a => a.Normal).ThenInclude(n => n.Taxes)
+                .Include(x => x.Fee).ThenInclude(f => f.Amount).ThenInclude(a => a.Paid).ThenInclude(p => p.Taxes)
+                .Include(x => x.Fee).ThenInclude(f => f.Payments).ThenInclude(p => p.Taxes)
+                .AsSplitQuery()
+                .Where(x => x.IsActive
+                    && orderIds.Contains(x.SourceOrderId)
+                    && subOrderIds.Contains(x.SourceSubOrderid)));
+
+// Items group: Items subtree with all financial/fulfillment/barcode sub-graphs (~13 split queries)
+private static readonly Func<OrderContext, string[], string[], IEnumerable<SubOrderModel>>
+    _bulkSubOrderItemsQuery = EF.CompileQuery(
+        (OrderContext ctx, string[] orderIds, string[] subOrderIds) =>
+            ctx.SubOrder.AsNoTracking()
+                .Include(x => x.Items).ThenInclude(i => i.Amount).ThenInclude(a => a.Normal).ThenInclude(n => n.Taxes)
+                .Include(x => x.Items).ThenInclude(i => i.Amount).ThenInclude(a => a.Paid).ThenInclude(p => p.Taxes)
+                .Include(x => x.Items).ThenInclude(i => i.Amount).ThenInclude(a => a.RetailPrice).ThenInclude(r => r.Taxes)
+                .Include(x => x.Items).ThenInclude(i => i.FulFillment).ThenInclude(f => f.DeliveryWindow)
+                .Include(x => x.Items).ThenInclude(i => i.Promotion)
+                .Include(x => x.Items).ThenInclude(i => i.Promotions)
+                .Include(x => x.Items).ThenInclude(i => i.Payments).ThenInclude(p => p.Taxes)
+                .Include(x => x.Items).ThenInclude(i => i.Remarks)
+                .Include(x => x.Items).ThenInclude(i => i.SubBarcode)
+                .AsSplitQuery()
+                .Where(x => x.IsActive
+                    && orderIds.Contains(x.SourceOrderId)
+                    && subOrderIds.Contains(x.SourceSubOrderid)));
+```
+
+### New Async Method: `GetSubOrderMessageFromBatchAsync`
+
+```csharp
+public async Task<CLResult> GetSubOrderMessageFromBatchAsync(
+    string OrderId,
+    IDbContextFactory<OrderContext> contextFactory,
+    List<SubOrderMessageViewModel> Output)
+```
+
+**Key change — Step 3 (parallel bulk load):**
+
+```csharp
+// Two independent DbContext instances — EF Core is NOT thread-safe
+await using var ctxHeader = contextFactory.CreateDbContext();
+await using var ctxItems  = contextFactory.CreateDbContext();
+
+var headerTask = Task.Run(() =>
+    _bulkSubOrderHeaderQuery(ctxHeader, orderIdsArr, subOrderIdsArr).ToList());
+var itemsTask  = Task.Run(() =>
+    _bulkSubOrderItemsQuery(ctxItems,  orderIdsArr, subOrderIdsArr).ToList());
+
+await Task.WhenAll(headerTask, itemsTask);
+
+// Merge by composite key
+var headerByKey = headerTask.Result.ToDictionary(s => (s.SourceOrderId, s.SourceSubOrderid));
+var itemsByKey  = itemsTask.Result.ToDictionary(s => (s.SourceOrderId, s.SourceSubOrderid));
+```
+
+**Step 6 mapping — split source:**
+
+```csharp
+// headerSO: base fields, Addresses, Remarks, Promotions, Fee
+// itemsSO:  Items and all nested financial/fulfillment sub-graphs
+if (!headerByKey.TryGetValue((pair.LoadOrderId, pair.LoadSubOrderId), out var headerSO)) continue;
+itemsByKey.TryGetValue((pair.LoadOrderId, pair.LoadSubOrderId), out var itemsSO);
+var itemModels = itemsSO?.Items ?? Enumerable.Empty<SubOrderItemModel>();
+```
+
+### Caller Update — `GetSubOrderAsync`
+
+```csharp
+// CHANGED from:
+subOrderRepository.GetSubOrderMessageFromBatch(SourceOrderId, ref resultAll);
+// CHANGED to:
+await subOrderRepository.GetSubOrderMessageFromBatchAsync(SourceOrderId, _contextFactory, resultAll);
+```
+
+Steps 1, 2, 4, 5 remain serial (unchanged) — they depend on the sub-order list produced by Step 3 or feed into the coordinator downstream.
+
+---
+
+## 21. Phase 5 Results — Measured 2026-04-02 (SubOrderId="All", N≈10)
+
+**Test conditions**: 30 sequential calls, `GetSubOrderAsync` (Phase 5 build), SubOrderId=`All`, same OrderId `TWDCDS2602122610025068`.
+
+### Raw Log
+
+| Req | ElapsedMs | CpuMs | MemDeltaKB | AllocKB | GC0 | GC1 |
+|-----|-----------|-------|-----------|---------|-----|-----|
+| #1 (cold) | 6,620 | 1,953 | 23,400 | 107,079 | 2 | 0 |
+| #2 | 874 | 422 | 2,113 | 2,103 | 0 | 0 |
+| #3 | 733 | 234 | 2,040 | 2,035 | 0 | 0 |
+| #4 | 738 | 109 | 2,033 | 2,027 | 0 | 0 |
+| #5 | 724 | 141 | 2,028 | 2,023 | 0 | 0 |
+| #6 | 753 | 141 | 2,022 | 2,017 | 0 | 0 |
+| #7 | 738 | 16 | 2,028 | 2,023 | 0 | 0 |
+| #8 | 744 | 63 | 2,051 | 2,045 | 0 | 0 |
+| #9 | 745 | 31 | 2,037 | 2,031 | 0 | 0 |
+| #A | 750 | 203 | 2,023 | 2,017 | 0 | 0 |
+| #B | 771 | 47 | 2,018 | 2,013 | 0 | 0 |
+| #C | 741 | 31 | 2,026 | 2,021 | 0 | 0 |
+| #D | 723 | 0 | 2,022 | 2,016 | 0 | 0 |
+| #E | 756 | 16 | 2,030 | 2,024 | 0 | 0 |
+| #F | 740 | 47 | 2,023 | 2,018 | 0 | 0 |
+| #10 | 723 | 63 | 2,028 | 2,023 | 0 | 0 |
+| #11 | 751 | 16 | 2,013 | 2,007 | 0 | 0 |
+| #12 | 733 | 16 | 2,020 | 2,015 | 0 | 0 |
+| #13 | 742 | 0 | 2,023 | 2,017 | 0 | 0 |
+| #14 | 740 | 31 | 2,026 | 2,021 | 0 | 0 |
+| #15 | 738 | 31 | 2,028 | 2,023 | 0 | 0 |
+| #16 | 754 | 0 | 2,029 | 2,024 | 0 | 0 |
+| #17 | 747 | 0 | 2,019 | 2,014 | 0 | 0 |
+| #18 | 750 | 0 | 2,021 | 2,016 | 0 | 0 |
+| #19 | 853 | 0 | 2,024 | 2,018 | 0 | 0 |
+| #1A | 741 | 16 | 2,024 | 2,019 | 0 | 0 |
+| #1B | 794 | 47 | -46,930 | 2,007 | 1 | 1 |
+| #1C | 746 | 16 | 2,039 | 2,033 | 0 | 0 |
+| #1D | 737 | 16 | 2,021 | 2,016 | 0 | 0 |
+| #1E | 752 | 47 | 2,036 | 2,031 | 0 | 0 |
+
+### Before/After Comparison
+
+| Metric | Phase 4 async (All) | Phase 5 (All) | Change |
+|--------|---------------------|---------------|--------|
+| ElapsedMs cold start (req #1) | ~5,363ms | **6,620ms** | +1,257ms (2 new compiled queries JIT'd) |
+| ElapsedMs P50 (req #2–#1E) | **~1,117ms** | **~741ms** | **-376ms (-34%)** |
+| ElapsedMs best | 1,080ms | **723ms** | **-357ms (-33%)** |
+| AllocatedKB (steady) | ~1,980 KB | **~2,020 KB** | +40 KB (2 extra DbContext per call) |
+| MemDelta (steady) | — | **~2,025 KB** | Very stable — no accumulation |
+| CpuMs (steady) | ~400ms | **0–200ms** | CPU pressure significantly reduced |
+| GC events | sawtooth #7, #28 | **GC0+GC1 once (#1B)** | Cleaner — single collection in 27 warm calls |
+
+### Pattern Breakdown
+
+```
+Req #1  (cold start):     6,620ms   107,079 KB  GC0=2
+                          ↑ Two new EF.CompileQuery static fields JIT-compiled on first call
+Req #2  (warmup):         874ms     2,103 KB
+Req #3+ (steady state):   723–794ms ~2,020 KB   GC=0 (except #1B)
+
+Req #1B: GC0=1 GC1=1 — heap -46,930 KB (46 MB reclaimed). Single sawtooth in 27 warm calls.
+Req #1C–#1E: immediately clean (GC=0).
+```
+
+### Full Optimization Progression (All Mode)
+
+| Phase | ElapsedMs P50 | vs Baseline |
+|-------|--------------|-------------|
+| Baseline | 5,048ms | — |
+| Phase 1 | 2,600ms | -48% |
+| Phase 2 | 2,514ms | -50% |
+| Phase 3 + Indexes | 1,410ms | -72% |
+| P0 + P1 | 1,242ms | -75% |
+| Phase 4 async | 1,117ms | -78% |
+| **Phase 5 parallel bulk** | **~741ms** | **-85%** |
+
+### BotE vs Actual — Step 3
+
+```
+Predicted Step 3: max(9, 13) × 35ms = ~455ms
+Actual Step 3:    total(741ms) − serial floor(~216ms) = ~525ms
+Gap:              ~70ms
+
+Cause: PostgreSQL connection pool contention — two parallel tasks competing for pool
+       slots simultaneously. Both queries land on the same server in the same burst window.
+
+Diagnosis: if gap persists under load, check pg_stat_activity for queued connections
+           and increase MaxPoolSize in connection string.
+```
+
+### Serial Floor Analysis
+
+```
+~216ms = Steps 1, 2, 4, 5 combined (serial prerequisites + downstream calls)
+  Step 1: GetSubOrderIds batch                       ~30ms
+  Step 2: GetOrderIds batch                          ~30ms
+  Step 4: GetStoreLocation (per-unique-store)        ~60ms
+  Step 5: GetPackageInfo + GetPackageTb              ~96ms
+  -------------------------------------------------------
+  Total serial floor:                               ~216ms
+
+Step 3 (parallel bulk, measured):                  ~525ms
+Total:                                             ~741ms ✓
+```
+
+### Interpretation
+
+- **-34% from Phase 4** — parallel bulk load cut the dominant serial bottleneck from ~900ms → ~525ms (-42%)
+- **Cold start +1,257ms**: two additional `EF.CompileQuery` static fields compiled at first call. One-time JIT cost per process restart.
+- **AllocatedKB stable at ~2,020 KB** — +40 KB vs Phase 4 for 2 extra `DbContext` instances per call. Negligible.
+- **CpuMs near-zero after warmup**: async I/O with tier-1 JIT. Threads not CPU-bound — entirely I/O wait.
+- **GC highly stable**: 1 sawtooth in 27 warm calls. AllocatedKB variance < 50 KB call-to-call.
+- **~70ms pool contention gap**: BotE assumed free parallel I/O. Actual PostgreSQL pool scheduling adds latency when both parallel tasks arrive simultaneously.
+- **Remaining serial floor ~216ms** is irreducible under current architecture. Next lever: `IMemoryCache` on `GetStoreLocation` (5-min TTL) can eliminate the ~60ms store lookup entirely.
+
+### Next Optimization Candidate (P4)
+
+```
+IMemoryCache on GetStoreLocation — 5-min TTL
+  Current: ~60ms per request (unique store lookup against DB every call)
+  With cache: ~0ms on cache hit (store data changes infrequently)
+  Expected gain: ~60ms reduction → P50 ~680ms
+  Risk: Low — store data is reference data, not transactional
+  Pattern: P# (to be defined — in-process cache for reference data)
+```

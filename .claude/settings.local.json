@@ -4,7 +4,10 @@
       "Bash(where python*)",
       "Bash(where py:*)",
       "Bash(ls /c/Python*/python.exe)",
-      "Read(//c/Users/**)"
+      "Read(//c/Users/**)",
+      "Bash(grep:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(python -c \"import re; text=open\\('kos-knowledge.md',encoding='utf-8'\\).read\\(\\); print\\('knowledge triple-blanks:', len\\(re.findall\\(chr\\(10\\)*3, text\\)\\)\\); text=open\\('kos-decisions.md',encoding='utf-8'\\).read\\(\\); print\\('decisions triple-blanks:', len\\(re.findall\\(chr\\(10\\)*3, text\\)\\)\\)\")"
     ]
   }
 }

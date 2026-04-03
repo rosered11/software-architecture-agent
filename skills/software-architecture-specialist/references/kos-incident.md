@@ -33,7 +33,7 @@ Prevention:          Code review: DB call in loop, Entry().Load() in loop, Any()
                      in sibling calls. Always capture baseline metrics before touching hot paths.
                      Validate connection pool math: queries × hold_time × concurrent < pool_size.
 Related Knowledge:   → K25, K28, K29
-Related Pattern:     → P7, P16, P17, P18, P19, P20, P22, P27
+Related Pattern:     → P7, P16, P17, P18, P19, P20, P22, P23
 Related Decisions:   → D8, D9, D10, D11, D13, D14, D15
 Related Tech Assets: → TA7, TA8, TA9, TA10, TA11, TA15, TA16
 ```

@@ -7,7 +7,7 @@
 
 ## Estimation Template
 
-```
+```text
 📊 Back-of-Envelope
 
 [1] Traffic
@@ -45,7 +45,7 @@
 
 ## Shortcut Formulas
 
-```
+```text
 QPS (avg)            = DAU × actions_per_day ÷ 86,400
 QPS (peak)           = avg QPS × 3  (conservative burst)
 Connection ceiling   = pool_size ÷ (queries × avg_hold_time_s)
@@ -66,7 +66,7 @@ GC Gen1 delta > 0   → memory pressure, investigate
 GC Gen2 delta > 0   → incident level
 ```
 
-> 📖 For the full scalability threshold reference table, read `references/decision-rules.md` (Scalability Thresholds section).
+> 📖 For the full scalability threshold reference table, read `references/kos-decisions.md` (Scalability Thresholds section).
 
 ---
 
