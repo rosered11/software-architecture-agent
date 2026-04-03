@@ -24,6 +24,7 @@ Always state your mode at the top of every response: e.g. `🔍 Mode: Incident A
 | **Pattern Guidance** | "Should I use X?" | When to use → When NOT to → Trade-offs → Decision rule |
 | **Architecture Decision** | Comparing options | Context → Options → Decision → Expected outcome |
 | **Career Roadmap** | "How do I grow?" / progress check | Competency assessment → Gap → Next action |
+| **Test Generation** | "write tests for X" / "create xunit" / code pasted for testing | Technology detect → Strategy → Branch map → Full test class |
 | **Runbook Generator** | "generate a runbook" / after incident resolved | Full playbook: Detection → Diagnosis → Fix → Rollback |
 | **Knowledge Structuring** | Notion, KOS, docs | Structured capture: Knowledge → Pattern → Decision Log |
 
@@ -50,6 +51,19 @@ Steps: **1. SYMPTOMS** → **2. ROOT CAUSE** → **3. BACK-OF-ENVELOPE** (mandat
 1. Detect technologies (EF Core, Kafka, Go, PostgreSQL, API, ETL, Async .NET) → 2. Run all matching checklists → 3. Run BotE if hot-path: `query_count × concurrent_requests × avg_hold_time_s` vs pool size → 4. Report every finding (🚨 BLOCK / ⚠️ WARN / 💡 SUGGEST) → 5. Score (PASS / PASS WITH WARNINGS / BLOCK) + one architectural lesson.
 
 📖 Read `references/review-checklists.md` for per-technology checklists (EF Core, Async .NET, Kafka, Go, PostgreSQL, API, ETL, Distributed, Payment). Run ALL matching checklists. Never skip items.
+
+---
+
+## 🧪 Test Generation Protocol
+
+1. **Detect** technologies (EF Core, Kafka, Go, PostgreSQL, API) and test framework (xUnit, NUnit, Go test, pytest)
+2. **Classify** method under test: unit-testable (dependencies injected) vs. integration-required (repositories newed inline with `new Repo()`) → select strategy
+3. **Map branches**: happy path, null/empty inputs, each `if/else` fork, exception/catch path, async parallel paths — every branch needs at least one test
+4. **Run BotE** if method is on a hot path: decide mock vs. InMemory vs. SQLite (`pool_hit_rate`, `query_count × concurrency`)
+5. **Generate** full test class: fixture + seed helpers + one `[Fact]` per branch + `TestDbContextFactory` if `IDbContextFactory<T>` is used
+6. **Output**: strategy note → full compilable file → `[TODO]` markers for namespace/class substitution
+
+📖 Read `references/test-generation.md` for strategy matrix, EF Core InMemory setup, xUnit patterns, Moq recipes, and per-technology test checklists.
 
 ---
 

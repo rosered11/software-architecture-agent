@@ -675,3 +675,165 @@ Related Incidents:  → I1: GetSubOrder API Latency Spike
 
 ---
 
+### TA17: TestDbContextFactory — IDbContextFactory\<T\> for xUnit
+
+```
+Name:             TestDbContextFactory — IDbContextFactory<T> for xUnit
+Type:             Code Snippet
+Language:         C#
+Usage:            Use when the SUT accepts IDbContextFactory<OrderContext> and creates parallel
+                  DbContext instances via CreateDbContext(). Each call returns a new context
+                  over the same InMemory database — mirrors production lifetime without SQL Server.
+                  Pair with UseInMemoryDatabase(Guid.NewGuid().ToString()) for test isolation.
+
+Prerequisites:    Microsoft.EntityFrameworkCore.InMemory
+                  Microsoft.EntityFrameworkCore (IDbContextFactory<T>)
+
+internal sealed class TestDbContextFactory : IDbContextFactory<OrderContext>
+{
+    private readonly DbContextOptions<OrderContext> _options;
+
+    public TestDbContextFactory(DbContextOptions<OrderContext> options)
+        => _options = options;
+
+    public OrderContext CreateDbContext() => new OrderContext(_options);
+}
+
+// Setup in test constructor:
+var dbOptions = new DbContextOptionsBuilder<OrderContext>()
+    .UseInMemoryDatabase(Guid.NewGuid().ToString())   // unique per test class
+    .Options;
+var context = new OrderContext(dbOptions);
+var factory = new TestDbContextFactory(dbOptions);
+var sut     = new MyService(logger, context, factory);
+
+// Why Guid per test: prevents state bleed when xUnit runs tests in parallel.
+// All CreateDbContext() calls share the same named store — correct for testing
+// Task.WhenAll patterns that open multiple contexts to the same logical DB.
+
+Related Pattern:    → P24: Parallel EF Core Context Pattern (IDbContextFactory)
+Related Knowledge:  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
+Related Tech Asset: → TA18: xUnit Integration Test Skeleton — EF Core Service
+```
+
+---
+
+### TA18: xUnit Integration Test Skeleton — EF Core Service with IDbContextFactory
+
+```
+Name:             xUnit Integration Test Skeleton — EF Core Service with IDbContextFactory
+Type:             Pattern Implementation
+Language:         C#
+Usage:            Skeleton for testing any service that:
+                    (a) nests repositories with `new Repo(_context)` (not injectable), AND
+                    (b) uses IDbContextFactory<T> for parallel Task.WhenAll paths.
+                  Fill in: [ServiceClass], namespace, model names, seed data, branch assertions.
+
+NuGet packages:
+  xunit
+  xunit.runner.visualstudio
+  Microsoft.NET.Test.Sdk
+  Microsoft.EntityFrameworkCore.InMemory
+  Moq
+
+public class MyMethodTests : IDisposable
+{
+    private const string OrderId    = "ORD-TEST-001";
+    private const string SubOrderId = "SUB-TEST-001";
+
+    private readonly DbContextOptions<OrderContext> _dbOptions;
+    private readonly OrderContext                   _context;
+    private readonly TestDbContextFactory           _factory;
+    private readonly Mock<ILogger>                  _loggerMock;
+    private readonly [ServiceClass]                 _sut;   // TODO: replace [ServiceClass]
+
+    public MyMethodTests()
+    {
+        _dbOptions  = new DbContextOptionsBuilder<OrderContext>()
+                          .UseInMemoryDatabase(Guid.NewGuid().ToString())
+                          .Options;
+        _context    = new OrderContext(_dbOptions);
+        _factory    = new TestDbContextFactory(_dbOptions);
+        _loggerMock = new Mock<ILogger>();
+        _sut        = new [ServiceClass](_loggerMock.Object, _context, _factory);
+    }
+
+    public void Dispose() => _context.Dispose();
+
+    // ── happy path ─────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task MyMethod_ValidInput_ReturnsResultIntOne()
+    {
+        SeedOrder(OrderId);
+        SeedSubOrder(OrderId, SubOrderId);
+        var (result, _) = await _sut.MyMethod(OrderId, SubOrderId);
+        Assert.Equal(1, result.ResultInt);
+    }
+
+    // ── exception path ─────────────────────────────────────────────────────────
+    [Fact]
+    public async Task MyMethod_MissingSubOrder_ReturnsResultIntNegativeTen()
+    {
+        SeedOrder(OrderId);
+        // No SubOrder seeded intentionally
+        var (result, _) = await _sut.MyMethod(OrderId, "NONEXISTENT");
+        Assert.Equal(-10, result.ResultInt);
+    }
+
+    // ── no exception propagated ────────────────────────────────────────────────
+    [Fact]
+    public async Task MyMethod_EmptyDatabase_DoesNotThrow()
+    {
+        var ex = await Record.ExceptionAsync(() => _sut.MyMethod("GHOST", "GHOST"));
+        Assert.Null(ex);
+    }
+
+    // ── deadlock guard ─────────────────────────────────────────────────────────
+    [Fact]
+    public async Task MyMethod_ParallelTasks_CompleteWithinTimeout()
+    {
+        SeedOrder(OrderId);
+        SeedSubOrder(OrderId, SubOrderId);
+        using var cts  = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var work       = _sut.MyMethod(OrderId, SubOrderId);
+        var completed  = await Task.WhenAny(work, Task.Delay(Timeout.Infinite, cts.Token));
+        Assert.Same(work, completed);
+    }
+
+    // ── seed helpers ───────────────────────────────────────────────────────────
+    private void SeedOrder(string sourceOrderId, int id = 1, string orderNumber = "ON-001")
+    {
+        _context.Order.Add(new OrderModel          // TODO: verify model name
+        {
+            Id = id, SourceOrderId = sourceOrderId,
+            IsActive = true, OrderNumber = orderNumber,
+            Customer = new List<OrderCustomerModel>()  // TODO: verify nav model name
+        });
+        _context.SaveChanges();
+    }
+
+    private void SeedSubOrder(string sourceOrderId, string sourceSubOrderId, int itemCount = 1)
+    {
+        _context.SubOrder.Add(new SubOrderModel    // TODO: verify model name
+        {
+            SourceOrderId = sourceOrderId, SourceSubOrderid = sourceSubOrderId,
+            IsActive = true,
+            Addresses = new List<SubOrderAddressModel>(),  // TODO: verify
+            Items     = Enumerable.Range(0, itemCount)
+                            .Select(i => new SubOrderItemModel { SkuCode = $"SKU-{i}" })
+                            .ToList()
+        });
+        _context.SaveChanges();
+    }
+}
+
+// Note: If AsSplitQuery() throws with InMemory, switch to:
+//   .UseSqlite("Filename=:memory:") + context.Database.EnsureCreated()
+
+Related Pattern:    → P24: Parallel EF Core Context Pattern (IDbContextFactory)
+Related Tech Asset: → TA17: TestDbContextFactory — IDbContextFactory<T> for xUnit
+Related Checklist:  → review-checklists.md: Checklist: Test Coverage (.NET / xUnit)
+```
+
+---
+

@@ -491,3 +491,85 @@ SUGGEST — Financial state not event-sourced
   Option: Append payment events to immutable log (kos-patterns.md #19)
           PaymentInitiated → CardCharged → PaymentSettled → Refunded
 ```
+
+## Checklist: Test Coverage (.NET / xUnit)
+
+> Run when reviewing test files OR when generating new tests. Goal: every branch observable,
+> no false-green from InMemory quirks, test isolation guaranteed.
+
+```
+─── BLOCK ──────────────────────────────────────────────────────────────────────────────
+
+BLOCK — No test for the exception/catch path
+  Pattern: Only happy-path tests; catch block (ResultInt = -10) never exercised
+  Risk: Silent failures in production — error path untested, may swallow wrong exceptions
+  Fix: Add test with missing seed data or injected throw; assert ResultInt == -10 and
+       ReturnMessage is non-empty
+
+BLOCK — Shared DbContext across parallel tasks in tests
+  Pattern: Single OrderContext instance passed to multiple concurrent Task.WhenAll arms
+  Risk: EF Core DbContext is NOT thread-safe — "A second operation was started on this
+        context" exception in CI but not locally (timing-dependent)
+  Fix: Use TestDbContextFactory (TA17); each task arm gets its own CreateDbContext() instance
+
+─── WARN ───────────────────────────────────────────────────────────────────────────────
+
+WARN — Same InMemory database name reused across test instances
+  Pattern: .UseInMemoryDatabase("TestDb") hard-coded string shared across all tests
+  Risk: Test A seeds data → Test B reads stale data from previous test → false-green or
+        false-red depending on execution order
+  Fix: .UseInMemoryDatabase(Guid.NewGuid().ToString()) — unique name per test class instance
+
+WARN — AsSplitQuery() used in production method but InMemory provider selected in tests
+  Pattern: Method under test calls a repository with AsSplitQuery(); test uses InMemory
+  Risk: InMemory may silently ignore AsSplitQuery() (EF Core 6+) or throw
+        InvalidOperationException (older versions) — test result unreliable
+  Fix: Switch to SQLite InMemory (.UseSqlite("Filename=:memory:") + EnsureCreated()) when
+       AsSplitQuery() or EF.CompileQuery is present in the call path
+
+WARN — Only one branch of "All" vs specific SubOrderId tested
+  Pattern: Tests cover SourceSubOrderId = "SUB-001" but not "All" (or vice versa)
+  Risk: Entire batch-load code path (GetSubOrderMessageFromBatchAsync) never exercised
+  Fix: Add dedicated test for SourceSubOrderId = "All" with multiple sub-orders seeded;
+       verify Items count equals sum across sub-orders
+
+WARN — Navigation properties not seeded; test passes because null check missing in prod
+  Pattern: Test seeds Order but not Customer nav property; assertion passes by luck
+  Risk: In production, orderHeader.Customer is loaded via Include() — if null-check is
+        missing, NRE on first customer order → untested code path
+  Fix: Always seed navigation properties (Customer, Addresses, Items) that are accessed
+       in the method under test; assert their mapped fields explicitly
+
+─── SUGGEST ────────────────────────────────────────────────────────────────────────────
+
+SUGGEST — Use Record.ExceptionAsync for no-throw assertions
+  Pattern: try/catch in test to verify exception is swallowed
+  Why: Record.ExceptionAsync is idiomatic xUnit and produces clearer failure messages
+  Option: var ex = await Record.ExceptionAsync(() => sut.Method(...)); Assert.Null(ex);
+
+SUGGEST — Use Guid.NewGuid().ToString() for DB isolation per test
+  Pattern: Hard-coded string DB name
+  Why: Prevents flaky tests when xUnit runs test methods in parallel
+  Option: Move DbContextOptions creation into constructor with Guid.NewGuid()
+
+SUGGEST — Separate seed helpers from test methods
+  Pattern: Inline _context.Order.Add(...) + SaveChanges() repeated in every [Fact]
+  Why: DRY — seed changes break N tests instead of one helper; readability suffers
+  Option: Private SeedOrder(...) / SeedSubOrder(...) helpers with default parameters;
+          see TA18 skeleton for reference pattern
+
+SUGGEST — Add deadlock-guard test for Task.WhenAll paths
+  Pattern: Async methods with Task.WhenAll have no timeout test
+  Why: Deadlocks manifest only under load; a simple CancellationTokenSource(10s) guard
+       catches them in CI before they reach production
+  Option: Task.WhenAny(workTask, Task.Delay(Timeout.Infinite, cts.Token));
+          Assert.Same(workTask, completed)
+
+SUGGEST — Inline repositories (new Repo()) are a testability smell — log it
+  Pattern: new OrderRepository(_context) inside method → cannot mock
+  Why: Forces integration test over unit test; every test needs DB setup
+  Option: Extract IOrderRepository / ISubOrderRepository interfaces; inject via constructor
+          — flag as SUGGEST in code review, link to future refactor task
+```
+
+> Cross-reference: TA17 (TestDbContextFactory), TA18 (xUnit skeleton), test-generation.md §3–§4
