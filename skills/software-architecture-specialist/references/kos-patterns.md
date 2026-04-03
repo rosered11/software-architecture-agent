@@ -1330,24 +1330,6 @@ Related Tech Assets: → TA12: Dead Tuple Health Monitor Query
 Source:           stockadjustments incident, spc_inventory, 2026-03-30
 ```
 
-**Problem**: PostgreSQL's default autovacuum scale factor (0.20) triggers only after 20% of live rows become dead. On large tables (> 500K rows), this means hundreds of thousands of dead tuples accumulate silently — degrading index scan performance and bloating storage — before autovacuum fires. After a VACUUM, index pages are marked "reusable" but the index file does not shrink, leaving a sparse B-tree that wastes I/O on every scan.
-
-**Solution**: Override per-table autovacuum settings to trigger at 1% dead rows. After any high-churn period, run `REINDEX CONCURRENTLY` to compact index files and restore B-tree density.
-
-**When to USE**:
-- Any PostgreSQL table exceeding 500K rows with default autovacuum settings
-- After detecting dead_ratio > 5% in `pg_stat_user_tables`
-- After `last_autovacuum IS NULL` on a large active table (autovacuum never triggered)
-- After heavy bulk DELETE or UPDATE migrations
-- After index bloat > 30% (reusable_pages / total_pages)
-
-**When NOT to USE**:
-- Tables with < 50K rows and infrequent writes — default autovacuum is sufficient
-- Read-only tables — no dead tuples generated, no vacuum needed
-- Aggressive `autovacuum_vacuum_scale_factor = 0.001` on tiny tables — unnecessary overhead
-
-**Complexity**: Low
-
 **Trade-offs**:
 | Pros | Cons |
 |------|------|
@@ -1435,15 +1417,6 @@ VACUUM FULL (instead of REINDEX CONCURRENTLY)  → only in maintenance window; l
 
 **Real incident**: `stockadjustments` (spc_inventory, 2026-03-30). 702,783 dead rows (14.5%) — autovacuum never triggered because default threshold = 828,932. After manual VACUUM: heap clean but 63% index bloat (1.07 GB waste) remained. REINDEX CONCURRENTLY queued for all 6 indexes.
 
-**KOS Summary**:
-- Root cause of silent bloat: `autovacuum_vacuum_scale_factor = 0.20` default means autovacuum fires only when dead rows > 20% of live rows — on large tables, that threshold is never reached in normal operations
-- Detection query: `pg_stat_user_tables` — check `n_dead_tup`, `dead_ratio`, `last_autovacuum`
-- VACUUM vs REINDEX: VACUUM cleans dead tuples (heap), REINDEX rebuilds index B-tree (structure). Both needed after high-churn period
-- REINDEX CONCURRENTLY: non-blocking, safe for production. Takes 5–20 min per index on 4M rows. Monitor via `pg_stat_progress_create_index`
-- VACUUM FULL: exclusive lock — never in production except maintenance window
-- Per-table override: `ALTER TABLE t SET (autovacuum_vacuum_scale_factor = 0.01)` — no restart needed, takes effect immediately
-- Threshold ladder: > 5M rows → 0.005, > 500K → 0.01, > 100K → 0.05, < 100K → default 0.20
-
 **Related patterns**: none — DB operations pattern, standalone.
 **Related decisions**: D12 (REINDEX CONCURRENTLY vs VACUUM FULL — decision record with full incident data)
 
@@ -1477,23 +1450,6 @@ Used in Decisions:   → D13: Apply EF.CompileQuery to GetSubOrderMessage Bulk Q
 Related Tech Assets: → TA15: EF.CompileQuery Static Field Template
 Source:           Order.API-3.dmp + Order.API-11.dmp load test analysis, 2026-03-31
 ```
-
-**Problem**: EF Core compiles every unique LINQ expression tree into IL at runtime and stores the result in a static `CompiledQueryCache`. Each unique expression tree = 1 `DynamicMethod` + 1 `DynamicILGenerator` + 1 `DynamicResolver` object held in static memory — never collected by GC. Under production load with many query variations, this cache grows into thousands of entries consuming 5–10 MB of non-reclaimable static heap.
-
-**Solution**: Precompile hot-path queries as static `Func<>` fields using `EF.CompileAsyncQuery` (or `EF.CompileQuery` for sync). The expression tree is compiled exactly once per process lifetime regardless of how many times the method is called or how many concurrent requests run.
-
-**When to USE**:
-- Any query called on a hot API path (called > 100× / minute)
-- Large Include chains with many navigation properties (each variation = new cache entry)
-- When heap dump (`dumpheap -stat`) shows DynamicMethod / DynamicILGenerator object count > 1,000
-- Batch queries with `Contains()` over ID lists (each unique set → unique expression tree)
-
-**When NOT to USE**:
-- One-off admin queries or background jobs called infrequently
-- Queries that change shape based on runtime conditions (the compiled signature must be fixed)
-- Very simple queries with no Includes (compilation cost is negligible)
-
-**Complexity**: Low
 
 **Trade-offs**:
 | Pros | Cons |
@@ -1565,17 +1521,6 @@ Query with dynamic filters (optional .Where clauses) → cannot compile statical
 - Load test validation (heapstat-4): `DynamicMethod` count 17,557 → **7,356 (-58%)** at higher load. Count is **stable** — confirmed ceiling, not unbounded growth. Remaining 7,356 = service-wide unique query footprint across all endpoints.
 - Heap: 112 MB → 90 MB (-20%). SubOrderMessageViewModel: 836 → 50 (-94%) — no ChangeTracker leak under concurrency.
 
-**KOS Summary**:
-- Static field pattern: `private static readonly Func<DbContext, params, IAsyncEnumerable<T>> _query = EF.CompileAsyncQuery(...)`
-- Compiled exactly once per process lifetime regardless of call count or concurrency
-- Cold start cost: ~106 MB one-time IL compilation on first call — acceptable, happens once at warmup
-- Steady-state gain: eliminates per-call DynamicMethod allocation → AllocatedKB drops per call
-- Limitation: query shape must be fixed. Cannot add optional `.Where()` clauses at runtime
-- Multi-row async: return `IAsyncEnumerable<T>`, enumerate with `await foreach`. Single-row: return `Task<T>`
-- Diagnose with `dotnet-dump analyze` → `dumpheap -stat` → look for DynamicMethod / DynamicILGenerator count
-- Healthy ceiling: DynamicMethod count stabilizes at N×(unique query shapes across all endpoints) — stable is fine, unbounded growth is the problem
-- AsSplitQuery + CompileQuery: supported in EF Core 10. Generates multiple compiled split queries, one per Include batch
-
 **Related patterns**: P20 Bulk Load Then Map, P16 Async Parallel DB Coordinator, P23 Parallel Split Compiled Query
 **Related decisions**: D13 (EF.CompileQuery static field — decision record with full heap dump incident data)
 
@@ -1608,10 +1553,6 @@ Used in Decisions:   → D8: IDbContextFactory, D11: Incremental Refactor, D13: 
 Related Pattern:     → P16: Async Parallel DB Coordinator, P20: Bulk Load Then Map, P22: EF Compiled Query Cache Management
 Source:           target.cs Phase 5, 2026-04-02. 1,117ms → 741ms (-34%).
 ```
-
-**Problem**: A single AsSplitQuery compiled query with 16 Include paths generates ~27 sequential SQL queries at ~35ms each ≈ 900ms. These are I/O-bound and independent — the database executes them one at a time because they share a single `DbContext` connection.
-
-**Solution**: Split the Include graph into two groups that have no shared navigation paths. Run each group as a separate compiled query on its own `DbContext` instance (from `IDbContextFactory`) in parallel via `Task.WhenAll`. Merge the two result sets by key after both complete.
 
 **Split strategy**:
 ```
