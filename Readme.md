@@ -65,3 +65,21 @@ The skill becomes more useful the more you feed it. Six months from now, kos-inc
 ### Hook Sync to Notion
  From now on, every time Claude edits a file under skills/software-architecture-specialist/references/, the hook fires automatically
    and keeps Notion in sync. Just make sure to open /hooks once (or restart Claude Code) to activate the hook for this session.
+
+### Manual Sync to Notion
+
+Sync all 5 DBs with body rebuild:
+  python sync/kos_sync.py --rebuild-body
+
+  Sync a specific DB with body rebuild:
+  python sync/kos_sync.py --db i --rebuild-body    # Incidents
+  python sync/kos_sync.py --db k --rebuild-body    # Knowledge
+  python sync/kos_sync.py --db p --rebuild-body    # Patterns
+  python sync/kos_sync.py --db d --rebuild-body    # Decisions
+  python sync/kos_sync.py --db ta --rebuild-body   # Tech Assets
+
+  Without --rebuild-body (default): upserts properties only — page body blocks are not touched.
+
+  With --rebuild-body: clears the existing body blocks on each Notion page and rewrites them from the rich markdown in
+  the KOS files. Use this when you've updated the narrative content below the KV block (e.g. the Phase 5 section in I1,
+  new P23 rich markdown).
