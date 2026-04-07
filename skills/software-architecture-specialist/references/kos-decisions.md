@@ -293,6 +293,7 @@ Decision:         Option B — .Include().AsNoTracking() on all hot-path read qu
 Expected Outcome: Eliminated N extra queries per GetSubOrder call (N = number of sub-order items).
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P18: Eager Graph Loading
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-03-27
 ```
 
@@ -318,6 +319,7 @@ Decision:         Option B — resolve once at GetSubOrder coordinator, pass res
 Expected Outcome: Eliminated 6–9 redundant resolution queries per request.
 Related Knowledge:  → K25: EF Core DbContext Thread Safety and IDbContextFactory
 Related Pattern:    → P19: Coordinator-Level Resolution
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-03-27
 ```
 
@@ -356,6 +358,7 @@ Related Pattern:    → P17: Batch Query (WHERE IN)
                    → P20: Bulk Load Then Map
                    → P16: Async Parallel DB Coordinator
                    → P23: Parallel Split Compiled Query
+Related Incidents:  → I1: GetSubOrder API Latency Spike
 Date:             2026-03-27
 Measured:         2026-04-02
 ```

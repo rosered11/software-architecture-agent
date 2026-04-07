@@ -484,6 +484,7 @@ ORDER BY n_dead_tup DESC;
 
 Related Knowledge:  → K26: PostgreSQL MVCC and Dead Tuples
 Related Pattern:    → P21: Per-Table Storage Hygiene
+Related Incidents:  → I2: PostgreSQL Dead Tuple Bloat — stockadjustments
 ```
 
 ---
@@ -519,6 +520,7 @@ WHERE relname = 'stockadjustments';
 
 Related Knowledge:  → K27: Autovacuum Scale Factor Trap for Large Tables
 Related Pattern:    → P21: Per-Table Storage Hygiene
+Related Incidents:  → I2: PostgreSQL Dead Tuple Bloat — stockadjustments
 ```
 
 ---
@@ -557,6 +559,7 @@ ORDER BY pg_relation_size(indexrelid) DESC;
 Related Knowledge:  → K26: PostgreSQL MVCC and Dead Tuples
 Related Pattern:    → P21: Per-Table Storage Hygiene
 Related Decision:   → D12: REINDEX CONCURRENTLY vs VACUUM FULL
+Related Incidents:  → I2: PostgreSQL Dead Tuple Bloat — stockadjustments
 ```
 
 ---
@@ -711,7 +714,7 @@ var sut     = new MyService(logger, context, factory);
 // All CreateDbContext() calls share the same named store — correct for testing
 // Task.WhenAll patterns that open multiple contexts to the same logical DB.
 
-Related Pattern:    → P24: Parallel EF Core Context Pattern (IDbContextFactory)
+Related Pattern:    → P16: Async Parallel DB Coordinator
 Related Knowledge:  → K28: EF Core Compiled Query Cache and DynamicMethod Accumulation
 Related Tech Asset: → TA18: xUnit Integration Test Skeleton — EF Core Service
 ```
@@ -830,7 +833,7 @@ public class MyMethodTests : IDisposable
 // Note: If AsSplitQuery() throws with InMemory, switch to:
 //   .UseSqlite("Filename=:memory:") + context.Database.EnsureCreated()
 
-Related Pattern:    → P24: Parallel EF Core Context Pattern (IDbContextFactory)
+Related Pattern:    → P16: Async Parallel DB Coordinator
 Related Tech Asset: → TA17: TestDbContextFactory — IDbContextFactory<T> for xUnit
 Related Checklist:  → review-checklists.md: Checklist: Test Coverage (.NET / xUnit)
 ```
