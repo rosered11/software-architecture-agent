@@ -1,215 +1,138 @@
-# 🎯 Career Roadmap — Software Engineer → Software Architect
+# Career Roadmap — Software Engineer → Software Architect
 
-> Read this file when the user asks about career growth, "how do I become an architect?",
-> "what should I focus on?", "am I making progress?", "what do I need to prove?",
-> or when Career Coaching mode is triggered.
->
-> This is not a generic learning list. It is a competency framework mapped directly
-> to the user's real work — their systems, their incidents, their decisions.
-> Every competency has: what it means, how to demonstrate it, and evidence already earned.
->
-> Goal: Software Architect in 2 years.
-> Current context: .NET, Go, Kafka, PostgreSQL — microservices, data sync, event-driven systems.
+> Triggered by: "how do I become an architect?", "what should I focus on?", "am I making progress?", Career Coaching mode.
+> Goal: Software Architect in 2 years. Stack: .NET, Go, Kafka, PostgreSQL — microservices, data sync, event-driven.
+> Every competency maps to real work — incidents, systems, decisions already in the KOS.
 
 ---
 
-## The Architect Competency Map
-
-There are 6 competency domains. Each has 3–5 specific skills.
-For each skill: current evidence is tracked, gaps are identified, next actions are defined.
-
----
+## Competency Map
 
 ### Domain 1: System Design
 
-The ability to design systems that are correct, scalable, and maintainable — before writing code.
+| Skill | What it means | Evidence | Gap |
+|-------|--------------|----------|-----|
+| Define flow + edge cases + failure modes | Every system has happy path, edge cases, and failure handling documented before coding | Stock Sync, SubOrder defined in Notion | FTP ETL failure modes incomplete |
+| Choose the right architecture pattern | Select Outbox, CQRS, Saga based on concrete trade-offs, not familiarity | Outbox considered for Stock Sync | No CQRS decision documented |
+| Design for scalability from the start | Identify O(n) risks and batch thresholds at design time, not after incident | GetSubOrder batch fix | No load estimation for FTP ETL |
+| Make trade-offs explicit | Document what is sacrificed, not just what is chosen | GetSubOrder ADR: 3 options | Most decisions undocumented |
 
-| Skill | What it means | Evidence earned | Gap |
-|-------|--------------|-----------------|-----|
-| Define flow + edge cases + failure modes | Every system has happy path, edge cases, and failure handling documented | Stock Sync, SubOrder Processing defined in Notion | FTP ETL failure modes not fully documented |
-| Choose the right architecture pattern | Select Outbox, CQRS, Saga, etc. based on concrete trade-offs | Outbox considered for Stock Sync events | No CQRS decision documented yet |
-| Design for scalability from the start | Identify O(n) risks, batch thresholds, horizontal scale path | GetSubOrder batch fix addresses scalability | No load estimation done for FTP ETL |
-| Make trade-offs explicit | Document what is sacrificed, not just what is chosen | GetSubOrder ADR documents 3 options | Most decisions still undocumented |
-
-**Current level**: Intermediate — you design working systems but decisions are often implicit.
-**Target**: Senior — every non-trivial decision has an ADR. System review is a habit, not a reaction.
+**Level → Target**: Intermediate (systems work, decisions implicit) → Senior (every non-trivial decision has an ADR; design review is a habit)
 
 ---
 
 ### Domain 2: Distributed Systems
 
-The ability to reason about systems that span multiple services, databases, and message queues.
-
-| Skill | What it means | Evidence earned | Gap |
-|-------|--------------|-----------------|-----|
-| Event-driven design | Design Kafka flows with correct partition key, ordering guarantees, DLQ | Kafka used in current systems | No documented partition key decisions |
-| Data consistency across services | Understand when to use Outbox, Saga, or direct calls | Aware of Outbox pattern | No Saga designed yet |
-| Failure isolation | One service failing should not cascade | Circuit breaker not yet implemented | |
-| Idempotency by default | All retryable operations are safe to repeat | Awareness present | Not consistently applied across services |
+| Skill | What it means | Evidence | Gap |
+|-------|--------------|----------|-----|
+| Event-driven design | Design Kafka flows with correct partition key, ordering guarantees, DLQ | Kafka in current systems | No partition key decisions documented |
+| Data consistency across services | Know when to use Outbox, Saga, or direct calls | Outbox pattern known | No Saga designed yet |
+| Failure isolation | One service failing must not cascade into others | — | Circuit breaker not implemented |
+| Idempotency by default | All retryable operations safe to repeat without side effects | Awareness present | Not consistently applied |
 | Observability across services | Trace ID propagation, cross-service correlation | Prometheus in use | No trace ID propagation confirmed |
 
-**Current level**: Intermediate — you work in distributed systems but don't yet design the contracts.
-**Target**: Senior — you define the event contracts, consistency boundaries, and failure isolation strategy.
+**Level → Target**: Intermediate (work in distributed systems, don't design the contracts) → Senior (define event contracts, consistency boundaries, and failure isolation strategy)
 
 ---
 
 ### Domain 3: Performance & Optimization
 
-The ability to identify, diagnose, and fix performance problems — and prevent them in design.
+| Skill | What it means | Evidence | Gap |
+|-------|--------------|----------|-----|
+| Diagnose N+1 and query patterns | Identify DB anti-patterns from code and metrics, not just production alerts | GetSubOrder — full root cause | |
+| Batch and chunk large datasets | Know when and how to apply batch + chunk | GetSubOrder fix applied | FTP ETL chunking unconfirmed |
+| Profile before optimizing | Measure query count and latency before writing any fix | EF Core logging used | No systematic profiling process |
+| Write performance into design | Flag O(n) risks at design review, not post-incident | Review checklist available | Not yet consistent habit |
 
-| Skill | What it means | Evidence earned | Gap |
-|-------|--------------|-----------------|-----|
-| Diagnose N+1 and query patterns | Identify DB anti-patterns from code and metrics | GetSubOrder incident — full root cause found | |
-| Batch and chunk large datasets | Know when and how to apply batch + chunk patterns | GetSubOrder fix applied | FTP ETL chunking not confirmed |
-| Profile before optimizing | Measure query count and latency before writing a fix | EF Core logging used in GetSubOrder | No systematic profiling process defined |
-| Write performance into design | Flag O(n) risks during design review, not after incident | System Design Review checklist now available | Not yet habit — needs consistent application |
-
-**Current level**: Intermediate-Advanced — you can fix performance problems. The gap is catching them earlier.
-**Target**: Senior — performance review is part of every PR and every system design, not a post-incident activity.
+**Level → Target**: Intermediate-Advanced (can fix performance problems) → Senior (performance review is part of every PR and system design, not a post-incident activity)
 
 ---
 
 ### Domain 4: Decision Making & Architecture Documentation
 
-The ability to make explicit, reasoned decisions and document them for future reference and teams.
+| Skill | What it means | Evidence | Gap |
+|-------|--------------|----------|-----|
+| Write ADRs | Capture context, options, decision, trade-offs in structured form | GetSubOrder ADR | Only 1 ADR — most decisions undocumented |
+| Evaluate options with trade-offs | Never choose without naming what you sacrifice | GetSubOrder: 3 options compared | Inconsistent on other decisions |
+| Know when NOT to use a pattern | Anti-conditions matter as much as when to apply | Patterns include anti-conditions | Needs practice in real decisions |
+| Build a decision audit trail | Past decisions are traceable and reviewable by anyone | Notion KOS Decision Log exists | Sparse — mostly empty |
 
-| Skill | What it means | Evidence earned | Gap |
-|-------|--------------|-----------------|-----|
-| Write ADRs | Capture context, options, decision, trade-offs in structured form | GetSubOrder batch query ADR created | Only 1 ADR documented — many decisions undocumented |
-| Evaluate options with trade-offs | Never pick one option without naming what you lose | GetSubOrder: 3 options compared | Not consistent on other decisions |
-| Know when NOT to use a pattern | Equally important as knowing when to use one | Patterns library includes anti-conditions | Needs practice in real decisions |
-| Build a decision audit trail | Your past decisions are traceable and reviewable | Notion KOS Decision Log exists | Sparse — most decisions not logged yet |
+**Level → Target**: Early (can write ADRs, rarely do) → Senior (every non-trivial choice has an ADR; decision trail is reviewable by anyone)
 
-**Current level**: Early — you can write ADRs but rarely do. The habit is not formed yet.
-**Target**: Senior — every non-trivial architectural choice has an ADR. Your decision trail is reviewable by anyone.
-
-**This is the highest-leverage gap to close.** Architects are judged on their decisions, not their code.
+> **This is the highest-leverage gap.** Architects are judged on their decisions, not their code.
 
 ---
 
 ### Domain 5: Operational Maturity
 
-The ability to run systems reliably in production — observability, incidents, runbooks, prevention.
+| Skill | What it means | Evidence | Gap |
+|-------|--------------|----------|-----|
+| Root cause analysis | Find the real cause, not the symptom | GetSubOrder fully analysed | More incidents needed in KOS |
+| Write and maintain runbooks | Operational playbooks that work at 2am without you | Template available | No runbooks written for live systems |
+| Define and own SLAs | Know what "healthy" looks like and alert on deviation | Prometheus in use | No explicit SLA targets per system |
+| Post-incident learning | Every incident generates Knowledge + Prevention record | KOS structure in place | Process not consistently followed |
+| Proactive system review | Run pre-mortems before incidents happen | Design Review checklist available | Not yet applied to existing systems |
 
-| Skill | What it means | Evidence earned | Gap |
-|-------|--------------|-----------------|-----|
-| Root cause analysis | Find the real cause, not the symptom | GetSubOrder incident fully analysed | Needs more incidents documented in KOS |
-| Write and maintain runbooks | Operational playbooks that work at 2am without you | GetSubOrder runbook template available | No runbooks written yet for live systems |
-| Define and own SLAs | Know what "healthy" looks like and alert on deviation | Prometheus in use | No explicit SLA targets defined per system |
-| Post-incident learning | Every incident generates a Knowledge + Prevention record | KOS structure in place | Process not yet consistently followed |
-| Proactive system review | Run pre-mortems before incidents happen | System Design Review checklist available | Not yet applied to existing systems |
-
-**Current level**: Reactive — you handle incidents well but systems lack proactive coverage.
-**Target**: Senior — every system has a runbook, SLA targets, and has been through a design review.
+**Level → Target**: Reactive (handle incidents well, no proactive coverage) → Senior (every system has a runbook, SLA targets, and has been through a design review)
 
 ---
 
 ### Domain 6: Communication & Influence
 
-The ability to communicate architectural decisions to non-technical stakeholders and to mentor others.
-
-| Skill | What it means | Evidence earned | Gap |
-|-------|--------------|-----------------|-----|
+| Skill | What it means | Evidence | Gap |
+|-------|--------------|----------|-----|
 | Explain trade-offs simply | Translate technical decisions into business impact | — | Not yet tracked |
 | Lead a design review | Facilitate a structured review of another engineer's design | — | Not yet done |
-| Write for future readers | ADRs, runbooks, and system docs are clear to someone new | Notion KOS structured | Content quality not yet evaluated |
+| Write for future readers | ADRs, runbooks, system docs clear to someone new | Notion KOS structured | Content quality not evaluated |
 | Influence without authority | Get buy-in for architectural changes without formal power | GetSubOrder fix adopted | More examples needed |
 
-**Current level**: Not yet demonstrated — this domain needs intentional focus in Year 2.
-**Target**: Senior — you regularly lead design discussions and your documentation is referenced by others.
+**Level → Target**: Not yet demonstrated → Senior (regularly lead design discussions; documentation referenced by others)
 
 ---
 
 ## 2-Year Roadmap
 
-### Year 1 — Build the Foundation (Months 1–12)
+### Year 1 — Build the Foundation
 
-**Theme**: Close the reactive gaps. Make structured thinking a habit.
-
-**Q1 — Months 1–3: Establish the baseline**
+**Q1 (Months 1–3): Establish the baseline**
 ```
-[ ] Run System Design Review on ALL 3 existing systems (Stock Sync, SubOrder, FTP ETL)
-    → Find gaps before they become incidents
-    → Generate at least 3 ADRs from the findings
-
-[ ] Write runbooks for all 3 systems
-    → Use runbook-template.md
-    → Start with the highest-severity system first
-
-[ ] Log every incident in KOS — no exceptions
-    → Title, Root Cause, Fix, Lesson Learned, Related Pattern
-    → Goal: 0 incidents without a KOS entry
-
-[ ] Establish code review habit
-    → Run review-checklists.md on every PR you touch
-    → Flag at least 1 architectural issue per sprint
+[ ] Run System Design Review on all 3 existing systems (Stock Sync, SubOrder, FTP ETL)
+    → Find gaps before they become incidents; generate ≥3 ADRs from findings
+[ ] Write runbooks for all 3 systems (runbook-template.md; highest severity first)
+[ ] Log every incident in KOS — no exceptions (Title, Root Cause, Fix, Lesson, Pattern)
+[ ] Run review-checklists.md on every PR touched; flag ≥1 architectural issue per sprint
 ```
 
-**Q2 — Months 4–6: Deepen distributed systems**
+**Q2 (Months 4–6): Deepen distributed systems**
 ```
-[ ] Design and implement Outbox pattern for at least 1 system
-    → Document as ADR: why Outbox, what alternatives, what trade-offs
-    → Add to Tech Assets in KOS
-
-[ ] Define partition key strategy for all Kafka topics you own
-    → Document reasoning in ADR
-    → Add to decision-rules.md
-
-[ ] Add trace ID propagation to at least 1 service
-    → Verify trace ID appears on every log line
-    → Document as Tech Asset
-
-[ ] Define SLA targets for each system
-    → Latency P99, error rate, consumer lag thresholds
-    → Add alert for each
+[ ] Design + implement Outbox pattern for ≥1 system; document as ADR with trade-offs
+[ ] Define partition key strategy for all owned Kafka topics; add to kos-decisions.md
+[ ] Add trace ID propagation to ≥1 service; verify on every log line; document as Tech Asset
+[ ] Define SLA targets per system (P99 latency, error rate, consumer lag); add alerts
 ```
 
-**Q3 — Months 7–9: Own architectural decisions**
+**Q3 (Months 7–9): Own architectural decisions**
 ```
-[ ] Write an ADR for every non-trivial decision going forward
-    → Target: 10+ ADRs in Notion Decision Log by end of Q3
-    → Include at least 2 options with trade-offs in each
-
-[ ] Lead at least 1 design review for another engineer's work
-    → Use system-design-review.md as the framework
-    → Write up findings as a design review document
-
-[ ] Apply batch + chunk pattern to FTP ETL pipeline
-    → Profile current performance first
-    → Document before/after metrics in kos-incident.md (even as a proactive finding)
-
-[ ] Build one new pattern from scratch
-    → Identify a recurring problem in your systems
-    → Design a reusable solution, name it, document it in KOS Patterns
+[ ] Write ADR for every non-trivial decision going forward (target: 10+ ADRs by end Q3)
+[ ] Lead ≥1 design review for another engineer using system-design-review.md
+[ ] Apply batch + chunk to FTP ETL pipeline; profile before, document before/after metrics
+[ ] Build one new pattern from scratch: identify recurring problem → name it → add to KOS
 ```
 
-**Q4 — Months 10–12: Demonstrate architect thinking**
+**Q4 (Months 10–12): Demonstrate architect thinking**
 ```
-[ ] Present a system design proposal to your team
-    → Use ADR format
-    → Include options considered and explicit trade-offs
-    → Get buy-in through reasoning, not authority
-
-[ ] Audit your KOS: does it tell the story of your growth?
-    → Every system has a design document
-    → Every major incident has a full KOS chain
-    → Every pattern you use has a record
-
-[ ] Write a "State of the Systems" document
-    → One page per system: health, known risks, open decisions
-    → This is what architects produce — system ownership artifacts
-
-[ ] Identify your weakest domain from the competency map
-    → Design a focused Q1 Year 2 plan to close it
+[ ] Present a system design proposal to the team (ADR format, options + trade-offs, buy-in via reasoning)
+[ ] Audit KOS: every system has a design doc; every major incident has a full chain; every pattern has a record
+[ ] Write a "State of the Systems" doc — one page per system: health, known risks, open decisions
+[ ] Identify weakest domain; design a focused Q1 Year 2 plan to close it
 ```
 
 ---
 
-### Year 2 — Demonstrate Architect-Level Thinking (Months 13–24)
+### Year 2 — Demonstrate Architect-Level Thinking
 
 **Theme**: Lead, not just do. Influence, not just fix.
 
-**Focus areas**:
 ```
 Month 13–15: Communication & Influence
   → Lead 3+ design reviews
@@ -217,56 +140,45 @@ Month 13–15: Communication & Influence
   → Mentor a junior engineer through an incident analysis
 
 Month 16–18: Cross-system architecture
-  → Design a change that spans 2+ services
-  → Define the event contracts, consistency boundary, and rollback plan
-  → Write the ADR yourself, get senior review
+  → Design a change spanning 2+ services (event contracts, consistency boundary, rollback plan)
+  → Write the ADR yourself; get senior review
 
 Month 19–21: Proactive architecture
-  → Identify a systemic risk across your systems
-  → Propose and lead the solution (not just implement it)
+  → Identify a systemic risk across systems; propose + lead the solution
   → Track the outcome: did it prevent an incident?
 
-Month 22–24: Architect readiness
-  → Can you answer these without hesitation?
-    - "What are the 3 biggest risks in your systems right now?"
-    - "Walk me through the last 3 architectural decisions you made."
-    - "What would you change about your current architecture if you could?"
-  → Build a portfolio: ADRs, runbooks, system reviews, incident analyses
-  → These are your evidence for the architect conversation
+Month 22–24: Architect readiness check
+  → Answer without hesitation:
+    "What are the 3 biggest risks in your systems right now?"
+    "Walk me through the last 3 architectural decisions you made."
+    "What would you change about your architecture if you could?"
+  → Portfolio: ADRs, runbooks, system reviews, incident analyses = evidence for the architect conversation
 ```
 
 ---
 
 ## Progress Check Protocol
 
-When the user asks "how am I doing?" or "what should I focus on next?",
-run through this assessment:
+When asked "how am I doing?" or "what should I focus on next?":
 
 ```
-1. How many ADRs exist in Notion? (Target: 10+ by Month 9)
-2. How many incidents are fully logged in KOS? (Target: all of them)
-3. Have all 3 systems been through a System Design Review? (Target: Q1)
-4. How many runbooks exist? (Target: 1 per system by Month 3)
-5. Is trace ID propagation implemented? (Target: Q2)
-6. Has at least 1 design review been led for another engineer? (Target: Q3)
+1. How many ADRs in Notion?             Target: 10+ by Month 9
+2. How many incidents fully logged?     Target: all of them
+3. All 3 systems through design review? Target: Q1
+4. How many runbooks exist?             Target: 1 per system by Month 3
+5. Trace ID propagation implemented?    Target: Q2
+6. ≥1 design review led for others?    Target: Q3
 ```
 
-Score each: Done / In Progress / Not Started
-Then identify the single highest-leverage action to take next.
+Score each: Done / In Progress / Not Started → identify the single highest-leverage action.
 
 **The question that cuts through everything**:
-> "If your tech lead asked you to explain the 3 biggest architectural risks in your systems
-> right now — could you answer immediately, with evidence?"
-
-If yes → you are thinking like an architect.
-If no → that is the gap to close first.
+> "If your tech lead asked you to explain the 3 biggest architectural risks in your systems right now — could you answer immediately, with evidence?"
+> Yes → thinking like an architect. No → that is the gap to close first.
 
 ---
 
-## Mindset Shifts — Progress Markers
-
-These are not skills to learn — they are ways of thinking to internalise.
-Use them to self-assess honestly.
+## Mindset Shifts
 
 | Shift | Still Engineer | Becoming Architect |
 |-------|---------------|-------------------|
@@ -275,6 +187,6 @@ Use them to self-assess honestly.
 | Incidents | Stressful surprises | Expected — have a runbook |
 | Patterns | Tools to use | Lenses to think with |
 | Performance | "Does it pass tests?" | "What is the query count?" |
-| Documentation | "The code is the docs" | "Future me needs this written down" |
+| Documentation | "The code is the docs" | "Future me needs this written" |
 | Failure | "It shouldn't fail" | "How does it fail gracefully?" |
 | Reviews | "Does it work?" | "What could go wrong in 6 months?" |
