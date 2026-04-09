@@ -1729,4 +1729,250 @@ Source:           Order.API-3.dmp + Order.API-11.dmp, 2026-03-31
 
 ---
 
+### K30: MySQL Transaction Scope Anti-Patterns in Long-Running ETL Jobs
+
+```
+Title:            MySQL Transaction Scope Anti-Patterns in Long-Running ETL Jobs
+Type:             Framework Knowledge
+Domain:           DB Performance / ETL
+Difficulty:       Intermediate
+Summary:          Wrapping a multi-batch ETL loop in a single DB transaction guarantees failure
+                  at scale. MySQL enforces wall-clock timeouts (innodb_lock_wait_timeout default
+                  50s, net_read_timeout default 30s) independent of query count. TX hold =
+                  batch_count × batch_latency. For 3M records at 700ms/batch = 210s >> any
+                  timeout. Fix: per-batch commit — each batch is its own atomic unit.
+Decision Rule:    batch_count × avg_batch_latency > 10s → per-batch commit mandatory
+                  batch_count × avg_batch_latency < 5s  → single TX acceptable
+                  MySQL target (default timeouts)         → assume innodb_lock_wait_timeout = 50s
+Related Patterns: → P24, P25
+Related Incidents:→ I3, I4, I5, I6
+Related Decisions:→ D16, D17
+Related Tech Assets: → TA19, TA20
+Source:           SyncProductMasterJda incident, 2026-04-03
+```
+
+#### MySQL Timeout Hierarchy (most likely to trigger in ETL)
+
+| Timeout | Default | Trigger |
+|---|---|---|
+| `net_read_timeout` | 30s | No network read from client for 30s continuous |
+| `innodb_lock_wait_timeout` | 50s | Write TX waits too long for row lock |
+| `wait_timeout` | 28,800s | Idle connection timeout |
+
+**Key insight:** These are wall-clock timers, not per-query counters. A TX open for 210s will trigger `innodb_lock_wait_timeout` at the ~50s mark regardless of how many queries ran successfully before the timeout fired.
+
+#### Why `RollbackAsync()` itself fails
+
+When MySQL kills a connection due to timeout, the TCP session is closed. When the `catch` block calls `tx.RollbackAsync()`, `MySqlConnector` tries to send `ROLLBACK` to a dead session — this throws a second exception. The stack trace in the error log confirms this: two entries for `MySqlTransaction` — one for the original failure, one for the failed rollback attempt. Both appear in the final exception chain.
+
+#### Correct Pattern (per-batch commit)
+
+```csharp
+// Anti-pattern — NEVER wrap a batch loop in a single TX
+await using var tx = await ctx.Database.BeginTransactionAsync(ct);  // OUTSIDE loop
+while (true) {
+    var batch = await ReadBatch();
+    await WriteBatch(batch);   // all 300 batches open under same TX
+}
+await tx.CommitAsync(ct);     // unreachable for 3M records — times out at batch ~43
+
+// Correct — per-batch commit
+while (true) {
+    var batch = await ReadBatch(lastId, ct);
+    if (batch.Count == 0) break;
+    await using var tx = await ctx.Database.BeginTransactionAsync(ct);  // INSIDE loop
+    await WriteBatch(batch, ct);
+    await tx.CommitAsync(ct);
+    lastId = batch.Last().Id;   // advance cursor after commit
+}
+```
+
+#### EF Core + MySQL Connection String Parameters for ETL
+
+```
+ConnectionTimeout=30;         -- time to establish connection
+DefaultCommandTimeout=120;    -- per-statement timeout (prevent runaway queries)
+ConnectionLifeTime=300;       -- max age of pooled connection (avoid stale connections)
+```
+
+Set via `UseMySql(..., o => o.CommandTimeout(120))` in `AddDbContext<T>` options registration.
+
+---
+
+### K32: EF Core ChangeTracker Accumulation in Per-Batch ETL Loops
+
+```
+Title:            EF Core ChangeTracker Accumulation in Per-Batch ETL Loops
+Type:             Framework Knowledge
+Domain:           EF Core / Memory Management
+Difficulty:       Intermediate
+Summary:          In a per-batch commit loop, EF Core's ChangeTracker accumulates tracked entities
+                  from every batch — even after CommitAsync(). Committed entities are no longer
+                  useful but remain in memory until DbContext is disposed or ChangeTracker.Clear()
+                  is called. For 300 batches × 10K entities = 3M tracked objects. Combined with
+                  an activity tracking Dictionary that also grows unbounded, heap grows linearly
+                  with batch count — predictable OOM for any large ETL job.
+Decision Rule:    After tx.CommitAsync() in a batch loop → always call context.ChangeTracker.Clear()
+                  Activity tracking Dictionary passed across batches → call .Clear() after each commit
+                  Heap delta > 200MB per batch → investigate ChangeTracker accumulation first
+Related Patterns: → P24, P25
+Related Incidents:→ I3, I4, I5
+Related Decisions:→ D16
+Related Tech Assets: → TA20
+Source:           SyncProductMasterJda live production incident, 2026-04-08
+```
+
+#### Why ChangeTracker Doesn't Auto-Clear After Commit
+
+EF Core's ChangeTracker tracks entities to detect changes for the next `SaveChangesAsync()`. After `CommitAsync()`, the entities are in the database — but EF doesn't know you're done with them. It keeps tracking in case you modify and re-save them in the same DbContext scope.
+
+In a batch loop where the DbContext lives for the entire job (not scoped per batch), this means:
+- Batch 1 commit: 10K entities tracked
+- Batch 2 commit: 20K entities tracked
+- Batch 300 commit: 3M entities tracked — all in heap
+
+#### The Fix
+
+```csharp
+await tx.CommitAsync(cancellationToken);
+
+// Detach all tracked entities — they're committed, no future use in this DbContext scope
+context.ChangeTracker.Clear();
+
+// Flush activity tracking dictionary — same unbounded growth problem
+activityTracking.Clear();
+```
+
+`ChangeTracker.Clear()` detaches all entities from the context (sets their state to `Detached`). GC can then reclaim the memory. Heap returns to near-baseline after each batch.
+
+#### Heap Pattern Before vs After
+
+```
+Before ChangeTracker.Clear():        After ChangeTracker.Clear():
+  Batch 1: 1,191MB (+1,175)            Batch 1: 150MB (+134)
+  Batch 2: 1,780MB (+589)              Batch 2: 148MB (-2)   ← flat
+  Batch 3: ~2,200MB (OOM)              Batch 3: 151MB (+3)   ← flat
+```
+
+---
+
+### K31: ETL Batch Observability — The 4 Metrics That Predict Timeout Recurrence
+
+```
+Title:            ETL Batch Observability — The 4 Metrics That Predict Timeout Recurrence
+Type:             Operational Knowledge
+Domain:           Observability / ETL
+Difficulty:       Beginner–Intermediate
+Summary:          After fixing an ETL timeout (per-batch commit), you must instrument 4 signals
+                  per batch to detect the next timeout before it happens: (1) TX hold time,
+                  (2) staging read latency, (3) cumulative records counter, (4) GC allocation.
+                  TX hold is the critical metric — if P95 drifts toward DB timeout threshold,
+                  alert before failure. Without these metrics, the fix is a black box.
+Decision Rule:    Any batch loop writing to DB → must have per-batch Stopwatch + Histogram
+                  ETL job > 100K records → Prometheus metrics mandatory (not just logs)
+                  Overhead budget: < 0.1% of batch duration for all instrumentation combined
+Related Patterns: → P25
+Related Incidents:→ I3, I4, I5
+Related Decisions:→ D17
+Related Tech Assets: → TA20, TA21
+Source:           SyncProductMasterJda follow-up, 2026-04-08
+```
+
+#### The 4 Predictive Signals
+
+| # | Metric | Type | Why It Predicts Failure |
+|---|---|---|---|
+| 1 | **Per-batch TX hold time** | Histogram | Directly maps to the variable that caused I3. If this drifts toward `innodb_lock_wait_timeout`, you have minutes to act. |
+| 2 | **Staging read latency** | Histogram | Slow reads extend total batch time. Detects index degradation on staging table. |
+| 3 | **Cumulative records counter** | Counter | Detects sync stalls (no progress), data volume growth (unexpected batch count). |
+| 4 | **GC allocation per batch** | Summary | Catches memory pressure from large batches. EF Core tracking overhead accumulates. |
+
+#### Metric Naming Convention for ETL
+
+```
+etl_sync_{metric_name}_{unit}
+```
+
+Labels: `sync_name`, `business_unit` — allows per-job filtering in Grafana.
+
+Examples:
+- `etl_sync_batch_duration_seconds` (Histogram)
+- `etl_sync_records_processed_total` (Counter)
+- `etl_sync_staging_read_seconds` (Histogram)
+- `etl_sync_batch_alloc_bytes` (Summary)
+
+#### Overhead Budget
+
+All instrumentation must stay under **0.1% of batch duration**. For a 700ms batch:
+
+| Instrument | Cost | % of batch |
+|---|---|---|
+| Stopwatch.StartNew() + Stop | ~0.001ms | 0.0001% |
+| GC.GetTotalAllocatedBytes(precise: false) × 2 | ~0.01ms | 0.001% |
+| Prometheus Observe/Inc × 5 | ~0.005ms | 0.0007% |
+| Structured log × 1 | ~0.1ms | 0.014% |
+| **Total** | **~0.12ms** | **0.017%** |
+
+---
+
+### K33: Copy-Paste DbSet Reference Propagation in EF Core ETL Service Clones
+
+```
+Title:            Copy-Paste DbSet Reference Propagation in EF Core ETL Service Clones
+Type:             Failure Mode / Code Quality
+Domain:           EF Core / ETL / Code Quality
+Difficulty:       Beginner
+Summary:          When an EF Core ETL sync service is cloned, the staging DbSet in
+                  GetProductStaging() and the DbSet in CheckPendingAsync() are independent
+                  call sites. Updating one does not update the other. Missing this causes
+                  a silent wrong-table query — job runs without error but processes no data.
+                  Fix: after cloning, grep for all source DbSet references and verify each
+                  independently. Six touch points must all be audited (→ P26 checklist).
+Decision Rule:    Cloned an EF Core ETL service? → audit every DbSet reference independently.
+                  Any staging query + CheckPendingAsync → must reference same DbSet.
+                  Grep for original DbSet name in cloned file — any hit = copy-paste bug.
+Related Incidents:→ I6
+Related Patterns: → P26
+Related Decisions:→ D18
+Related Tech Assets: → TA22
+Source:           SyncProductBarcodeJda copy-paste incident, 2026-04-08
+```
+
+#### Concept
+
+When an EF Core ETL sync service is cloned (e.g., `SyncProductMasterJda` → `SyncProductBarcodeJda`), the DbSet reference in the staging query method and the DbSet reference in `CheckPendingAsync` are **independent call sites**. Updating one does not update the other.
+
+#### Failure Pattern
+
+```csharp
+// GetProductStaging — updated correctly:
+var products = await stagingContext.SpcJdaBarcodeStaging   // ✓ correct
+    .AsNoTracking().Where(x => x.Id > lastId)...
+
+// CheckPendingAsync — NOT updated (copy-paste leftover):
+return await stagingContext.SpcJdaProductStaging            // ✗ wrong table
+    .AnyAsync(x => x.Id > lastId, cancellationToken);
+```
+
+#### Silent Failure Modes
+
+| Scenario | Observed behavior | Actual cause |
+|---|---|---|
+| Product staging empty, barcode staging has rows | "No data to sync" — 0 rows processed | `CheckPendingAsync` returns false on wrong table |
+| Both tables have rows | Sync appears healthy | Lucky path — pending check passes by coincidence |
+| Product staging has rows, barcode staging empty | Enters loop, reads 0, exits | Wrong table returns true; correct table empty |
+
+The third scenario is dangerous: the job appears healthy but processes nothing.
+
+#### Detection
+
+Grep for the original DbSet name after cloning:
+```bash
+grep -n "SpcJdaProductStaging" SyncProductBarcodeJda.cs
+# Any hit in a Barcode file = copy-paste bug
+```
+
+#### Rule
+
+After cloning any EF Core ETL service, audit **every DbSet reference** independently — staging query, `CheckPendingAsync`, and any other `AnyAsync`/`CountAsync`/`FirstOrDefaultAsync` call. See → P26 for full clone checklist.
 

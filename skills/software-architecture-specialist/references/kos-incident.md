@@ -633,3 +633,400 @@ Actual outcome exceeded estimate: predicted ~630 MB post-REINDEX, actual = 251 M
 - After VACUUM, always check index bloat separately — they are independent problems
 - `REINDEX CONCURRENTLY` is safe for production (no lock) and should be used whenever index bloat > 30%
 - "Autovacuum never ran" + large table = almost certainly a scale_factor configuration problem
+
+---
+
+### I3: MySQL ETL Sync — Long-Lived Transaction Timeout Causes Airflow Job Failure
+
+```
+Title:               MySQL ETL Sync — Long-Lived Transaction Timeout Causes Airflow Job Failure
+Severity:            High
+System:              ETL Pipeline — SyncProductMasterJda / SyncProductBarcodeJda (Airflow + .NET)
+Status:              Fix implemented 2026-04-08. Per-batch commit + Prometheus resource tracking metrics added.
+Follow-Up:           I4 — added ETL resource tracking (batch duration, memory, records counter)
+Date:                2026-04-03
+Problem:             .NET sync job processing 3M records from staging DB to MySQL production DB
+                     fails after a long run. Exit code 1. Airflow marks DAG run as failed.
+                     Single transaction wraps entire 300-batch sync loop (~210s open).
+                     MySQL innodb_lock_wait_timeout (default 50s) kills the connection,
+                     triggering RollbackAsync(), exhausting Polly retry attempts, propagating
+                     exit code 1 to Airflow.
+Root Cause:          BeginTransactionAsync() at line 55 of ProcessSyncLoopAsync() wraps the
+                     entire while(true) batch loop (lines 59–74) in a single DB transaction.
+                     BotE: 300 batches × 700ms = 210s hold >> innodb_lock_wait_timeout (50s).
+                     MySQL kills the connection → catch calls RollbackAsync() on dead connection
+                     (second failure) → Polly retries=0 → exception propagates → exit code 1.
+                     Airflow retries=0 → DAG run marked failed, no retry.
+Lesson Learned:      Long-running ETL transactions must commit per batch, not per job.
+                     TX hold = batch_count × batch_latency. Always BotE this before design.
+Prevention:          Per-batch commit (TX inside loop). CommandTimeout(120) on DbContext.
+                     Set Airflow retries=2 retry_delay=5min execution_timeout=40min.
+                     Set subprocess timeout=1800s (derived from BotE: 300 × 1.5s × 3x safety factor).
+Related Knowledge:   → K30, K32
+Related Pattern:     → P24, P25
+Related Decisions:   → D16, D17
+Related Tech Assets: → TA19, TA20
+Related Incidents:   → I4, I5, I6 (follow-ups: observability, OOM, copy-paste bug + batch size)
+```
+
+#### Symptoms
+
+- Airflow DAG fails: `Exception: .NET job failed` (exit code 1) at `2026-04-03 11:47:41`
+- Stack trace: `ProcessSyncLoopAsync() → MySqlTransaction.RollbackAsync() → Polly → Program.Main()`
+- Job runs for a long time before failure (not immediate — confirms timeout, not config error)
+- 0 records committed — all work lost on each run attempt
+
+#### BotE — Transaction Hold Time
+
+| Variable | Value |
+|---|---|
+| Total records | 3,000,000 |
+| Batch size | 10,000 |
+| Batch count | 300 |
+| Avg staging read | ~500ms |
+| Avg production insert | ~200ms |
+| Per-batch duration | ~700ms |
+| **Total TX hold** | **210 seconds** |
+| MySQL `innodb_lock_wait_timeout` | 50s (default) |
+| MySQL `net_read_timeout` | 30s (default) |
+| **Risk** | **Certain failure** — 210s >> 50s |
+
+#### Root Cause — Deep Analysis
+
+The fundamental error: the commit boundary is the entire job, not the batch.
+
+```csharp
+// product.cs — ProcessSyncLoopAsync()
+// Line 55: Transaction opened BEFORE the loop
+await using var tx = await context.Database.BeginTransactionAsync(cancellationToken);
+try
+{
+    long lastIdFromStaging = startingId;
+    while (true)                              // 300 iterations for 3M records
+    {
+        var productStagings = await GetProductStaging(lastIdFromStaging, cancellationToken);
+        // ...writes to production MySQL, all under same open TX...
+        await SyncProductMasterAsync(...)
+    }
+    await tx.CommitAsync(cancellationToken);  // Line 66: unreachable — times out at batch ~43–71
+}
+catch (Exception ex)
+{
+    await tx.RollbackAsync(cancellationToken); // Line 81: also fails — connection already dead
+    throw;
+}
+```
+
+MySQL kills the connection at ~30–50s (whichever timeout fires first). When `MySqlConnector` throws, the `catch` block calls `tx.RollbackAsync()` on a dead TCP session — this throws a second exception. The stack trace confirms both failures. Polly has `retries=0` so the exception propagates immediately. Airflow sees exit code 1 and marks the DAG run failed with no retry.
+
+#### Fix
+
+Move `BeginTransactionAsync()` inside the `while(true)` loop. Each batch opens, commits, and closes its own short TX (~700ms hold). On failure: only the in-flight batch is rolled back. All prior batches remain committed. Idempotent restart via monotonic cursor (`WHERE Id > lastId`).
+
+See → P24 for blueprint, → TA19 for full C# template.
+
+#### Results (Expected Post-Fix)
+
+| Metric | Before | After |
+|---|---|---|
+| TX hold time | ~210s | ~700ms per batch |
+| MySQL timeout risk | Certain | Eliminated |
+| On-failure data loss | 100% (3M records) | ≤ 0.03% (1 batch / 300 batches) |
+| Restart | Full re-run from record 0 | Resume from last committed cursor |
+| Airflow retry effectiveness | 0% (retries=0) | Effective — resumes from checkpoint |
+
+---
+
+### I4: MySQL ETL Sync — Zero Observability on Batch Resource Consumption
+
+```
+Title:               MySQL ETL Sync — Zero Observability on Batch Resource Consumption
+Severity:            Medium
+System:              ETL Pipeline — SyncProductMasterJda (Airflow + .NET)
+Status:              Fix implemented 2026-04-08
+Date:                2026-04-08
+Problem:             After I3 fix (per-batch commit), the ETL job runs without timeout failures.
+                     However, there are zero metrics on per-batch resource consumption: TX hold time,
+                     memory allocation, staging read latency, records throughput. If batch latency
+                     drifts (data volume growth, index degradation, connection pool contention),
+                     there is no early warning — next symptom will be another timeout incident.
+Root Cause:          ProcessSyncLoopAsync() in product.cs had no instrumentation beyond basic
+                     log messages. No Prometheus metrics, no Stopwatch per batch, no GC tracking.
+                     Observability gap: "a fix without measurement is anecdotal" (I3 lesson).
+Lesson Learned:      Every ETL batch loop must expose: per-batch TX hold time (Histogram),
+                     cumulative records counter, staging read latency, and GC allocation.
+                     These are the 4 signals that predict the next timeout before it happens.
+Prevention:          Prometheus metrics + structured logging with per-batch resource tracking.
+                     Alert rules: WARN if batch_duration_p95 > 5s, CRIT if > 30s.
+                     Dashboard: Grafana panel showing batch duration trend over time.
+Related Knowledge:   → K31, K32
+Related Pattern:     → P25
+Related Decisions:   → D17
+Related Tech Assets: → TA20, TA21
+Related Incidents:   → I3 (predecessor), I5 (follow-up — OOM), I6 (follow-up — copy-paste bug + batch size)
+```
+
+#### Symptoms
+
+- ETL job succeeds but provides no visibility into resource consumption per batch
+- No way to detect batch latency drift before it causes a timeout
+- No Prometheus metrics for alerting on TX hold time regression
+- Memory allocation per batch unknown — cannot predict GC pressure at scale
+
+#### BotE — Metric Budget
+
+| Metric | Overhead per batch | Acceptable? |
+|---|---|---|
+| Stopwatch (2×: staging read + TX hold) | ~0.001ms | Yes — negligible |
+| GC.GetTotalAllocatedBytes (2×) | ~0.01ms | Yes — non-precise mode |
+| Prometheus Observe/Inc (5 calls) | ~0.005ms | Yes — in-process counters |
+| Structured log (1 per batch) | ~0.1ms | Yes — async sink |
+| **Total per batch** | **~0.12ms** | **< 0.02% of 700ms batch** |
+
+#### Fix
+
+Added 5 Prometheus metrics + Stopwatch + GC tracking to `ProcessSyncLoopAsync()` in `product.cs`:
+
+1. **`etl_sync_batch_duration_seconds`** (Histogram) — per-batch TX hold time, buckets 0.1s–51.2s
+2. **`etl_sync_records_processed_total`** (Counter) — cumulative records committed
+3. **`etl_sync_current_batch_round`** (Gauge) — current batch round number
+4. **`etl_sync_staging_read_seconds`** (Histogram) — staging read latency per batch
+5. **`etl_sync_batch_alloc_bytes`** (Summary) — GC allocation per batch
+
+Plus structured log per batch: TX hold ms, staging read ms, alloc MB, total records, job elapsed.
+Plus job summary log on completion: total records, batch count, total duration, avg ms/batch.
+
+#### Alert Rules (Prometheus)
+
+```yaml
+# WARN: batch TX hold drifting high
+- alert: EtlBatchDurationHigh
+  expr: histogram_quantile(0.95, rate(etl_sync_batch_duration_seconds_bucket[5m])) > 5
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "ETL batch P95 TX hold > 5s — investigate before timeout threshold"
+
+# CRIT: approaching MySQL timeout
+- alert: EtlBatchDurationCritical
+  expr: histogram_quantile(0.95, rate(etl_sync_batch_duration_seconds_bucket[5m])) > 30
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "ETL batch P95 TX hold > 30s — imminent timeout risk (MySQL default 50s)"
+
+# WARN: sync stall — no records processed
+- alert: EtlSyncStall
+  expr: increase(etl_sync_records_processed_total[5m]) == 0 and etl_sync_current_batch_round > 0
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "ETL sync has not committed records in 5 minutes — possible stall"
+```
+
+#### Results
+
+| Metric | Before | After |
+|---|---|---|
+| Per-batch TX hold visibility | None | Histogram with P50/P95/P99 |
+| Memory allocation visibility | None | Summary per batch |
+| Staging read latency visibility | None | Histogram per batch |
+| Alert on latency drift | None | WARN > 5s, CRIT > 30s |
+| Total overhead per batch | 0 | ~0.12ms (~0.02% of 700ms) |
+
+#### Lesson Learned
+
+> **Observability is not optional for ETL.** The I3 fix (per-batch commit) eliminated the timeout, but without metrics the fix is a black box. The next data volume doubling or index degradation will silently push batch duration from 700ms toward 50s with zero warning. Metrics close the loop: Incident → Fix → Measure → Alert → Prevent recurrence.
+
+---
+
+### I5: ETL Sync — OOM Risk from Oversized Batch + EF ChangeTracker Accumulation
+
+```
+Title:               ETL Sync — OOM Risk from Oversized Batch + EF ChangeTracker Accumulation
+Severity:            High
+System:              ETL Pipeline — SyncProductMasterJda / SyncProductBarcodeJda (Airflow + .NET)
+Status:              Root cause confirmed. Fix implemented 2026-04-08.
+Date:                2026-04-08
+Problem:             Live Airflow log shows Batch 1: 100K records, TX hold 144s, alloc 5,757MB,
+                     heap 1,191MB (+1,175MB). Batch 2: heap 1,780MB (+589MB). Heap growing every
+                     batch — OOM expected by batch 4-5. Root: batch size config = 100K (10×
+                     intended), EF ChangeTracker never cleared after commit, per-batch activity
+                     tracking dictionary never cleared (grows to 3M entries across job).
+Root Cause:          Three compounding issues: (1) BatchSize config returned 100K instead of 10K —
+                     100K entities × 30 fields × EF SqlParameter per insert = ~5GB alloc per batch.
+                     (2) context.ChangeTracker not cleared after tx.CommitAsync() — committed
+                     entities remain tracked across batches, heap grows with each batch commit.
+                     (3) productMasterActivityTracking Dictionary<string, Activity> created once in
+                     ProcessAsync() and passed through loop — accumulates all 3M records in memory,
+                     never flushed between batches.
+Lesson Learned:      Per-batch commit prevents TX timeout but does NOT prevent memory accumulation.
+                     After each commit: clear ChangeTracker (dead tracking weight) and flush the
+                     activity tracking dictionary (unbounded growth). Batch size must be verified
+                     in staging before prod — BotE: batch_size × fields × EF_overhead > 500MB = too large.
+Prevention:          context.ChangeTracker.Clear() after tx.CommitAsync().
+                     activityTracking.Clear() after each batch commit.
+                     Verify batch size config in staging with heap metrics before deploying.
+                     Alert: heap_delta > 200MB per batch = memory leak signal.
+Related Knowledge:   → K31, K32
+Related Pattern:     → P24, P25
+Related Decisions:   → D16, D17
+Related Tech Assets: → TA20, TA21
+Related Incidents:   → I3, I4, I6 (follow-up — copy-paste bug + batch size near timeout)
+```
+
+#### Symptoms (from Airflow log 2026-04-08)
+
+```
+Batch 1: 100K records, TX hold 144,829ms, alloc 5,757MB, heap 1,191MB, heapDelta +1,175MB
+Batch 2: 100K records, TX hold 139,447ms, alloc 6,346MB, heap 1,780MB, heapDelta +589MB
+Projected Batch 3: heap ~2,200MB → OOM / Gen2 GC storm
+```
+
+#### BotE — Memory per Batch at 100K
+
+| Source | Memory |
+|---|---|
+| 100K staging entities (AsNoTracking) loaded | ~100MB |
+| 100K mapped Product objects | ~100MB |
+| EF ChangeTracker: 100K entities × 30 fields × SqlParameter | ~3–4GB alloc |
+| 100K ProductMasterActivity with JSON Payload per record | ~200MB |
+| Dictionary accumulation across batches (3M entries) | ~500MB+ |
+| **Total alloc per batch** | **~5,700MB (matches log)** |
+
+At 10K batch size (correct config): ~570MB alloc per batch — within acceptable range.
+
+#### Fix
+
+Three changes applied to both `product.cs` and `barcode.cs`:
+
+```csharp
+await tx.CommitAsync(cancellationToken);
+
+// Fix 1: release tracked entities — no longer needed after commit
+context.ChangeTracker.Clear();
+
+// Fix 2: flush activity tracking dictionary — prevent unbounded growth
+productMasterActivityTracking.Clear();
+```
+
+Config fix: set `BatchSize = 10000` in appsettings (not a code change).
+
+#### Results (Expected Post-Fix at 10K batch size)
+
+| Metric | Before (100K batch) | After (10K batch + ChangeTracker.Clear) |
+|---|---|---|
+| TX hold per batch | ~144s | ~14s |
+| Alloc per batch | ~5,757MB | ~200-300MB |
+| Heap after batch 1 | 1,191MB | ~100-150MB |
+| Heap delta (steady state) | +589MB per batch (growing) | ~0 (flat sawtooth) |
+| OOM risk | Certain by batch 4-5 | Eliminated |
+
+---
+
+### I6: SyncProductBarcodeJda — Copy-Paste Bug in CheckPendingAsync + Batch Size Approaching MySQL Timeout
+
+```
+Title:               SyncProductBarcodeJda — CheckPendingAsync Copy-Paste Bug + 20K Batch Near Timeout
+Severity:            High
+System:              ETL Pipeline — SyncProductBarcodeJda / SyncProductMasterJda (Airflow + .NET)
+Status:              Fix implemented 2026-04-08
+Date:                2026-04-08
+Problem:             Two issues discovered in follow-up review of I3/I5 fixes.
+                     A) barcode.cs CheckPendingAsync queries SpcJdaProductStaging instead of
+                     SpcJdaBarcodeStaging — copy-paste from product.cs. Silent failure: if product
+                     staging has no pending rows but barcode staging does, entire barcode sync skips.
+                     B) SyncProductMasterJda running at BatchSize=20K. Airflow logs show TX hold
+                     27,082–39,689ms per batch (Batch 1: 39,689ms = 79% of MySQL 50s timeout).
+                     CRIT alert threshold (>30s) already firing for Batches 1, 9, 10.
+Root Cause:          A) barcode.cs was cloned from product.cs. GetProductStaging() was correctly
+                     updated to SpcJdaBarcodeStaging, but CheckPendingAsync() retained the original
+                     SpcJdaProductStaging reference — silent wrong-table query.
+                     B) BatchSize config not reduced to 10K after I5 fix. At 20K: TX hold scales to
+                     ~28–40s (linear with I5 BotE: 100K→144s, 10K→14s, 20K→28s). Any write latency
+                     spike → timeout breach.
+Lesson Learned:      Clone validation is not optional. After cloning an ETL sync service, all DbSet
+                     references must be audited in both the staging query AND CheckPendingAsync.
+                     These are independent call sites — updating one does not update the other.
+                     Batch size calibration: verify actual TX hold vs timeout limit after every
+                     config change. 20K→28–40s leaves zero headroom vs 50s MySQL timeout.
+Prevention:          ETL clone checklist (→ P26): verify 6 touch points before merging a cloned service.
+                     Batch size rule (→ D18): batch_size × avg_write_ms < timeout × 0.5 (50% margin).
+                     At current throughput: 10K = ~14s = 28% of 50s limit. Hard ceiling: 10K.
+Related Knowledge:   → K30, K33
+Related Pattern:     → P24, P26
+Related Decisions:   → D16, D18
+Related Tech Assets: → TA19, TA22
+Related Incidents:   → I3 (per-batch TX fix), I5 (OOM + ChangeTracker fix)
+```
+
+#### Symptoms
+
+**Issue A — CheckPendingAsync wrong table (barcode.cs)**
+
+- `SyncProductBarcodeJda` runs without error but commits 0 records
+- Airflow log shows "no data to sync" warning even when barcode staging table has pending rows
+- Invisible unless both staging tables are checked: if product staging is empty, barcode sync silently skips entirely
+
+**Issue B — Batch size 20K TX hold near timeout (Airflow log 2026-04-08)**
+
+```
+Batch  1: 20000 records, TX hold 39,689ms  ← CRIT (79% of 50s limit)
+Batch  2: 20000 records, TX hold 27,975ms
+Batch  9: 20000 records, TX hold 35,900ms  ← CRIT
+Batch 10: 20000 records, TX hold 30,310ms  ← CRIT threshold
+Batch 21: 20000 records, TX hold 27,897ms
+```
+
+Heap is stable (~240–267MB, oscillating ±10MB) — ChangeTracker.Clear() and dict.Clear() from I5 fix are working correctly.
+
+#### BotE — TX Hold vs Batch Size
+
+| Batch Size | TX Hold (BotE) | % of MySQL 50s timeout | Risk |
+|---|---|---|---|
+| 10K (target) | ~14s | 28% | Safe |
+| 20K (current) | ~28–40s | 56–80% | CRITICAL |
+| 100K (I5 pre-fix) | ~144s | 288% | Fatal |
+
+**BotE formula**: `tx_hold ≈ (batch_size / 10000) × 14s`  
+Safety margin rule: tx_hold < timeout × 0.5 → 10K is the ceiling for this workload.
+
+#### Root Cause Detail
+
+**A — Copy-paste bug in barcode.cs:204**
+
+```csharp
+// barcode.cs — BEFORE FIX (wrong):
+internal async ValueTask<bool> CheckPendingAsync(long lastId, CancellationToken cancellationToken)
+{
+    return await stagingContext.SpcJdaProductStaging   // ← product table, not barcode!
+        .AnyAsync(x => x.Id > lastId, cancellationToken);
+}
+
+// barcode.cs — AFTER FIX:
+internal async ValueTask<bool> CheckPendingAsync(long lastId, CancellationToken cancellationToken)
+{
+    return await stagingContext.SpcJdaBarcodeStaging   // ← correct
+        .AnyAsync(x => x.Id > lastId, cancellationToken);
+}
+```
+
+`GetProductStaging()` in barcode.cs correctly queries `SpcJdaBarcodeStaging` — only `CheckPendingAsync` was missed. Both are independent call sites; updating one does not update the other.
+
+#### Fix
+
+**A — Code fix** (`barcode.cs` line 204): 1-line change — `SpcJdaProductStaging` → `SpcJdaBarcodeStaging`
+
+**B — Config fix** (`appsettings.json`): `BatchSize = 10000` (not a code change)
+
+#### Results
+
+| Metric | Before | After |
+|---|---|---|
+| Barcode sync correctness | Silently skips when product staging empty | Correctly reads barcode staging |
+| TX hold per batch | 28–40s (CRIT alert) | ~14s (28% of MySQL limit) |
+| Timeout risk | Present (Batch 1: 40s) | Eliminated (10K = 14s) |
+

@@ -1637,3 +1637,216 @@ foreach (var pair in subOrderPairs)
 **Related decisions**: D8 (IDbContextFactory), D11 (Bulk Load Then Map choice), D13 (EF.CompileQuery), D15 (await using scope rule)
 
 ---
+
+### P24: Per-Batch Commit for Long-Running ETL Sync
+
+```
+Name:             Per-Batch Commit for Long-Running ETL Sync
+Category:         ETL / Data Pipeline
+Problem:          A long-running ETL job wraps all batch writes in a single DB transaction.
+                  Total TX hold (batch_count × batch_latency) exceeds DB server timeout.
+                  DB kills connection → full rollback → 0 records committed → job fails.
+Solution:         Move transaction boundary inside the batch loop. One TX per batch (~single-digit
+                  seconds hold). Use monotonic cursor (WHERE Id > lastId) for idempotent restart.
+                  Persist cursor after each commit so failure resumes from last checkpoint.
+When to Use:      batch_count × avg_batch_latency > 10s
+                  MySQL/SQL Server with default lock wait timeouts
+                  Source data has monotonic cursor (sequential ID or timestamp)
+                  Partial sync visibility in prod is acceptable during job run
+When NOT to Use:  All-or-nothing atomicity required across entire dataset
+                  No upsert semantics on target (duplicate insert risk without unique constraint)
+                  Total batch time < 5s (single TX acceptable at that scale)
+Complexity:       Low — structural refactor, no new infrastructure
+Based on Knowledge:  → K30, K32
+Related Decisions:   → D16, D17
+Related Incidents:   → I3, I4, I5, I6
+Related Tech Assets: → TA19, TA20
+Related Patterns:    → P25 (observability follow-up)
+```
+
+#### Commit Strategy Decision Tree
+
+```
+BotE: batch_count × avg_batch_latency = ?
+
+  < 5,000ms  → single TX safe
+  5–30,000ms → per-batch commit preferred
+  > 30,000ms → per-batch commit mandatory
+```
+
+#### Structure
+
+```
+BEFORE (anti-pattern):              AFTER (per-batch commit):
+
+BeginTransaction()                  while (true) {
+  while (true) {                      batch = ReadBatch(lastId)
+    ReadBatch(lastId)                 if empty → break
+    WriteBatch(batch)
+  }                                   BeginTransaction()
+Commit()  ← single failure point       WriteBatch(batch)
+                                      Commit()
+                                      lastId = batch.Last().Id
+                                      PersistCursor(lastId)
+                                    }
+```
+
+#### Trade-offs
+
+| Dimension | Per-Batch Commit | Single TX |
+|---|---|---|
+| MySQL timeout safety | Immune (~700ms hold) | Certain failure at 3M scale |
+| On-failure impact | ≤ 1 batch (10K rows) | 100% rollback |
+| Atomicity | Per-batch | Per-job |
+| Partial visibility | Yes — records appear during sync | No |
+| Restart capability | Idempotent from cursor | Full re-run |
+
+#### Airflow Hardening (complementary)
+
+```python
+PythonOperator(
+    task_id='run_dotnet_job',
+    retries=2,
+    retry_delay=timedelta(minutes=5),
+    execution_timeout=timedelta(hours=3),
+)
+# Inside callable:
+exit_code = result.wait(timeout=7200)   # 2h subprocess hard ceiling
+```
+
+---
+
+### P25: ETL Batch Resource Tracking (Prometheus + Stopwatch + GC)
+
+```
+Name:             ETL Batch Resource Tracking (Prometheus + Stopwatch + GC)
+Category:         Observability / ETL
+Problem:          An ETL batch loop writes to DB per-batch but has no instrumentation on resource
+                  consumption. Batch latency drift (from data growth, index degradation, pool
+                  contention) is invisible until it causes a timeout failure — repeating the
+                  original incident.
+Solution:         Add 5 Prometheus metrics (Histogram for TX hold + staging read, Counter for
+                  records, Gauge for round, Summary for GC alloc) plus Stopwatch per-batch
+                  plus GC.GetTotalAllocatedBytes before/after. Structured log per batch with
+                  all values. Job summary log on completion.
+When to Use:      Any batch loop with DB writes processing > 10K total records
+                  After fixing a timeout incident (prevent recurrence via early detection)
+                  Any ETL job orchestrated by Airflow/scheduler (no interactive visibility)
+When NOT to Use:  One-off scripts with < 1K records (log is sufficient)
+                  Inner loops within a single batch (too granular — per-batch is the right level)
+Complexity:       Low — adds ~15 lines of instrumentation, no new infrastructure
+Based on Knowledge:  → K31, K32
+Related Decisions:   → D17
+Related Incidents:   → I3, I4, I5
+Related Tech Assets: → TA20, TA21
+```
+
+#### Structure
+
+```
+// ── Declare static Prometheus fields ──
+static Histogram BatchDuration = ...;     // TX hold per batch
+static Histogram StagingReadDuration = ...; // staging read per batch
+static Counter RecordsProcessed = ...;     // cumulative records
+static Gauge CurrentBatchRound = ...;      // current round
+static Summary BatchMemoryAlloc = ...;     // GC alloc per batch
+
+// ── Inside batch loop ──
+var readSw = Stopwatch.StartNew();
+var batch = await ReadBatch(lastId);
+readSw.Stop();
+StagingReadDuration.Observe(readSw.Elapsed.TotalSeconds);
+
+long gcBefore = GC.GetTotalAllocatedBytes(precise: false);
+var batchSw = Stopwatch.StartNew();
+
+await using var tx = await BeginTransactionAsync();
+await WriteBatch(batch);
+await tx.CommitAsync();
+
+batchSw.Stop();
+long gcAfter = GC.GetTotalAllocatedBytes(precise: false);
+
+BatchDuration.Observe(batchSw.Elapsed.TotalSeconds);
+RecordsProcessed.Inc(batch.Count);
+CurrentBatchRound.Set(round);
+BatchMemoryAlloc.Observe(gcAfter - gcBefore);
+
+logger.LogInformation("[{Sync}] Batch {R}: {N} rows, TX {TxMs}ms, read {ReadMs}ms, alloc {MB:F1}MB",
+    SyncName, round, batch.Count, batchSw.ElapsedMilliseconds,
+    readSw.ElapsedMilliseconds, (gcAfter - gcBefore) / 1_048_576.0);
+```
+
+#### Trade-offs
+
+| Dimension | With Tracking | Without Tracking |
+|---|---|---|
+| Timeout prediction | Early warning via P95 trend | Blind until failure |
+| Overhead per batch | ~0.12ms (~0.02% of 700ms) | 0 |
+| Dashboard / alert capability | Full Grafana + Prometheus | None |
+| Debugging failed batches | Exact metrics in log | Only "batch N failed" |
+| Code complexity | +15 lines | Simpler but opaque |
+
+---
+
+### P26: ETL Service Clone Validation Checklist
+
+```
+Name:             ETL Service Clone Validation Checklist
+Category:         ETL / Code Quality
+Problem:          Cloned EF Core ETL sync services silently query the wrong DbSet when
+                  the copy-paste update is incomplete. Missing one touch point causes
+                  the job to run without error but process no data (or wrong data).
+When to Use:      Any time an ETL sync service is created by copying an existing one.
+                  Mandatory before merging a cloned SyncProduct*Jda or similar service.
+When NOT to Use:  New services built from scratch (use as final review checklist only).
+Complexity:       Low
+Based on Knowledge:  → K33
+Related Incidents:   → I6
+Related Decisions:   → D18
+Related Tech Assets: → TA22
+```
+
+#### Problem
+
+Cloning `SyncProductMasterJda` to create `SyncProductBarcodeJda` (or any new ETL sync) leaves multiple independent call sites referencing the original service's DbSet, config key, and service name. Each must be updated separately — they do not share a reference.
+
+#### The 6 Touch Points (must all be verified)
+
+| # | Location | What to check | Example — source | Example — clone |
+|---|---|---|---|---|
+| 1 | `GetProductStaging()` | Staging DbSet name | `SpcJdaProductStaging` | `SpcJdaBarcodeStaging` |
+| 2 | `CheckPendingAsync()` | Staging DbSet name (independent!) | `SpcJdaProductStaging` | `SpcJdaBarcodeStaging` |
+| 3 | Constructor / class name | Service class name | `SyncProductMasterJda` | `SyncProductBarcodeJda` |
+| 4 | `serviceType` property | Service type string for logging | `"JdaProductMaster"` | `"JdaProductBarcode"` |
+| 5 | `SyncName` / tracker key | Tracker name in DB | `"SyncProductMasterJda"` | `"SyncProductBarcodeJda"` |
+| 6 | `BatchSize` config read | Correct appsettings key | `BatchSize = 10000` | Verify same ceiling applies |
+
+#### Verification Script
+
+After cloning, grep for the source service's unique identifiers:
+
+```bash
+# Must return 0 hits in the cloned file — any hit = unreplaced copy-paste
+grep -n "SpcJdaProductStaging" SyncProductBarcodeJda.cs
+grep -n "SyncProductMasterJda" SyncProductBarcodeJda.cs
+grep -n "JdaProductMaster"     SyncProductBarcodeJda.cs
+```
+
+#### When NOT to Use (avoid over-applying)
+
+- Clones that share the same staging table intentionally — skip touch point 1 and 2, but verify the rest.
+- New services built from scratch (not clones) — use as a final review checklist, not a replacement for proper design.
+
+#### Trade-offs
+
+| | Pro | Con |
+|---|---|---|
+| Checklist enforcement | Catches silent data-skip bugs before prod | Adds review step to clone process |
+| Grep verification | Zero cost, runs in 1 second | Must be added to PR checklist / CI |
+
+#### Decision Rule
+
+> If you cloned an EF Core ETL sync service → run this checklist before merging. Every touch point must be independently verified — the compiler will not catch a valid DbSet call on the wrong table.
+
+---

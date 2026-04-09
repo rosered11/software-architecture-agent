@@ -535,7 +535,7 @@ Date:             2026-04-01
 | [EF Core](#ef-core) | When to use Include vs batch, projection, split query |
 | [Kafka & Messaging](#kafka--messaging) | Retry count, DLQ routing, partition strategy, Outbox trigger |
 | [Caching](#caching) | When to add cache, TTL, invalidation strategy |
-| [Data Ingestion (ETL/FTP)](#data-ingestion-etlftp) | Staging trigger, validation gate, chunk size |
+| [Data Ingestion (ETL/FTP)](#data-ingestion-etlftp) | Staging trigger, validation gate, chunk size, ETL TX scope |
 | [API Design](#api-design) | Pagination threshold, timeout, idempotency trigger |
 | [Architecture Patterns](#architecture-patterns) | When to introduce CQRS, Saga, Repository, Circuit Breaker |
 | [System Design](#system-design) | Microservice split trigger, event vs direct call, retry strategy |
@@ -1051,10 +1051,35 @@ Chunk size for file processing:
 ```
 
 ```
+ETL transaction scope:
+  batch_count × avg_batch_latency > 10,000ms  → per-batch commit mandatory
+  batch_count × avg_batch_latency < 5,000ms   → single TX acceptable
+  MySQL target (default config)                → assume innodb_lock_wait_timeout = 50s
+
+  while(true) batch loop + DB writes?          → TX MUST be inside the loop, never outside
+  BeginTransaction() before a while loop?      → architectural bug — move inside loop immediately
+  Polly retries on ETL job?                    → only effective with per-batch idempotent cursor
+  Airflow retries on .NET subprocess job?      → add retries=2, retry_delay=5min, subprocess timeout=7200s
+```
+
+```
 Validation gate:
 Hard validation failure (missing required field, wrong type) → reject row, log, continue
 Soft validation failure (unexpected value, out of range)     → flag row, process with default
 All rows in file fail validation                             → reject file, alert, do not partially apply
+```
+
+```
+
+```
+ETL batch observability (mandatory after any timeout fix):
+  Batch loop writing to DB?                    → Prometheus Histogram on TX hold time
+  Total records > 100K?                        → Counter + Gauge (round) + GC Summary
+  Job orchestrated by scheduler?               → Alerting required — logs alone insufficient
+  Alert thresholds:                            → WARN P95 > 5s, CRIT P95 > 30s (for MySQL 50s default)
+  Overhead budget:                             → < 0.1% of batch duration for all instrumentation
+  5 required metrics: batch_duration_seconds (Histogram), records_processed_total (Counter),
+    current_batch_round (Gauge), staging_read_seconds (Histogram), batch_alloc_bytes (Summary)
 ```
 
 ```
@@ -1584,4 +1609,125 @@ Availability → downtime budget:
   99.99% → 52.6 min/year (target for customer-facing)
   99.999%→ 5.26 min/year (financial / payments target)
 ```
+
+---
+
+### D16: Transaction Scope for Bulk ETL Operations — Per-Batch vs Single TX
+
+```
+Title:            Transaction Scope for Bulk ETL Operations — Per-Batch vs Single TX
+Context:          .NET ETL job syncing large record volumes from staging to MySQL production
+                  via EF Core + batch loop, orchestrated by Airflow.
+Problem:          Where should the transaction boundary sit — wrapping the entire job (single TX)
+                  or wrapping each individual batch (per-batch commit)?
+Options Considered:
+  A. Single TX — atomic across all records. Simple code.
+     Fails at scale: TX hold = batch_count × latency = 210s >> 50s MySQL timeout.
+     0 records committed on failure. Eliminated by BotE.
+  B. Per-Batch Commit — TX hold = 1 batch duration (~700ms). Safe against all MySQL timeouts.
+     Idempotent restart via monotonic cursor. On failure only in-flight batch is lost.
+     Trade-off: partial sync visible in prod during run. Acceptable for ETL.
+  C. Chunked Multi-Batch TX — commit every N batches. More complex than B, no significant benefit.
+Decision:         Option B — Per-Batch Commit.
+Rationale:        BotE eliminates Option A (210s >> 50s). Option C adds complexity for no gain.
+                  Option B is the canonical ETL pattern, compatible with existing cursor design.
+Trade-offs:       Accept partial sync visibility in production during job execution.
+                  Accept per-batch (not per-job) atomicity — standard ETL consistency model.
+Expected Outcome: Zero MySQL timeout failures. Max 1 batch re-synced on failure. Effective Airflow
+                  retry behavior (resumes from cursor, not from zero).
+Rules:
+  batch_count × avg_batch_latency > 10s?  → per-batch commit mandatory
+  while(true) loop with DB writes?         → TX MUST be inside the loop, never outside
+  BeginTransaction() before a while loop?  → architectural bug — requires immediate fix
+  Polly retries on ETL?                    → only useful with per-batch commit (preserves progress)
+  Airflow retries on .NET subprocess job?  → add retries=2, retry_delay=5min, subprocess timeout = BotE_realistic × 3
+Related Knowledge:  → K30, K32
+Related Pattern:    → P24, P25
+Related Incidents:  → I3, I4, I5, I6
+Related Tech Assets:→ TA19, TA20
+Date:             2026-04-07
+```
+
+---
+
+### D17: ETL Batch Observability Strategy — Prometheus Metrics vs Log-Only
+
+```
+Title:            ETL Batch Observability Strategy — Prometheus Metrics vs Log-Only
+Context:          .NET ETL job (SyncProductMasterJda) syncing 3M records to MySQL via per-batch
+                  commit loop. Post-I3 fix: per-batch TX eliminates timeout. But zero metrics
+                  on batch resource consumption — no early warning for latency drift.
+Problem:          How should we instrument the ETL batch loop — structured logs only (low effort)
+                  or Prometheus metrics + logs (slightly more effort, enables alerting)?
+Options Considered:
+  A. Structured logging only — add Stopwatch + GC to log per batch. No Prometheus.
+     Pro: Zero dependency. Con: No alerting, no trend visualization, must grep logs to detect drift.
+  B. Prometheus metrics + structured logging — Histogram for TX hold, Counter for records,
+     Summary for GC alloc, plus structured log per batch.
+     Pro: Real-time dashboard, P95 alerts, trend detection. Con: Requires prometheus-net dependency.
+  C. OpenTelemetry traces — span per batch with attributes.
+     Pro: Distributed trace context. Con: Heavier setup, ETL is single-process (no distributed trace needed).
+Decision:         Option B — Prometheus metrics + structured logging.
+Rationale:        Stack already uses Prometheus (tech stack spec). ETL runs unattended on Airflow —
+                  alerting is non-negotiable. Logs alone require manual grep to detect trends.
+                  Prometheus Histograms give P50/P95/P99 automatically. Overhead: ~0.02% of batch duration.
+Trade-offs:       Requires prometheus-net NuGet package. Static metric fields in class. Minimal.
+Expected Outcome: Grafana dashboard showing batch duration trend per sync job. Alert fires when
+                  P95 batch TX hold > 5s (warn) or > 30s (crit) — well before MySQL 50s timeout.
+Rules:
+  ETL batch loop writing to DB?                → Prometheus Histogram on TX hold time mandatory
+  Total records > 100K?                        → Counter + Gauge (round) mandatory
+  Job orchestrated by scheduler (Airflow)?     → Alerting required — logs alone insufficient
+  Overhead > 0.1% of batch duration?           → Remove instrument — too expensive
+Related Knowledge:  → K31, K32
+Related Pattern:    → P25
+Related Incidents:  → I3, I4, I5
+Related Tech Assets:→ TA20, TA21
+Date:             2026-04-08
+```
+
+
+---
+
+### D18: Max Batch Size for MySQL ETL — 10K Records Hard Ceiling
+
+```
+Title:       Max Batch Size for MySQL ETL — 10K Records Hard Ceiling
+Context:     SyncProductMasterJda / SyncProductBarcodeJda running with BatchSize=20K.
+             Airflow logs show TX hold 27-40s per batch (Batch 1: 39,689ms = 79% of
+             MySQL 50s innodb_lock_wait_timeout). CRIT alert fires for Batches 1, 9, 10.
+Problem:     What is the correct upper bound for batch size in this ETL workload?
+Decision:    BatchSize = 10,000 records. Hard ceiling. Never exceed without re-running BotE.
+Rationale:   BotE formula: tx_hold approx (batch_size / 10K) x 14s
+             Safety margin rule: tx_hold < timeout x 0.5 (50% headroom)
+             10K -> 14s = 28% of 50s limit  (safe)
+             20K -> 28-40s = 56-80% of limit (CRITICAL — CRIT alert firing)
+IF/THEN Rules:
+  BatchSize <= 10K AND tx_hold_p95 < 14s  -> batch healthy, no change
+  BatchSize <= 10K AND tx_hold_p95 > 14s  -> investigate write-side latency
+  BatchSize > 10K                          -> reduce to 10K immediately
+  tx_hold_p95 > 30s                        -> CRIT alert, reduce batch size
+Related Knowledge:  → K30, K33
+Related Pattern:    → P24, P26
+Related Incidents:  → I3, I5, I6
+Date:               2026-04-08
+```
+
+#### BotE
+
+| Batch Size | TX Hold | % of 50s MySQL timeout | Risk |
+|---|---|---|---|
+| 10K (target) | ~14s | 28% | Safe |
+| 20K (current) | ~28-40s | 56-80% | CRITICAL |
+| 25K | ~35s | 70% | CRIT alert |
+| 36K | ~50s | 100% | Certain timeout |
+
+Safety margin = 50% of timeout -> max safe tx_hold = 25s. Round down to 10K to account
+for write-latency variance (index degradation, lock contention, GC pause).
+
+#### Decision
+
+BatchSize = 10000 in appsettings.json. Not a code change — config entry read by
+ConfigurationHelper.GetBatchSize(configuration). Never increase without re-running BotE
+formula against current observed avg_write_ms from Prometheus etl_sync_batch_duration_seconds.
 

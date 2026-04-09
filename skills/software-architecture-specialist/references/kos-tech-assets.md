@@ -840,3 +840,388 @@ Related Checklist:  → review-checklists.md: Checklist: Test Coverage (.NET / x
 
 ---
 
+### TA19: C# EF Core Per-Batch Commit Template with Polly Timeout Policy
+
+```
+Name:             C# EF Core Per-Batch Commit Template with Polly Timeout Policy
+Type:             Pattern Implementation
+Language:         C#
+Stack:            .NET 8, EF Core 8, Pomelo.EntityFrameworkCore.MySql, Polly v7+
+Usage:            Drop-in replacement for ProcessSyncLoopAsync() that wraps a while(true) batch
+                  loop in a single TX. Requires monotonic source cursor (WHERE Id > lastId).
+                  Fill in GetProductStaging(), SyncProductMasterAsync() with your types.
+Related Knowledge:  → K30
+Related Pattern:    → P24, P25
+Related Decisions:  → D16, D17
+Related Incidents:  → I3, I4, I5, I6
+Related Tech Assets:→ TA20 (observability instrumentation)
+```
+
+#### Per-Batch Commit Loop
+
+```csharp
+protected override async Task<long> ProcessSyncLoopAsync(
+    long startingId,
+    Dictionary<string, ProductMasterActivity> productMasterActivityTracking,
+    CancellationToken cancellationToken)
+{
+    var hasData = await CheckPendingAsync(startingId, cancellationToken);
+    if (!hasData)
+    {
+        logger.LogWarning(Shared.LoggingHelper.MESSAGE_WITOUT_DATA_SYNC, SyncName, businessUnit);
+        return startingId;
+    }
+
+    // Polly: retry transient DB errors per batch (exponential backoff: 2s, 4s, 8s)
+    var retryPolicy = Policy
+        .Handle<MySqlException>(ex => IsTransient(ex))
+        .Or<TimeoutRejectedException>()
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+            onRetry: (ex, delay, attempt, _) =>
+                logger.LogWarning(ex, "Batch {Round} retry {Attempt} after {Delay}s",
+                    round, attempt, delay.TotalSeconds));
+
+    // Polly: hard timeout per batch (60s ceiling)
+    var timeoutPolicy = Policy.TimeoutAsync(60, TimeoutStrategy.Optimistic);
+    var batchPolicy = Policy.WrapAsync(retryPolicy, timeoutPolicy);
+
+    long lastProcessedId = startingId;
+    int round = 1;
+
+    while (true)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Read batch BEFORE opening TX — minimizes TX hold to write-only duration (~200ms)
+        var productStagings = await GetProductStaging(lastProcessedId, cancellationToken);
+        if (productStagings.Count == 0)
+        {
+            logger.LogInformation(LoggingHelper.MESSAGE_TRACKING_END_BATCH, SyncName);
+            break;
+        }
+
+        await batchPolicy.ExecuteAsync(async ct =>
+        {
+            // Per-batch TX: hold time ≈ insert duration only (~200ms for 10K rows)
+            await using var tx = await context.Database.BeginTransactionAsync(ct);
+            try
+            {
+                await SyncProductMasterAsync(
+                    productStagings, productMasterActivityTracking, ct);
+                await tx.CommitAsync(ct);
+
+                // Advance cursor AFTER commit — safe: if commit fails, cursor stays back
+                lastProcessedId = productStagings.Last().Id;
+                logger.LogInformation(
+                    LoggingHelper.MESSAGE_TRACKING_PER_BATCH,
+                    SyncName, round, productStagings.Count, lastProcessedId);
+                round++;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, Shared.LoggingHelper.MESSAGE_ROLLBACK, SyncName, businessUnit);
+                try { await tx.RollbackAsync(ct); }
+                catch (Exception rbEx)
+                {
+                    // Dead connection — rollback will also fail. Log and swallow.
+                    logger.LogError(rbEx, "Rollback failed for batch {Round}", round);
+                }
+                throw; // rethrow for Polly retry
+            }
+        }, cancellationToken);
+
+        // Persist staging state per-batch, after production commit
+        await stagingContext.SaveChangesAsync(cancellationToken);
+    }
+
+    return lastProcessedId;
+}
+
+/// <summary>Transient MySQL error codes safe to retry.</summary>
+private static bool IsTransient(MySqlException ex) => ex.Number is
+    1205 or  // ER_LOCK_WAIT_TIMEOUT
+    1213 or  // ER_LOCK_DEADLOCK
+    2006 or  // CR_SERVER_GONE_ERROR
+    2013;    // CR_SERVER_LOST
+```
+
+#### DbContext Registration — add CommandTimeout
+
+```csharp
+// Program.cs / DI setup
+services.AddDbContext<DbSpcProductContext>(options =>
+    options.UseMySql(
+        connectionString,
+        ServerVersion.AutoDetect(connectionString),
+        o => o.CommandTimeout(120)));   // 2-min per-statement ceiling
+```
+
+#### Airflow DAG Fix — airflow.py
+
+```python
+from datetime import timedelta
+
+# Inside run_dotnet_exe():
+try:
+    exit_code = result.wait(timeout=7200)   # 2h hard ceiling
+except subprocess.TimeoutExpired:
+    result.kill()
+    raise Exception(".NET job exceeded maximum allowed runtime of 2 hours")
+
+# In PythonOperator:
+retries=2,
+retry_delay=timedelta(minutes=5),
+execution_timeout=timedelta(hours=3),
+```
+
+---
+
+### TA20: ETL Batch Resource Tracking — Prometheus + Stopwatch + GC (.NET)
+
+```
+Name:             ETL Batch Resource Tracking — Prometheus + Stopwatch + GC
+Type:             Pattern Implementation
+Language:         C#
+Stack:            .NET 8, Prometheus-net, EF Core 8
+Usage:            Drop-in instrumentation block for any ETL batch loop with DB writes.
+                  Provides 6 Prometheus metrics + Stopwatch + GC allocation + heap delta tracking.
+                  Includes ChangeTracker.Clear() + tracking dictionary clear after each commit.
+                  Copy static field declarations + batch block into sync class.
+Related Knowledge:  → K31, K32
+Related Pattern:    → P25
+Related Decisions:  → D17
+Related Incidents:  → I3, I4, I5
+```
+
+#### Static Prometheus Field Declarations
+
+```csharp
+// Add to sync class — static fields, one per metric
+private static readonly Histogram BatchDuration = Metrics
+    .CreateHistogram("etl_sync_batch_duration_seconds",
+        "Per-batch TX hold time (staging read excluded)",
+        new HistogramConfiguration
+        {
+            Buckets = Histogram.ExponentialBuckets(0.1, 2, 10), // 0.1s → 51.2s
+            LabelNames = new[] { "sync_name", "business_unit" }
+        });
+
+private static readonly Counter RecordsProcessed = Metrics
+    .CreateCounter("etl_sync_records_processed_total",
+        "Cumulative records committed",
+        new CounterConfiguration { LabelNames = new[] { "sync_name", "business_unit" } });
+
+private static readonly Gauge CurrentBatchRound = Metrics
+    .CreateGauge("etl_sync_current_batch_round",
+        "Current batch round number (resets per job run)",
+        new GaugeConfiguration { LabelNames = new[] { "sync_name", "business_unit" } });
+
+private static readonly Histogram StagingReadDuration = Metrics
+    .CreateHistogram("etl_sync_staging_read_seconds",
+        "Per-batch staging read duration",
+        new HistogramConfiguration
+        {
+            Buckets = Histogram.ExponentialBuckets(0.05, 2, 8), // 50ms → 6.4s
+            LabelNames = new[] { "sync_name", "business_unit" }
+        });
+
+private static readonly Summary BatchMemoryAlloc = Metrics
+    .CreateSummary("etl_sync_batch_alloc_bytes",
+        "GC allocation per batch",
+        new SummaryConfiguration { LabelNames = new[] { "sync_name", "business_unit" } });
+```
+
+#### Per-Batch Instrumentation Block (inside while loop)
+
+```csharp
+var labels = new[] { SyncName, businessUnit.ToString() };
+
+// ── Track staging read ──
+var readSw = Stopwatch.StartNew();
+var productStagings = await GetProductStaging(lastIdFromStaging, cancellationToken);
+readSw.Stop();
+StagingReadDuration.WithLabels(labels).Observe(readSw.Elapsed.TotalSeconds);
+
+if (productStagings.Count == 0) break;
+
+// ── Track per-batch TX hold + memory ──
+long gcBefore = GC.GetTotalAllocatedBytes(precise: false);
+var batchSw = Stopwatch.StartNew();
+
+await using var tx = await context.Database.BeginTransactionAsync(cancellationToken);
+try
+{
+    await SyncProductMasterAsync(productStagings, productMasterActivityTracking, cancellationToken);
+    await tx.CommitAsync(cancellationToken);
+
+    batchSw.Stop();
+    long gcAfter = GC.GetTotalAllocatedBytes(precise: false);
+
+    // ── Record metrics ──
+    BatchDuration.WithLabels(labels).Observe(batchSw.Elapsed.TotalSeconds);
+    RecordsProcessed.WithLabels(labels).Inc(productStagings.Count);
+    CurrentBatchRound.WithLabels(labels).Set(round);
+    BatchMemoryAlloc.WithLabels(labels).Observe(gcAfter - gcBefore);
+
+    logger.LogInformation(
+        "[{SyncName}] Batch {Round}: {Count} records, TX hold {TxHoldMs}ms, "
+        + "staging read {ReadMs}ms, alloc {AllocMB:F1}MB, total {Total}, elapsed {JobSec:F0}s",
+        SyncName, round, productStagings.Count,
+        batchSw.ElapsedMilliseconds, readSw.ElapsedMilliseconds,
+        (gcAfter - gcBefore) / 1_048_576.0,
+        totalRecordsProcessed, jobStopwatch.Elapsed.TotalSeconds);
+    round++;
+}
+catch (Exception ex)
+{
+    batchSw.Stop();
+    logger.LogError(ex,
+        "[{SyncName}] Batch {Round} FAILED after {TxHoldMs}ms — total committed: {Total}",
+        SyncName, round, batchSw.ElapsedMilliseconds, totalRecordsProcessed);
+    try { await tx.RollbackAsync(cancellationToken); }
+    catch (Exception rbEx)
+    {
+        logger.LogError(rbEx, "Rollback failed for batch {Round}", round);
+    }
+    throw;
+}
+```
+
+#### Job Summary Log (after while loop)
+
+```csharp
+jobStopwatch.Stop();
+logger.LogInformation(
+    "[{SyncName}] Job complete: {Total} records in {Rounds} batches, "
+    + "{JobSec:F1}s total, avg {AvgMs:F0}ms/batch",
+    SyncName, totalRecordsProcessed, round - 1,
+    jobStopwatch.Elapsed.TotalSeconds,
+    round > 1 ? jobStopwatch.Elapsed.TotalMilliseconds / (round - 1) : 0);
+```
+
+---
+
+
+### TA21: Airflow PythonOperator — Subprocess Kill on Task Termination
+
+```
+Name:             Airflow PythonOperator Subprocess Kill Pattern
+Type:             Code Snippet
+Language:         Python
+Stack:            Apache Airflow 2.x, subprocess.Popen
+Usage:            Guarantees the child .NET process (or any subprocess) is killed when Airflow
+                  terminates the Python callable via execution_timeout, worker shutdown, or
+                  task cancellation. Without this, the subprocess runs as an orphan indefinitely.
+                  Wrap the Popen streaming loop in try/finally — the finally block always runs.
+Related Knowledge:  → K30
+Related Incidents:  → I3, I4, I5
+```
+
+#### Pattern
+
+```python
+def run_dotnet_exe():
+    proc = subprocess.Popen(
+        ["dotnet", f"{app_path}/ETLCronjob.dll", "--process-type=" + process_type],
+        cwd=app_path, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    try:
+        print("=== .Net Logging Start ===")
+        for line in proc.stdout:
+            print(line, end="")           # streams live to Airflow task logs
+        print("=== .Net Logging End ===")
+
+        exit_code = proc.wait()
+        if exit_code != 0:
+            raise Exception(f".NET job failed with exit code {exit_code}")
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()                   # reap zombie to free PID
+        raise
+    finally:
+        if proc.poll() is None:           # safety net
+            proc.kill()
+            proc.wait()
+```
+
+#### Why `result.wait(timeout=7200)` after the streaming loop is dead code
+
+```
+for line in result.stdout:   ← blocks until stdout exhausted (process already exited)
+    print(line)
+result.wait(timeout=7200)    ← process is dead, timeout never fires
+```
+
+Real timeout guard = `execution_timeout=timedelta(hours=3)` on PythonOperator.
+try/finally ensures subprocess is killed when that timeout fires.
+
+---
+
+### TA22: ETL Clone Verification Diff — SyncProduct*Jda Touch Points
+
+```
+Name:             ETL Clone Verification Diff — SyncProduct*Jda Touch Points
+Type:             Code Review Checklist / Copy-Paste Safety
+Language:         C# / .NET
+Related Incidents:   → I6
+Related Knowledge:   → K33
+Related Patterns:    → P26
+Related Decisions:   → D18
+Date:             2026-04-08
+```
+
+Use this as a PR diff checklist when creating a new SyncProduct*Jda service by cloning
+an existing one. All 6 touch points must be updated independently.
+
+```csharp
+// ── CLONE VERIFICATION: 6 touch points, verify each independently ──────────────────
+
+// TOUCH POINT 1 — Class name (constructor)
+// Source:  public sealed class SyncProductMasterJda(...)
+// Clone:   public sealed class SyncProductBarcodeJda(...)  ← update class name
+
+// TOUCH POINT 2 — Staging DbSet in GetProductStaging()
+// Source:  stagingContext.SpcJdaProductStaging
+// Clone:   stagingContext.SpcJdaBarcodeStaging  ← MUST update — independent from TP3!
+
+// TOUCH POINT 3 — Staging DbSet in CheckPendingAsync()
+// Source:  stagingContext.SpcJdaProductStaging.AnyAsync(x => x.Id > lastId, ...)
+// Clone:   stagingContext.SpcJdaBarcodeStaging.AnyAsync(x => x.Id > lastId, ...)
+//          ↑ MOST COMMONLY MISSED — compiler does NOT catch wrong table reference
+
+// TOUCH POINT 4 — serviceType property
+// Source:  protected override string serviceType => "JdaProductMaster";
+// Clone:   protected override string serviceType => "JdaProductBarcode";
+
+// TOUCH POINT 5 — SyncName / tracker key (used in DB and logs)
+// Source:  SyncName = "SyncProductMasterJda"  (defined in abstract base)
+// Clone:   SyncName = "SyncProductBarcodeJda"  ← check base class or override
+
+// TOUCH POINT 6 — BatchSize config value
+// Source:  BatchSize = 10000  (appsettings.json)
+// Clone:   verify same 10K ceiling applies for new workload
+//          if write volume differs, re-run BotE: tx_hold = (batch_size/10K) x 14s < 25s
+```
+
+#### Post-Clone Grep Verification (run before merging)
+
+```bash
+# Replace SyncProductBarcodeJda with your new file name
+CLONE_FILE="SyncProductBarcodeJda.cs"
+SOURCE_DBSET="SpcJdaProductStaging"
+
+echo "=== Checking for unreplaced copy-paste DbSet references ==="
+grep -n "$SOURCE_DBSET" "$CLONE_FILE" && echo "BUG: wrong DbSet reference found!" || echo "PASS"
+
+SOURCE_SYNCNAME="SyncProductMasterJda"
+echo "=== Checking for unreplaced SyncName ==="
+grep -n "$SOURCE_SYNCNAME" "$CLONE_FILE" && echo "BUG: old SyncName found!" || echo "PASS"
+```
+
+Expected output: both checks return `PASS`. Any `BUG:` line = fix before merge.
+
