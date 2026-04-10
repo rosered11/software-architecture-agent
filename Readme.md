@@ -3,8 +3,6 @@
 ## Resume session
 
 ```
-claude --resume e73d3473-25dc-401d-86b1-3877bbb165dc -> original
-
 claude --resume ddba815c-b98f-4aa4-9bbb-b137df304f51 -> warehouse.md
 
 ```

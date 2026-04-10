@@ -1656,7 +1656,7 @@ When to Use:      batch_count × avg_batch_latency > 10s
 When NOT to Use:  All-or-nothing atomicity required across entire dataset
                   No upsert semantics on target (duplicate insert risk without unique constraint)
                   Total batch time < 5s (single TX acceptable at that scale)
-Complexity:       Low — structural refactor, no new infrastructure
+Complexity:       Low — structural refactor / no new infrastructure
 Based on Knowledge:  → K30, K32
 Related Decisions:   → D16, D17
 Related Incidents:   → I3, I4, I5, I6
@@ -1734,7 +1734,7 @@ When to Use:      Any batch loop with DB writes processing > 10K total records
                   Any ETL job orchestrated by Airflow/scheduler (no interactive visibility)
 When NOT to Use:  One-off scripts with < 1K records (log is sufficient)
                   Inner loops within a single batch (too granular — per-batch is the right level)
-Complexity:       Low — adds ~15 lines of instrumentation, no new infrastructure
+Complexity:       Low — adds ~15 lines of instrumentation / no new infrastructure
 Based on Knowledge:  → K31, K32
 Related Decisions:   → D17
 Related Incidents:   → I3, I4, I5
