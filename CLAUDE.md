@@ -22,6 +22,9 @@ Core loop: **Incident → Knowledge → Pattern → Decision → Reuse**
 ```
 skills/software-architecture-specialist/
 ├── SKILL.md                        # Agent definition and mode dispatch logic
+├── memory/                         # Project memory — Claude reads only, never synced to Notion
+│   ├── feedback_notion_sync_standard.md  # Notion sync rendering rules (ALWAYS apply)
+│   └── project_overview.md              # Project context and layout
 ├── assets/
 │   ├── career-roadmap.md           # 6-domain competency map + 2-year quarterly plan
 │   ├── notion-kos-template.md      # Notion Knowledge Operating System templates
@@ -57,15 +60,15 @@ Valid prefixes: `I` (incident), `K` (knowledge), `P` (pattern), `D` (decision), 
 
 **File → Notion database mapping:**
 
-| File                        | Notion Database  |
-|-----------------------------|------------------|
+| File                            | Notion Database  |
+|---------------------------------|------------------|
 | `references/kos-incident.md`    | Incidents (I)    |
 | `references/kos-knowledge.md`   | Knowledge (K)    |
 | `references/kos-patterns.md`    | Patterns (P)     |
 | `references/kos-decisions.md`   | Decisions (D)    |
 | `references/kos-tech-assets.md` | Tech Assets (TA) |
 
-The sync parser (`sync/kos_sync.py`) splits on `### (I|K|P|D|TA)\d+:` headers and reads only the first KV block per section. Everything below the KV block is Claude-only context.
+The sync parser (`sync/kos_sync.py`) splits on `### (I|K|P|D|TA)\d+:` headers and reads only the first KV block per section. For Pattern records, rich content below the KV block (`**Trade-offs**`, `**Decision Rule**`, `**Your Stack**`) is also extracted automatically.
 
 The `## DECISION RULES` section in `kos-decisions.md` is Claude-only; it is never synced.
 

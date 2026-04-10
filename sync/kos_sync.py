@@ -131,6 +131,96 @@ def extract_code_block(section_text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _text_after_kv(section_text: str) -> str:
+    """Return the markdown text that follows the first KV ``` block in a section."""
+    m = re.search(r"```\n.*?```", section_text, re.DOTALL)
+    return section_text[m.end():].strip() if m else ""
+
+
+def extract_pattern_rich_content(section_text: str, existing_keys: set) -> dict:
+    """
+    Parse **Heading**: sections below the KV block in a Pattern record and promote
+    them into named fields so they sync to Notion.
+
+    Handles:
+      **Trade-offs**:          → 'Trade-offs'  (markdown table, rendered by _value_to_blocks)
+      **Decision Rule**:       → 'Decision Rule' (bullet/rule lines; skipped if KV already has it)
+      **Your Stack (...)**:    → 'Snippet' + 'Language' (code block; first language wins)
+      **<Any other heading>**: → field named after the heading (code unwrapped if fenced)
+
+    KV-block fields (existing_keys) are never overwritten.
+    """
+    after_kv = _text_after_kv(section_text)
+    if not after_kv:
+        return {}
+
+    result: dict = {}
+
+    # Split on **Bold Title**: markers — each chunk starts with one heading
+    parts = re.split(r'\n(?=\*\*[^*\n]+\*\*:)', after_kv)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        hm = re.match(r'\*\*([^*\n]+)\*\*:?\s*\n?(.*)', part, re.DOTALL)
+        if not hm:
+            continue
+
+        raw_title = hm.group(1).strip()
+        body = re.sub(r'\n?---\s*$', '', hm.group(2)).strip()
+        if not body:
+            continue
+
+        lower = raw_title.lower()
+
+        # ── Trade-offs (markdown table) ──────────────────────────────────────
+        if "trade-off" in lower:
+            field, value = "Trade-offs", body
+
+        # ── Decision Rule (bullet list or plain ``` code fence) ──────────────
+        elif "decision rule" in lower:
+            field = "Decision Rule"
+            cm = re.search(r'```\w*\n(.*?)```', body, re.DOTALL)
+            value = cm.group(1).strip() if cm else body
+
+        # ── Your Stack / Stack code example → Snippet + Language ─────────────
+        elif "your stack" in lower or lower.startswith("stack"):
+            # Detect language from heading: "Your Stack (Go + file-based)" → "go"
+            lang_m = re.search(r'\(([^)]+)\)', raw_title)
+            raw_lang = re.split(r'[\s+/,]', lang_m.group(1))[0].strip() if lang_m else ""
+
+            # Collect ALL code fences in this section (e.g. P14 has SQL + C#)
+            code_blocks = re.findall(r'```(\w*)\n(.*?)```', body, re.DOTALL)
+            if code_blocks:
+                detected_lang = code_blocks[0][0].strip()
+                combined = "\n\n".join(cb[1].strip() for cb in code_blocks)
+                if "Language" not in existing_keys and "Language" not in result:
+                    result["Language"] = _lang(raw_lang or detected_lang)
+                if "Snippet" not in existing_keys and "Snippet" not in result:
+                    result["Snippet"] = combined
+            else:
+                if "Language" not in existing_keys and "Language" not in result:
+                    result["Language"] = _lang(raw_lang)
+                if "Snippet" not in existing_keys and "Snippet" not in result:
+                    result["Snippet"] = body
+            continue
+
+        # ── Generic section (BotE Impact, Real incident, Pitfall, Notes, etc.) ─
+        else:
+            field = raw_title
+            # Unwrap a code fence if the entire body is one fenced block
+            cm = re.search(r'```\w*\n(.*?)```', body, re.DOTALL)
+            value = cm.group(1).strip() if cm and cm.group(1).strip() == body.strip().lstrip('`\n').rstrip('`') else body
+
+        # KV fields take precedence; don't add duplicates
+        if field not in existing_keys and field not in result:
+            result[field] = value
+
+    return result
+
+
 def parse_kos_system_design() -> dict[str, list[dict]]:
     """
     Parse all KOS split files into records.
@@ -170,13 +260,20 @@ def parse_kos_system_design() -> dict[str, list[dict]]:
         fields["_id"]    = kos_id
         fields["_title"] = fields.get("Title") or fields.get("Name") or title
 
-        # For Tech Assets, extract the code snippet separately
+        # For Tech Assets, extract the code snippet from the KV block
         if prefix == "TA":
             snippet = extract_snippet(block_text)
             if snippet:
                 fields["Snippet"] = snippet
 
-        db_map = {"K": "knowledge", "P": "patterns", "D": "decisions", "TA": "tech_assets", "I": "incidents"}
+        # For Patterns, extract below-KV rich content (Trade-offs, Decision Rule,
+        # Your Stack code, and any other **Heading**: sections)
+        if prefix == "P":
+            rich = extract_pattern_rich_content(section, set(fields.keys()))
+            fields.update(rich)
+
+        db_map = {"K": "knowledge", "P": "patterns", "D": "decisions",
+                  "TA": "tech_assets", "I": "incidents"}
         result[db_map[prefix]].append(fields)
 
     return result
@@ -436,6 +533,24 @@ def _value_to_blocks(text: str) -> list:
                 },
             })
 
+        # Arrow-prefixed items: → Item  (Related fields, rule outcomes)
+        elif stripped.startswith("→"):
+            blocks.append({
+                "object": "block", "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": _parse_rich_text(stripped)},
+            })
+
+        # Pros: / Cons: lines — option trade-offs and Trade-offs field
+        elif re.match(r'^(Pros|Cons):\s+', stripped):
+            m = re.match(r'^(Pros|Cons):\s+(.*)', stripped)
+            label, content = m.group(1), m.group(2)
+            blocks.append({
+                "object": "block", "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": _parse_rich_text(f"**{label}:** {content}")
+                },
+            })
+
         # Regular paragraph
         else:
             blocks.append({
@@ -460,6 +575,18 @@ def _value_to_blocks(text: str) -> list:
     return blocks
 
 
+# Fields already synced as DB Select properties, or internal rendering hints —
+# skip from page body to avoid redundant heading_2 + one-word paragraphs.
+_BODY_SKIP_FIELDS = {"Type", "Domain", "Difficulty", "Category", "Complexity", "Language", "Stack Language"}
+
+# Fields whose values are multi-item lists without markdown list markers.
+# Each non-empty line is rendered as a bulleted_list_item.
+_BULLET_FIELD_NAMES = {
+    "When to Use", "When NOT to Use",
+    "Rules", "Decision Rule",
+}
+
+
 def record_to_blocks(record: dict) -> list:
     """Convert record fields to well-structured Notion page blocks."""
     skip = {"_id", "_title", "Title", "Name"}
@@ -472,28 +599,56 @@ def record_to_blocks(record: dict) -> list:
     ]
 
     for i, (key, value) in enumerate(entries):
+        # Skip pure metadata labels — already visible as DB properties
+        if key in _BODY_SKIP_FIELDS:
+            continue
+
         blocks.append({
             "object": "block", "type": "heading_2",
             "heading_2": {
                 "rich_text": [{"type": "text", "text": {"content": key}}]
             },
         })
+
         if key == "Snippet":
-            # Render as a code block using the Language field from the same record
+            # Render as a code block using the Language field from the same record.
+            # Split into 2000-char rich_text chunks to avoid Notion API truncation.
             lang = _lang(record.get("Language", ""))
+            chunks = _chunk(value, 2000)
             blocks.append({
                 "object": "block", "type": "code",
                 "code": {
-                    "rich_text": [{"type": "text", "text": {"content": value[:2000]}}],
+                    "rich_text": [{"type": "text", "text": {"content": c}} for c in chunks],
                     "language": lang,
                 },
             })
+        elif key == "Stack Example":
+            # Pattern-extracted stack code — language stored in 'Stack Language' field
+            lang = _lang(record.get("Stack Language", record.get("Language", "")))
+            chunks = _chunk(value, 2000)
+            blocks.append({
+                "object": "block", "type": "code",
+                "code": {
+                    "rich_text": [{"type": "text", "text": {"content": c}} for c in chunks],
+                    "language": lang,
+                },
+            })
+        elif key in _BULLET_FIELD_NAMES:
+            # Each non-empty line is a separate list item (no markdown markers in source)
+            for line in value.split("\n"):
+                line = line.strip()
+                if line:
+                    blocks.append({
+                        "object": "block", "type": "bulleted_list_item",
+                        "bulleted_list_item": {"rich_text": _parse_rich_text(line)},
+                    })
         else:
             blocks.extend(_value_to_blocks(value))
+
         if i < len(entries) - 1:
             blocks.append({"object": "block", "type": "divider", "divider": {}})
 
-    return blocks[:100]
+    return blocks[:200]
 
 
 def _chunk(text: str, size: int) -> list[str]:
@@ -691,6 +846,7 @@ def sync_tech_assets(notion: Client, db_id: str, records: list[dict],
             "Type":     _select(r.get("Type", "")),
             "Language": _select(r.get("Language", "")),
             "Usage":    _rtext(r.get("Usage", "")),
+            "Snippet":  _rtext(r.get("Snippet", "")),
         }
 
         # Relation: Related Knowledge → Knowledge DB

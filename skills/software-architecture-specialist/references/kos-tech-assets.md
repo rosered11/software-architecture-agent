@@ -421,6 +421,7 @@ Language:         C#
 Usage:            Full async coordinator with parallel DB calls and pure in-memory map functions.
                   Core output of the GetSubOrder Phase 1–4 refactor (incident2.cs).
 
+// Snippet:
 // MapPayments — pure in-memory, no DB calls
 private static List<PaymentModel> MapPayments(List<OrderMessagePayment> rows) =>
     rows.Select(r => new PaymentModel
@@ -467,6 +468,7 @@ Usage:            Run on a schedule (daily or weekly) or after any heavy write/d
                   Alert when dead_ratio > 5% on tables with > 100K rows.
                   Add to pg_cron, Grafana alert, or external cron scheduler.
 
+-- Snippet:
 SELECT
   schemaname,
   relname AS table_name,
@@ -499,6 +501,7 @@ Usage:            Apply to any table > 500K rows with default autovacuum setting
                   Run once — persists in pg_class until explicitly changed.
                   Scale by table size: 0.005 for > 5M rows, 0.01 for > 500K, 0.05 for > 100K.
 
+-- Snippet:
 -- For large tables (> 500K rows): trigger vacuum at ~1% dead rows
 ALTER TABLE stockadjustments SET (
   autovacuum_vacuum_scale_factor = 0.01,
@@ -536,6 +539,7 @@ Usage:            Run after detecting index bloat > 30% (reusable / total pages)
                   Does not lock the table — safe for production.
                   Requires PostgreSQL 12+.
 
+-- Snippet:
 -- Run each one at a time (not all in parallel)
 REINDEX INDEX CONCURRENTLY stockadjustments_pkey;
 REINDEX INDEX CONCURRENTLY stockadjustments_adjusted_at_idx;
@@ -692,6 +696,7 @@ Usage:            Use when the SUT accepts IDbContextFactory<OrderContext> and c
 Prerequisites:    Microsoft.EntityFrameworkCore.InMemory
                   Microsoft.EntityFrameworkCore (IDbContextFactory<T>)
 
+// Snippet:
 internal sealed class TestDbContextFactory : IDbContextFactory<OrderContext>
 {
     private readonly DbContextOptions<OrderContext> _options;
@@ -739,6 +744,7 @@ NuGet packages:
   Microsoft.EntityFrameworkCore.InMemory
   Moq
 
+// Snippet:
 public class MyMethodTests : IDisposable
 {
     private const string OrderId    = "ORD-TEST-001";
@@ -850,6 +856,8 @@ Stack:            .NET 8, EF Core 8, Pomelo.EntityFrameworkCore.MySql, Polly v7+
 Usage:            Drop-in replacement for ProcessSyncLoopAsync() that wraps a while(true) batch
                   loop in a single TX. Requires monotonic source cursor (WHERE Id > lastId).
                   Fill in GetProductStaging(), SyncProductMasterAsync() with your types.
+Snippet:          See sections below — ProcessSyncLoopAsync (per-batch TX + Polly retry/timeout),
+                  DbContext registration (CommandTimeout), Airflow DAG timeout fix.
 Related Knowledge:  → K30
 Related Pattern:    → P24, P25
 Related Decisions:  → D16, D17
@@ -989,6 +997,9 @@ Usage:            Drop-in instrumentation block for any ETL batch loop with DB w
                   Provides 6 Prometheus metrics + Stopwatch + GC allocation + heap delta tracking.
                   Includes ChangeTracker.Clear() + tracking dictionary clear after each commit.
                   Copy static field declarations + batch block into sync class.
+Snippet:          See sections below — static Prometheus field declarations (Histogram, Counter,
+                  Gauge, Summary) + per-batch instrumentation block with Stopwatch, GC tracking,
+                  ChangeTracker.Clear(), and tracking dictionary reset.
 Related Knowledge:  → K31, K32
 Related Pattern:    → P25
 Related Decisions:  → D17
