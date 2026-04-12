@@ -1,0 +1,31 @@
+{
+  "eval_id": 3,
+  "eval_name": "system-design-review-order-pipeline",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: System Design Review' or 'System Design Review' as a heading",
+      "passed": true,
+      "evidence": "The response opens with '**Mode: System Design Review**' on line 1."
+    },
+    {
+      "text": "scores-7-dimensions — All 7 dimensions scored: Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary",
+      "passed": true,
+      "evidence": "The Scorecard table includes all 7 required dimensions with numeric scores: Flow Completeness (3/5), Failure Handling (1/5), Data Consistency (2/5), Retry & Idempotency (1/5), Observability (2/5), Scalability (3/5), Security Boundary (3/5)."
+    },
+    {
+      "text": "flags-missing-retry-dlq — Response explicitly flags missing retry logic AND missing DLQ as risks",
+      "passed": true,
+      "evidence": "CRITICAL risk item states: 'No Retry and No DLQ on Go Consumer' and the fix explicitly calls for: '(1) Retry transient errors with exponential backoff (3 attempts, max 30s). (2) Route permanent errors to orders.status-update.dlq'."
+    },
+    {
+      "text": "contains-bote-numbers — BotE numbers present for 10x growth scenario",
+      "passed": true,
+      "evidence": "The Back-of-Envelope section explicitly models 10x: '10x growth target: 500 orders/min = 8.3 QPS avg. Peak at 10x (3x burst): ~25 QPS' and '90-day retention at 10x: ~130 GB'."
+    },
+    {
+      "text": "has-action-plan — Response ends with a ranked action plan",
+      "passed": true,
+      "evidence": "The response includes a ranked '## Action Plan' with Priority 1 through Priority 6 items, each with a specific action, rationale, and effort estimate."
+    }
+  ]
+}

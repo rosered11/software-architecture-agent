@@ -20,7 +20,7 @@ Core loop: **Incident → Knowledge → Pattern → Decision → Reuse**
 ## Repository Structure
 
 ```
-skills/software-architecture-specialist/
+.claude/skills/software-architecture-specialist/
 ├── SKILL.md                        # Agent definition and mode dispatch logic
 ├── memory/                         # Project memory — Claude reads only, never synced to Notion
 │   ├── feedback_notion_sync_standard.md  # Notion sync rendering rules (ALWAYS apply)

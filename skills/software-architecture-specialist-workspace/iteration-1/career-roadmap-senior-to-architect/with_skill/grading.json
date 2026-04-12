@@ -1,0 +1,31 @@
+{
+  "eval_id": 5,
+  "eval_name": "career-roadmap-senior-to-architect",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Career Roadmap' or 'Career Roadmap' as a heading",
+      "passed": true,
+      "evidence": "The response opens with '**Mode: Career Roadmap**' on line 1."
+    },
+    {
+      "text": "runs-progress-check — Scores or checks all 6 indicators: ADRs written, KOS incidents logged, system reviews done, runbooks generated, trace ID adopted, design reviews led",
+      "passed": true,
+      "evidence": "The Progress Check table explicitly scores all 6 indicators: ADRs written (0), KOS incidents fully logged (0), Systems through design review (0), Runbooks exist (0), Trace ID propagation implemented (Unknown), Design reviews led for others (0)."
+    },
+    {
+      "text": "identifies-highest-leverage-gap — Names a single highest-leverage gap",
+      "passed": true,
+      "evidence": "'## The Highest-Leverage Gap' section names a single gap: 'Domain 4: Decision Making & Architecture Documentation' with the quote 'This is the highest-leverage gap. Architects are judged on their decisions, not their code.'"
+    },
+    {
+      "text": "gives-concrete-next-action — Gives a next action specific enough to start today",
+      "passed": true,
+      "evidence": "The response provides a 5-field ADR template and states: 'Pick the last non-trivial technical decision you made this week... Write a 5-field ADR right now' with a concrete template to fill in immediately."
+    },
+    {
+      "text": "offers-roadmap-update — Offers to update career-roadmap.md",
+      "passed": true,
+      "evidence": "The final line reads: 'Would you like me to update `assets/career-roadmap.md` with your current Progress Check scores and set Month 1 targets based on this session?'"
+    }
+  ]
+}

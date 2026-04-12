@@ -1,0 +1,31 @@
+{
+  "eval_id": 1,
+  "eval_name": "pattern-guidance-bote",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Pattern Guidance' or 'Pattern Guidance' as a heading",
+      "passed": true,
+      "evidence": "The response opens with '**Mode: Pattern Guidance**' on line 1."
+    },
+    {
+      "text": "contains-bote-pool-math — Response shows BotE pool math with formula involving query_count x hold_time vs pool size, with actual numbers",
+      "passed": true,
+      "evidence": "Response shows: 'Pool = 20, p95 = 800ms → actual hold time under load = 800ms. Concurrent connections at peak: 100 QPS × 0.800s = 80 connections needed vs 20 pool = pool exhausted (400% over capacity)'."
+    },
+    {
+      "text": "covers-both-options — Response addresses both Redis caching AND batch reads as options",
+      "passed": true,
+      "evidence": "Response has a dedicated '## Pattern A: Batch Reads' section and a '## Pattern B: Redis Caching (Look-Aside)' section, each with full details."
+    },
+    {
+      "text": "has-when-not-to-use — Response includes a 'when NOT to use' section for at least one option",
+      "passed": true,
+      "evidence": "Both Pattern A and Pattern B include explicit '**When NOT to USE:**' subsections with concrete conditions."
+    },
+    {
+      "text": "has-decision-rule — Response has a concrete if/then decision rule (not just 'it depends')",
+      "passed": true,
+      "evidence": "The '## Decision Rule' section contains explicit if/then logic: 'IDs unique per event? → Batch Reads only (Redis hit rate ~0%). IDs repeat heavily + data stable? → Batch Reads + Redis layer on top. Unsure? → Batch first, measure, then decide on Redis'."
+    }
+  ]
+}

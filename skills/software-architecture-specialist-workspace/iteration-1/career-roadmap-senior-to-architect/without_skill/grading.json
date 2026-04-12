@@ -1,0 +1,31 @@
+{
+  "eval_id": 5,
+  "eval_name": "career-roadmap-senior-to-architect",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Career Roadmap' or 'Career Roadmap' as a heading",
+      "passed": false,
+      "evidence": "The response title is 'From Senior Developer to Software Architect: Where to Focus First' — no 'Mode: Career Roadmap' label or 'Career Roadmap' heading appears anywhere in the response."
+    },
+    {
+      "text": "runs-progress-check — Scores or checks all 6 indicators: ADRs written, KOS incidents logged, system reviews done, runbooks generated, trace ID adopted, design reviews led",
+      "passed": false,
+      "evidence": "The response does not score or check any of the 6 indicators. It mentions ADRs and design sessions but does not address KOS incidents logged, runbooks generated, trace ID adopted, or provide a progress check against defined metrics."
+    },
+    {
+      "text": "identifies-highest-leverage-gap — Names a single highest-leverage gap",
+      "passed": true,
+      "evidence": "The response identifies 'decision ownership and communication' as the core gap, and singles out writing ADRs as 'Priority 1' — the highest-leverage entry point named explicitly."
+    },
+    {
+      "text": "gives-concrete-next-action — Gives a next action specific enough to start today",
+      "passed": true,
+      "evidence": "The response states: 'Pick any significant technical decision your team made in the last 30 days and write an ADR for it retrospectively... You can start today, on your current team.'"
+    },
+    {
+      "text": "offers-roadmap-update — Offers to update career-roadmap.md",
+      "passed": false,
+      "evidence": "The response provides a 90-day plan inline but never mentions career-roadmap.md or offers to update any file with a personalized roadmap."
+    }
+  ]
+}

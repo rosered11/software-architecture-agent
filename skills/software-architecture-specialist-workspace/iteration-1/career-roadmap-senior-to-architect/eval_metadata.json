@@ -1,0 +1,27 @@
+{
+  "eval_id": 5,
+  "eval_name": "career-roadmap-senior-to-architect",
+  "prompt": "I've been a senior developer for 3 years. I write code daily but haven't led any system design sessions, written any ADRs, or formally documented incident post-mortems. I want to move toward a Software Architect role. Where should I focus first?",
+  "assertions": [
+    {
+      "text": "Response includes 'Mode: Career Roadmap' or 'Career Roadmap' as a heading",
+      "name": "contains-mode-label"
+    },
+    {
+      "text": "Response scores or checks all 6 indicators: ADRs written, KOS incidents logged, system reviews done, runbooks generated, trace ID adopted, design reviews led",
+      "name": "runs-progress-check"
+    },
+    {
+      "text": "Response names a single highest-leverage gap (not a generic list of 10 things to do)",
+      "name": "identifies-highest-leverage-gap"
+    },
+    {
+      "text": "Response gives a next action specific enough to start today (not 'read books about architecture')",
+      "name": "gives-concrete-next-action"
+    },
+    {
+      "text": "Response offers to update career-roadmap.md with evidence from this session",
+      "name": "offers-roadmap-update"
+    }
+  ]
+}

@@ -1,0 +1,279 @@
+{
+  "metadata": {
+    "skill_name": "software-architecture-specialist",
+    "skill_path": "skills/software-architecture-specialist",
+    "executor_model": "claude-sonnet-4-6",
+    "analyzer_model": "claude-sonnet-4-6",
+    "timestamp": "2026-04-12T15:00:00Z",
+    "evals_run": [1, 2, 3, 4, 5],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "eval_name": "pattern-guidance-bote",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 133.6,
+        "tokens": 30237,
+        "tool_calls": 15,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Pattern Guidance' or 'Pattern Guidance' as a heading", "passed": true, "evidence": "The response opens with '**Mode: Pattern Guidance**' on line 1."},
+        {"text": "contains-bote-pool-math — Response shows BotE pool math with formula involving query_count x hold_time vs pool size, with actual numbers", "passed": true, "evidence": "Response shows: 'Concurrent connections at peak: 100 QPS × 0.800s = 80 connections needed vs 20 pool = pool exhausted (400% over capacity)'."},
+        {"text": "covers-both-options — Response addresses both Redis caching AND batch reads as options", "passed": true, "evidence": "Response has dedicated '## Pattern A: Batch Reads' and '## Pattern B: Redis Caching (Look-Aside)' sections."},
+        {"text": "has-when-not-to-use — Response includes a 'when NOT to use' section for at least one option", "passed": true, "evidence": "Both Pattern A and Pattern B include explicit '**When NOT to USE:**' subsections with concrete conditions."},
+        {"text": "has-decision-rule — Response has a concrete if/then decision rule (not just 'it depends')", "passed": true, "evidence": "The '## Decision Rule' section contains explicit if/then logic: 'IDs unique per event? → Batch Reads only (Redis hit rate ~0%)'."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "pattern-guidance-bote",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.8,
+        "passed": 4,
+        "failed": 1,
+        "total": 5,
+        "time_seconds": 66.7,
+        "tokens": 12382,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Pattern Guidance' or 'Pattern Guidance' as a heading", "passed": false, "evidence": "The response title is 'Architecture Analysis: Redis Caching vs. Batch Reads...' — no 'Mode: Pattern Guidance' label appears anywhere."},
+        {"text": "contains-bote-pool-math — Response shows BotE pool math with formula involving query_count x hold_time vs pool size, with actual numbers", "passed": true, "evidence": "'33 queries/sec with a pool of 20 means each query must complete in under ~600ms to avoid queuing.' Shows query_count × hold_time vs pool_size reasoning with actual numbers."},
+        {"text": "covers-both-options — Response addresses both Redis caching AND batch reads as options", "passed": true, "evidence": "Dedicated 'Option A: Redis Caching' and 'Option B: Batch Reads (DataLoader Pattern)' sections."},
+        {"text": "has-when-not-to-use — Response includes a 'when NOT to use' section for at least one option", "passed": true, "evidence": "Under Option A: 'Fails when: Each event carries a unique ID never repeated (cache hit rate ~0%).'"},
+        {"text": "has-decision-rule — Response has a concrete if/then decision rule (not just 'it depends')", "passed": true, "evidence": "Decision Rule table with 'Cache hit rate > 60% AND staleness acceptable → Add Redis' and other concrete conditions."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "incident-analysis-pool-exhaustion",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 194.7,
+        "tokens": 33326,
+        "tool_calls": 14,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Incident Analysis' or 'Incident Analysis' as a heading", "passed": true, "evidence": "The response opens with '## 🔍 Mode: Incident Analysis' on line 1."},
+        {"text": "contains-bote-pool-math — Response contains BotE pool math with numbers (connections x hold_time vs pool_size)", "passed": true, "evidence": "Section 3: 'concurrent = 30 | queries = 15 | hold = 0.2s. Total hold = 30 × 15 × 0.2 = 90s/s → pool = 90% → EXHAUSTED'."},
+        {"text": "identifies-root-cause — Response names a specific root cause", "passed": true, "evidence": "6 ranked root cause hypotheses including RC-1 (long-held connections), RC-2 (DbContext not disposed), RC-3 (N+1 inside a loop)."},
+        {"text": "includes-ef-core-fix — Response gives concrete EF Core-specific fix", "passed": true, "evidence": "'var items = await _context.Orders.AsNoTracking().Where(o => ids.Contains(o.Id)).ToListAsync(); // 1 query' and fixes for DbContext disposal."},
+        {"text": "mentions-kos-capture — Response mentions generating KOS records", "passed": true, "evidence": "Section 9 'KOS RECORDS GENERATED' lists all 5 record types: I7, K34, P27, D19, and TA23 with titles."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "incident-analysis-pool-exhaustion",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.4,
+        "passed": 2,
+        "failed": 3,
+        "total": 5,
+        "time_seconds": 105.7,
+        "tokens": 13742,
+        "tool_calls": 3,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Incident Analysis' or 'Incident Analysis' as a heading", "passed": false, "evidence": "Title is 'Incident Analysis: EF Core Connection Pool Exhaustion' but no 'Mode:' dispatch label — does not follow mode-dispatch format."},
+        {"text": "contains-bote-pool-math — Response contains BotE pool math with numbers (connections x hold_time vs pool_size)", "passed": false, "evidence": "Describes pool exhaustion conceptually but shows no explicit BotE arithmetic: connections × hold_time vs pool_size formula with numbers."},
+        {"text": "identifies-root-cause — Response names a specific root cause", "passed": true, "evidence": "Names 'Leaked DbContext / Unclosed Connections (Most Common)' as top-ranked root cause, with four additional specific causes."},
+        {"text": "includes-ef-core-fix — Response gives concrete EF Core-specific fix", "passed": true, "evidence": "Provides 'Use DI scoped lifetime', 'Change to AddDbContext<T>()', 'Use IDbContextFactory<T>' with code examples."},
+        {"text": "mentions-kos-capture — Response mentions generating KOS records", "passed": false, "evidence": "No mention of KOS records, knowledge capture, or any structured incident logging system."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "eval_name": "system-design-review-order-pipeline",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 128.3,
+        "tokens": 22064,
+        "tool_calls": 6,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: System Design Review' or 'System Design Review' as a heading", "passed": true, "evidence": "Response opens with '**Mode: System Design Review**' on line 1."},
+        {"text": "scores-7-dimensions — All 7 dimensions scored: Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary", "passed": true, "evidence": "Scorecard table includes all 7 dimensions with numeric scores: Flow Completeness (3/5), Failure Handling (1/5), Data Consistency (2/5), Retry & Idempotency (1/5), Observability (2/5), Scalability (3/5), Security Boundary (3/5)."},
+        {"text": "flags-missing-retry-dlq — Response explicitly flags missing retry logic AND missing DLQ as risks", "passed": true, "evidence": "CRITICAL risk: 'No Retry and No DLQ on Go Consumer' with fix: '(1) Retry transient errors... (2) Route permanent errors to orders.status-update.dlq'."},
+        {"text": "contains-bote-numbers — BotE numbers present for 10x growth scenario", "passed": true, "evidence": "'10x growth target: 500 orders/min = 8.3 QPS avg. Peak at 10x (3x burst): ~25 QPS' and '90-day retention at 10x: ~130 GB'."},
+        {"text": "has-action-plan — Response ends with a ranked action plan", "passed": true, "evidence": "'## Action Plan' with Priority 1 through Priority 6 items, each with specific action, rationale, and effort estimate."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "eval_name": "system-design-review-order-pipeline",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.4,
+        "passed": 2,
+        "failed": 3,
+        "total": 5,
+        "time_seconds": 73.0,
+        "tokens": 12771,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: System Design Review' or 'System Design Review' as a heading", "passed": false, "evidence": "'System Design Review: Order Webhook Pipeline' — not a mode-dispatch label, doesn't follow expected skill mode format."},
+        {"text": "scores-7-dimensions — All 7 dimensions scored: Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary", "passed": false, "evidence": "Response covers gaps in free-form sections but never scores or labels the 7 required dimensions by name."},
+        {"text": "flags-missing-retry-dlq — Response explicitly flags missing retry logic AND missing DLQ as risks", "passed": true, "evidence": "'1. No Retry Logic on the Go Consumer — Risk: HIGH' and '2. No Dead Letter Queue (DLQ) — Risk: HIGH'."},
+        {"text": "contains-bote-numbers — BotE numbers present for 10x growth scenario", "passed": false, "evidence": "Mentions '10x to ~500 orders/minute' but no BotE calculation worked out with explicit numbers."},
+        {"text": "has-action-plan — Response ends with a ranked action plan", "passed": true, "evidence": "'Prioritized Recommendations' section with Immediate / Short-term / Medium-term priority tiers."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "eval_name": "architecture-decision-rest-vs-kafka",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 142.1,
+        "tokens": 30083,
+        "tool_calls": 12,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Architecture Decision' or ADR-style heading", "passed": true, "evidence": "Response includes '**Mode: Architecture Decision**' as a labeled field on line 3, with ADR-style title."},
+        {"text": "contains-bote-latency-budget — BotE includes latency budget calculation given 2-5s fulfillment time", "passed": true, "evidence": "'Concurrent requests = QPS × hold_time_s = 33.3 × 5s = ~167 held connections' — direct BotE using 2-5s fulfillment time."},
+        {"text": "covers-both-options-with-tradeoffs — Both REST and Kafka options with trade-offs for each", "passed": true, "evidence": "Option A shows pool saturation math and cascade failure; Option B shows goroutine math and storage estimates. 7-dimension comparison table."},
+        {"text": "gives-concrete-decision — Picks one option with specific justification", "passed": true, "evidence": "'**Choose Kafka Events with Transactional Outbox.**' with 5 numbered reasoning points."},
+        {"text": "has-expected-outcome-numbers — Expected outcome includes target numbers", "passed": true, "evidence": "Expected Outcome table: 'Order acceptance latency: REST 2-5s vs Kafka <50ms', 'Max sustainable QPS: REST ~2 QPS vs Kafka >1,000 QPS'."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "eval_name": "architecture-decision-rest-vs-kafka",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.6,
+        "passed": 3,
+        "failed": 2,
+        "total": 5,
+        "time_seconds": 74.0,
+        "tokens": 12777,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Architecture Decision' or ADR-style heading", "passed": false, "evidence": "Heading is 'Architecture Decision: REST vs Kafka...' — no 'Mode:' label, no formal ADR structure (Status, Context, Decision, Consequences)."},
+        {"text": "contains-bote-latency-budget — BotE includes latency budget calculation given 2-5s fulfillment time", "passed": true, "evidence": "'~33 req/sec with 2–5 second blocking calls, you need roughly 116 concurrent in-flight requests' — BotE derivation using the 2-5s processing time."},
+        {"text": "covers-both-options-with-tradeoffs — Both REST and Kafka options with trade-offs for each", "passed": true, "evidence": "'Why Synchronous REST Fails' section plus 'Why Kafka Fits This Problem' section and a 7-dimension comparative table."},
+        {"text": "gives-concrete-decision — Picks one option with specific justification", "passed": true, "evidence": "'Choose Kafka' with a concrete decision rule: 'If processing time > 500ms OR expected load > 500 req/min... → use async messaging (Kafka)'."},
+        {"text": "has-expected-outcome-numbers — Expected outcome includes target numbers", "passed": false, "evidence": "Discusses scale numbers (partitions, goroutines) but no explicit target latency reduction, throughput improvement, or p95 latency goals."}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 5,
+      "eval_name": "career-roadmap-senior-to-architect",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 67.5,
+        "tokens": 19007,
+        "tool_calls": 4,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Career Roadmap' or 'Career Roadmap' as a heading", "passed": true, "evidence": "Response opens with '**Mode: Career Roadmap**' on line 1."},
+        {"text": "runs-progress-check — Scores or checks all 6 indicators: ADRs written, KOS incidents logged, system reviews done, runbooks generated, trace ID adopted, design reviews led", "passed": true, "evidence": "Progress Check table explicitly scores all 6 indicators: ADRs written (0), KOS incidents logged (0), Systems through design review (0), Runbooks exist (0), Trace ID (Unknown), Design reviews led (0)."},
+        {"text": "identifies-highest-leverage-gap — Names a single highest-leverage gap", "passed": true, "evidence": "'## The Highest-Leverage Gap' section names a single gap: 'Domain 4: Decision Making & Architecture Documentation'."},
+        {"text": "gives-concrete-next-action — Gives a next action specific enough to start today", "passed": true, "evidence": "Provides a 5-field ADR template: 'Pick the last non-trivial technical decision you made this week... Write a 5-field ADR right now'."},
+        {"text": "offers-roadmap-update — Offers to update career-roadmap.md", "passed": true, "evidence": "Final line: 'Would you like me to update `assets/career-roadmap.md` with your current Progress Check scores and set Month 1 targets based on this session?'"}
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 5,
+      "eval_name": "career-roadmap-senior-to-architect",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.4,
+        "passed": 2,
+        "failed": 3,
+        "total": 5,
+        "time_seconds": 48.7,
+        "tokens": 11947,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "contains-mode-label — Response includes 'Mode: Career Roadmap' or 'Career Roadmap' as a heading", "passed": false, "evidence": "Title is 'From Senior Developer to Software Architect: Where to Focus First' — no 'Mode: Career Roadmap' label anywhere."},
+        {"text": "runs-progress-check — Scores or checks all 6 indicators: ADRs written, KOS incidents logged, system reviews done, runbooks generated, trace ID adopted, design reviews led", "passed": false, "evidence": "Does not score any of the 6 indicators. Mentions ADRs and design sessions but not KOS incidents, runbooks, trace ID adoption, or progress check metrics."},
+        {"text": "identifies-highest-leverage-gap — Names a single highest-leverage gap", "passed": true, "evidence": "Identifies 'decision ownership and communication' as the core gap, singles out ADRs as 'Priority 1' — explicit highest-leverage entry point."},
+        {"text": "gives-concrete-next-action — Gives a next action specific enough to start today", "passed": true, "evidence": "'Pick any significant technical decision your team made in the last 30 days and write an ADR for it retrospectively... You can start today.'"},
+        {"text": "offers-roadmap-update — Offers to update career-roadmap.md", "passed": false, "evidence": "Provides a 90-day plan inline but never mentions career-roadmap.md or offers to update any file."}
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {"mean": 1.0, "stddev": 0.0, "min": 1.0, "max": 1.0},
+      "time_seconds": {"mean": 133.2, "stddev": 47.0, "min": 67.5, "max": 194.7},
+      "tokens": {"mean": 26943, "stddev": 6279, "min": 19007, "max": 33326}
+    },
+    "without_skill": {
+      "pass_rate": {"mean": 0.52, "stddev": 0.16, "min": 0.4, "max": 0.8},
+      "time_seconds": {"mean": 73.6, "stddev": 20.5, "min": 48.7, "max": 105.7},
+      "tokens": {"mean": 12724, "stddev": 779, "min": 11947, "max": 13742}
+    },
+    "delta": {
+      "pass_rate": "+0.48",
+      "time_seconds": "+59.6",
+      "tokens": "+14219"
+    }
+  },
+  "notes": [
+    "contains-mode-label fails 100% of baseline runs — the mode-dispatch framework is entirely a skill-added behavior, not emergent from Claude's base knowledge",
+    "contains-bote-pool-math: baseline passes on Pattern Guidance (4/5) but fails on Incident Analysis — BotE is inconsistently applied without the skill's mandatory BotE protocol",
+    "Eval 1 (pattern-guidance-bote) has the highest baseline score (4/5) — baseline Claude naturally addresses both options and provides decision rules, but lacks the structured mode label",
+    "Eval 2 (incident-analysis-pool-exhaustion) and Eval 3 (system-design-review) show the largest skill delta — the 9-step incident protocol and 7-dimension scorecard are high-value structural additions",
+    "KOS capture (mentions-kos-capture) is a pure skill differentiator — baseline never mentions it",
+    "Skill adds ~60s and ~14K tokens per eval — cost of the structured reasoning, BotE tables, and KOS integration",
+    "Baseline gives good advice but lacks: mode labels, BotE arithmetic, structured scorecards, KOS integration, and career-roadmap.md offers"
+  ]
+}

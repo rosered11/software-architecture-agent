@@ -1,0 +1,31 @@
+{
+  "eval_id": 4,
+  "eval_name": "architecture-decision-rest-vs-kafka",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Architecture Decision' or ADR-style heading",
+      "passed": true,
+      "evidence": "The response includes '**Mode: Architecture Decision**' as a labeled field on line 3, preceded by an ADR-style title heading."
+    },
+    {
+      "text": "contains-bote-latency-budget — BotE includes latency budget calculation given 2-5s fulfillment time",
+      "passed": true,
+      "evidence": "The BotE section calculates: 'Concurrent requests = QPS × hold_time_s = 33.3 × 5s = ~167 held connections' directly using the 2-5s fulfillment time, and shows 'Publish latency: <5ms — order acceptance is off the fulfillment critical path'."
+    },
+    {
+      "text": "covers-both-options-with-tradeoffs — Both REST and Kafka options with trade-offs for each",
+      "passed": true,
+      "evidence": "Option A (Synchronous REST) shows pool saturation math and cascade failure risk; Option B (Kafka Events) shows consumer goroutine math and storage estimates. The Decision section explicitly compares both with trade-off reasoning."
+    },
+    {
+      "text": "gives-concrete-decision — Picks one option with specific justification",
+      "passed": true,
+      "evidence": "The response states: '**Choose Kafka Events with Transactional Outbox.**' and provides 5 numbered reasoning points explaining exactly why Kafka was chosen over REST."
+    },
+    {
+      "text": "has-expected-outcome-numbers — Expected outcome includes target numbers",
+      "passed": true,
+      "evidence": "The Expected Outcome table includes concrete numbers: 'Order acceptance latency: REST 2-5s vs Kafka <50ms', 'Max sustainable QPS: REST ~2 QPS vs Kafka >1,000 QPS'."
+    }
+  ]
+}

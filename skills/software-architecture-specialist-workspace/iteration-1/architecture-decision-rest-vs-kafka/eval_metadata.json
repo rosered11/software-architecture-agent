@@ -1,0 +1,27 @@
+{
+  "eval_id": 4,
+  "eval_name": "architecture-decision-rest-vs-kafka",
+  "prompt": "We need to decide between synchronous REST calls vs Kafka events for communication between our .NET order service and Go fulfillment service. Orders come in at ~200/minute today, expected to reach 2,000/minute in 6 months. Fulfillment processing takes 2–5 seconds. What should we choose?",
+  "assertions": [
+    {
+      "text": "Response includes 'Mode: Architecture Decision' or ADR-style heading",
+      "name": "contains-mode-label"
+    },
+    {
+      "text": "Response contains BotE latency budget calculation given 2-5s fulfillment time",
+      "name": "contains-bote-latency-budget"
+    },
+    {
+      "text": "Response covers both REST and Kafka options with explicit trade-offs for each",
+      "name": "covers-both-options-with-tradeoffs"
+    },
+    {
+      "text": "Response picks one option and gives a specific justification (not just pros/cons without a conclusion)",
+      "name": "gives-concrete-decision"
+    },
+    {
+      "text": "Expected outcome section includes target numbers (not just qualitative statements)",
+      "name": "has-expected-outcome-numbers"
+    }
+  ]
+}

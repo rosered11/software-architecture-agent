@@ -1,0 +1,31 @@
+{
+  "eval_id": 2,
+  "eval_name": "incident-analysis-pool-exhaustion",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Incident Analysis' or 'Incident Analysis' as a heading",
+      "passed": false,
+      "evidence": "The response title is 'Incident Analysis: EF Core Connection Pool Exhaustion' — while 'Incident Analysis' appears in the title, it is not labeled as 'Mode: Incident Analysis' and does not follow the expected mode-dispatch format."
+    },
+    {
+      "text": "contains-bote-pool-math — Response contains BotE pool math with numbers (connections x hold_time vs pool_size)",
+      "passed": false,
+      "evidence": "The response describes pool exhaustion conceptually but provides no explicit BotE calculation with numbers such as connections x hold_time vs pool_size. It says pool size is 100 but does not show the arithmetic."
+    },
+    {
+      "text": "identifies-root-cause — Response names a specific root cause",
+      "passed": true,
+      "evidence": "The response names 'Leaked DbContext / Unclosed Connections (Most Common)' as the top-ranked specific root cause, along with four additional specific causes."
+    },
+    {
+      "text": "includes-ef-core-fix — Response gives concrete EF Core-specific fix",
+      "passed": true,
+      "evidence": "The response provides concrete EF Core fixes including 'Use DI scoped lifetime', 'Change to AddDbContext<T>()', 'Use IDbContextFactory<T>', and 'Make entire call chain async', with code examples."
+    },
+    {
+      "text": "mentions-kos-capture — Response mentions generating KOS records",
+      "passed": false,
+      "evidence": "The response contains no mention of KOS records, knowledge capture, or any structured incident logging system."
+    }
+  ]
+}

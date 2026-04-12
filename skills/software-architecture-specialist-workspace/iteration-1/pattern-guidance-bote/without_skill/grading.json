@@ -1,0 +1,31 @@
+{
+  "eval_id": 1,
+  "eval_name": "pattern-guidance-bote",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Pattern Guidance' or 'Pattern Guidance' as a heading",
+      "passed": false,
+      "evidence": "The response title is 'Architecture Analysis: Redis Caching vs. Batch Reads for PostgreSQL Lookup Latency' — no 'Mode: Pattern Guidance' label or 'Pattern Guidance' heading appears anywhere."
+    },
+    {
+      "text": "contains-bote-pool-math — Response shows BotE pool math with formula involving query_count x hold_time vs pool size, with actual numbers",
+      "passed": true,
+      "evidence": "The response states: 'At 2,000 events/minute (~33 events/second), a pool of 20 connections should be sufficient in theory — unless queries are slow or connections are held too long... 33 queries/sec with a pool of 20 means each query must complete in under ~600ms to avoid queuing.' This shows query_count x hold_time vs pool_size reasoning with actual numbers."
+    },
+    {
+      "text": "covers-both-options — Response addresses both Redis caching AND batch reads as options",
+      "passed": true,
+      "evidence": "The response has dedicated sections 'Option A: Redis Caching' and 'Option B: Batch Reads (DataLoader Pattern)', each with full analysis."
+    },
+    {
+      "text": "has-when-not-to-use — Response includes a 'when NOT to use' section for at least one option",
+      "passed": true,
+      "evidence": "Under Option A, the response explicitly states 'Fails when: Each event carries a unique ID never repeated (cache hit rate ~0%). You pay Redis + PostgreSQL cost every time and add operational complexity for zero gain.'"
+    },
+    {
+      "text": "has-decision-rule — Response has a concrete if/then decision rule (not just 'it depends')",
+      "passed": true,
+      "evidence": "The response includes a 'Decision Rule' table with specific conditions and actions, e.g. 'Cache hit rate > 60% AND staleness acceptable → Add Redis' and 'Cache hit rate < 30% OR IDs are mostly unique → Use batch reads'."
+    }
+  ]
+}

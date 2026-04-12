@@ -1,0 +1,27 @@
+{
+  "eval_id": 3,
+  "eval_name": "system-design-review-order-pipeline",
+  "prompt": "Review this design: .NET API receives order webhooks, saves to PostgreSQL, publishes to Kafka. Go consumer reads Kafka, updates order status. No retry logic on the consumer, no DLQ. ~50 orders/minute today, expecting 10x growth.",
+  "assertions": [
+    {
+      "text": "Response includes 'Mode: System Design Review' or 'System Design Review' as a heading",
+      "name": "contains-mode-label"
+    },
+    {
+      "text": "Response scores all 7 dimensions: Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary",
+      "name": "scores-7-dimensions"
+    },
+    {
+      "text": "Response explicitly flags missing retry logic AND missing DLQ as risks",
+      "name": "flags-missing-retry-dlq"
+    },
+    {
+      "text": "Response contains BotE numbers for the 10x growth scenario (e.g. 500 orders/min, QPS calculation)",
+      "name": "contains-bote-numbers"
+    },
+    {
+      "text": "Response ends with a ranked action plan or prioritized next steps",
+      "name": "has-action-plan"
+    }
+  ]
+}

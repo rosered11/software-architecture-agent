@@ -1,0 +1,27 @@
+{
+  "eval_id": 2,
+  "eval_name": "incident-analysis-pool-exhaustion",
+  "prompt": "Our .NET API started throwing 'Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool.' yesterday at 3pm. EF Core, pool size 100, no traffic spike. How do I diagnose this?",
+  "assertions": [
+    {
+      "text": "Response includes 'Mode: Incident Analysis' or 'Incident Analysis' as a heading",
+      "name": "contains-mode-label"
+    },
+    {
+      "text": "Response contains BotE pool math with numbers (connections x hold_time vs pool_size)",
+      "name": "contains-bote-pool-math"
+    },
+    {
+      "text": "Response names a specific root cause (not just 'check your code' or generic advice)",
+      "name": "identifies-root-cause"
+    },
+    {
+      "text": "Response gives concrete EF Core-specific fix (e.g. AsNoTracking, using disposal, connection leak fix)",
+      "name": "includes-ef-core-fix"
+    },
+    {
+      "text": "Response mentions generating or creating KOS records (incident log capture)",
+      "name": "mentions-kos-capture"
+    }
+  ]
+}

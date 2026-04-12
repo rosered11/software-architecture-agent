@@ -1,0 +1,31 @@
+{
+  "eval_id": 4,
+  "eval_name": "architecture-decision-rest-vs-kafka",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Architecture Decision' or ADR-style heading",
+      "passed": false,
+      "evidence": "The response heading is 'Architecture Decision: REST vs Kafka for .NET Order Service → Go Fulfillment Service' — while it has 'Architecture Decision' in the title, there is no 'Mode:' label and it does not use a formal ADR-style structure (Status, Context, Decision, Consequences)."
+    },
+    {
+      "text": "contains-bote-latency-budget — BotE includes latency budget calculation given 2-5s fulfillment time",
+      "passed": true,
+      "evidence": "The response calculates: 'At 2,000 req/min (~33 req/sec) with 2–5 second blocking calls, you need roughly 116 concurrent in-flight requests held open at all times.' This is a BotE latency budget derivation using the 2-5s processing time."
+    },
+    {
+      "text": "covers-both-options-with-tradeoffs — Both REST and Kafka options with trade-offs for each",
+      "passed": true,
+      "evidence": "The response has a 'Why Synchronous REST Fails at This Scale' section detailing REST trade-offs and a 'Why Kafka Fits This Problem' section, plus a comparative table covering 7 dimensions for both options."
+    },
+    {
+      "text": "gives-concrete-decision — Picks one option with specific justification",
+      "passed": true,
+      "evidence": "The response states 'Choose Kafka' as the recommendation and provides a 'Decision Rule': 'If processing time > 500ms OR expected load > 500 req/min OR services cross team/language boundaries → use async messaging (Kafka).'"
+    },
+    {
+      "text": "has-expected-outcome-numbers — Expected outcome includes target numbers",
+      "passed": false,
+      "evidence": "The response discusses scale numbers (partitions, goroutines, req/min) but does not provide explicit expected outcome targets such as target latency reduction, throughput improvement percentage, or p95 latency goals after switching to Kafka."
+    }
+  ]
+}

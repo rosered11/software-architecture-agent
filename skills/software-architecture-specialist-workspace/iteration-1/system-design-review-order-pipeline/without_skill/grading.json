@@ -1,0 +1,31 @@
+{
+  "eval_id": 3,
+  "eval_name": "system-design-review-order-pipeline",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: System Design Review' or 'System Design Review' as a heading",
+      "passed": false,
+      "evidence": "The response heading is 'System Design Review: Order Webhook Pipeline' — while 'System Design Review' appears in the title, it is not labeled as a mode dispatch (e.g. 'Mode: System Design Review') and does not follow the expected skill mode format."
+    },
+    {
+      "text": "scores-7-dimensions — All 7 dimensions scored: Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary",
+      "passed": false,
+      "evidence": "The response does not use a 7-dimension scorecard. It covers gaps and strengths in free-form sections but never explicitly scores or labels Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, or Security Boundary as named dimensions."
+    },
+    {
+      "text": "flags-missing-retry-dlq — Response explicitly flags missing retry logic AND missing DLQ as risks",
+      "passed": true,
+      "evidence": "The response has two dedicated 'Critical Gaps' sections: '1. No Retry Logic on the Go Consumer — Risk: HIGH' and '2. No Dead Letter Queue (DLQ) — Risk: HIGH', both explicitly flagged."
+    },
+    {
+      "text": "contains-bote-numbers — BotE numbers present for 10x growth scenario",
+      "passed": false,
+      "evidence": "The response mentions '10x to ~500 orders/minute' and a scalability table, but does not show a BotE calculation (e.g., throughput math, connection counts, or latency projections) worked out with explicit numbers for the 10x scenario."
+    },
+    {
+      "text": "has-action-plan — Response ends with a ranked action plan",
+      "passed": true,
+      "evidence": "The response includes a 'Prioritized Recommendations' section with numbered items divided into 'Immediate', 'Short-term', and 'Medium-term' priority tiers."
+    }
+  ]
+}

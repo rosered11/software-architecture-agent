@@ -1,0 +1,145 @@
+{
+  "skill_name": "software-architecture-specialist",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "We have a Go background service processing 2,000 Kafka events per minute. Each event triggers a single PostgreSQL row lookup by ID. p95 latency is spiking to 800ms under load. Connection pool is set to 20. Should I add Redis caching or switch to batch reads?",
+      "expected_output": "Pattern Guidance response with mode label, BotE pool math (query_count x hold_time vs pool size), when to use / when NOT to use for both options, stack-specific (.NET/Go/PostgreSQL) trade-offs, and a concrete decision rule.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Response includes 'Mode: Pattern Guidance' or 'Pattern Guidance' as a heading",
+          "name": "contains-mode-label"
+        },
+        {
+          "text": "Response shows BotE pool math with formula involving query_count x hold_time vs pool size, with actual numbers",
+          "name": "contains-bote-pool-math"
+        },
+        {
+          "text": "Response addresses both Redis caching AND batch reads as options",
+          "name": "covers-both-options"
+        },
+        {
+          "text": "Response includes a 'when NOT to use' section for at least one option",
+          "name": "has-when-not-to-use"
+        },
+        {
+          "text": "Response has a concrete if/then decision rule (not just 'it depends')",
+          "name": "has-decision-rule"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Our .NET API started throwing 'Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool.' yesterday at 3pm. EF Core, pool size 100, no traffic spike. How do I diagnose this?",
+      "expected_output": "Incident Analysis with mode label, all 9 steps (Symptoms → Root Cause → BotE → Fix → Prevention → Lesson → Pattern → Decision Rule → Knowledge Capture), BotE pool math showing connections exhausted, concrete EF Core fix, and KOS record generation.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Response includes 'Mode: Incident Analysis' or 'Incident Analysis' as a heading",
+          "name": "contains-mode-label"
+        },
+        {
+          "text": "Response contains BotE pool math with numbers (connections x hold_time vs pool_size)",
+          "name": "contains-bote-pool-math"
+        },
+        {
+          "text": "Response names a specific root cause (not just 'check your code' or generic advice)",
+          "name": "identifies-root-cause"
+        },
+        {
+          "text": "Response gives concrete EF Core-specific fix (e.g. AsNoTracking, using disposal, connection leak fix)",
+          "name": "includes-ef-core-fix"
+        },
+        {
+          "text": "Response mentions generating or creating KOS records (incident log capture)",
+          "name": "mentions-kos-capture"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Review this design: .NET API receives order webhooks, saves to PostgreSQL, publishes to Kafka. Go consumer reads Kafka, updates order status. No retry logic on the consumer, no DLQ. ~50 orders/minute today, expecting 10x growth.",
+      "expected_output": "System Design Review with mode label, BotE (QPS, storage, concurrency ceiling), scores for all 7 dimensions (Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary), risks ranked by likelihood x impact, and an action plan.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Response includes 'Mode: System Design Review' or 'System Design Review' as a heading",
+          "name": "contains-mode-label"
+        },
+        {
+          "text": "Response scores all 7 dimensions: Flow Completeness, Failure Handling, Data Consistency, Retry & Idempotency, Observability, Scalability, Security Boundary",
+          "name": "scores-7-dimensions"
+        },
+        {
+          "text": "Response explicitly flags missing retry logic AND missing DLQ as risks",
+          "name": "flags-missing-retry-dlq"
+        },
+        {
+          "text": "Response contains BotE numbers for the 10x growth scenario (e.g. 500 orders/min, QPS calculation)",
+          "name": "contains-bote-numbers"
+        },
+        {
+          "text": "Response ends with a ranked action plan or prioritized next steps",
+          "name": "has-action-plan"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "We need to decide between synchronous REST calls vs Kafka events for communication between our .NET order service and Go fulfillment service. Orders come in at ~200/minute today, expected to reach 2,000/minute in 6 months. Fulfillment processing takes 2–5 seconds. What should we choose?",
+      "expected_output": "Architecture Decision in ADR format with mode label, BotE (QPS ceiling, latency budget), both options with trade-offs and BotE impact, a concrete decision with justification, expected outcome with target numbers, and risks to watch.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Response includes 'Mode: Architecture Decision' or ADR-style heading",
+          "name": "contains-mode-label"
+        },
+        {
+          "text": "Response contains BotE latency budget calculation given 2-5s fulfillment time",
+          "name": "contains-bote-latency-budget"
+        },
+        {
+          "text": "Response covers both REST and Kafka options with explicit trade-offs for each",
+          "name": "covers-both-options-with-tradeoffs"
+        },
+        {
+          "text": "Response picks one option and gives a specific justification (not just pros/cons without a conclusion)",
+          "name": "gives-concrete-decision"
+        },
+        {
+          "text": "Expected outcome section includes target numbers (not just qualitative statements)",
+          "name": "has-expected-outcome-numbers"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "I've been a senior developer for 3 years. I write code daily but haven't led any system design sessions, written any ADRs, or formally documented incident post-mortems. I want to move toward a Software Architect role. Where should I focus first?",
+      "expected_output": "Career Roadmap with mode label, 6-indicator Progress Check scored, highest-leverage gap identified, connection to competency domain, one concrete action specific enough to start today, and offer to update career-roadmap.md.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Response includes 'Mode: Career Roadmap' or 'Career Roadmap' as a heading",
+          "name": "contains-mode-label"
+        },
+        {
+          "text": "Response scores or checks all 6 indicators: ADRs written, KOS incidents logged, system reviews done, runbooks generated, trace ID adopted, design reviews led",
+          "name": "runs-progress-check"
+        },
+        {
+          "text": "Response names a single highest-leverage gap (not a generic list of 10 things to do)",
+          "name": "identifies-highest-leverage-gap"
+        },
+        {
+          "text": "Response gives a next action specific enough to start today (not 'read books about architecture')",
+          "name": "gives-concrete-next-action"
+        },
+        {
+          "text": "Response offers to update career-roadmap.md with evidence from this session",
+          "name": "offers-roadmap-update"
+        }
+      ]
+    }
+  ]
+}

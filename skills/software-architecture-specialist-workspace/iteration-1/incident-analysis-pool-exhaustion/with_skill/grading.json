@@ -1,0 +1,31 @@
+{
+  "eval_id": 2,
+  "eval_name": "incident-analysis-pool-exhaustion",
+  "expectations": [
+    {
+      "text": "contains-mode-label — Response includes 'Mode: Incident Analysis' or 'Incident Analysis' as a heading",
+      "passed": true,
+      "evidence": "The response opens with '## 🔍 Mode: Incident Analysis' on line 1."
+    },
+    {
+      "text": "contains-bote-pool-math — Response contains BotE pool math with numbers (connections x hold_time vs pool_size)",
+      "passed": true,
+      "evidence": "Section 3 BACK-OF-ENVELOPE shows: 'concurrent = 30 | queries = 15 | hold = 0.2s. Total hold = 30 × 15 × 0.2 = 90s/s → pool = 90% → EXHAUSTED' with pool_size = 100."
+    },
+    {
+      "text": "identifies-root-cause — Response names a specific root cause",
+      "passed": true,
+      "evidence": "The response lists 6 ranked root cause hypotheses including RC-1 (Long-held connections/slow queries), RC-2 (DbContext not disposed), RC-3 (N+1 inside a loop), with the conclusion: 'something is holding connections too long, not requesting too many'."
+    },
+    {
+      "text": "includes-ef-core-fix — Response gives concrete EF Core-specific fix",
+      "passed": true,
+      "evidence": "Section 5 FIXES includes EF Core code: 'var items = await _context.Orders.AsNoTracking().Where(o => ids.Contains(o.Id)).ToListAsync(); // 1 query' and fixes for DbContext disposal with 'services.AddDbContext<AppDbContext>'."
+    },
+    {
+      "text": "mentions-kos-capture — Response mentions generating KOS records",
+      "passed": true,
+      "evidence": "Section 9 'KOS RECORDS GENERATED' lists all 5 record types: I7, K34, P27, D19, and TA23 with titles."
+    }
+  ]
+}
