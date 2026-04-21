@@ -1850,3 +1850,93 @@ grep -n "JdaProductMaster"     SyncProductBarcodeJda.cs
 > If you cloned an EF Core ETL sync service → run this checklist before merging. Every touch point must be independently verified — the compiler will not catch a valid DbSet call on the wrong table.
 
 ---
+
+### P27: Airflow DAG Debug Runner — Stub-Based Local Execution Pattern
+
+```
+Title:       Airflow DAG Debug Runner — Stub-Based Local Execution
+Problem:     Airflow DAG files cannot run locally without a full Airflow installation.
+             MySqlHook, BaseHook, Variable, DAG, and PythonOperator all fail at import.
+             Debugging requires either deploying to Airflow server (slow) or having a
+             local stub layer that lets VS Code debugger attach and step through ETL logic.
+Solution:    debug_runner.py per DAG: (1) inject sys.modules stubs for all airflow.*
+             imports before the DAG file is imported; (2) replace MySqlHook with real
+             pymysql-backed implementation per conn_id; (3) mock TaskInstance (xcom_push)
+             for parent DAGs or dag_run.conf for triggered child DAGs; (4) import and
+             call the target function directly.
+When to USE:
+             → ETL logic in Airflow PythonOperator needs local step-through debugging
+             → Reproducing a production bug from logs without deploying
+             → Testing new DAG code before pushing to Airflow server
+             → Debugging child DAG conf values (XCom is resolved before conf reaches child)
+When NOT to USE:
+             → Full DAG scheduling / dependency resolution testing (use Airflow standalone)
+             → Testing Airflow-specific features (sensors, XCom between real tasks, retries)
+             → Performance benchmarking (real Airflow worker has different env)
+Complexity:        Low
+Related Incident:  I7
+Related Knowledge: K34
+Related Decision:  D19
+Related TA:        TA23
+```
+
+**Snippet** — debug_runner.py skeleton (adapt per DAG; full template in TA23):
+
+```python
+import sys, types, os
+
+for name in ["airflow", "airflow.models.dag", "airflow.operators.python",
+             "airflow.operators.trigger_dagrun", "airflow.providers.mysql.hooks.mysql",
+             "airflow.hooks.base", "airflow.models"]:
+    sys.modules[name] = types.ModuleType(name)
+
+class _NoOp:
+    def __init__(self, *a, **kw): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def __rshift__(self, other): return other
+
+sys.modules["airflow.models.dag"].DAG = _NoOp
+sys.modules["airflow.operators.python"].PythonOperator = _NoOp
+sys.modules["airflow.models"].Variable = type("V", (), {
+    "get": staticmethod(lambda k, default_var=None: default_var)
+})()
+
+# Wire real MySqlHook per conn_id (see TA23 for full _RealMySqlHook implementation)
+sys.path.insert(0, os.path.dirname(__file__))
+from ds_outbound_order import ds_inc_outbound_order_etl_data
+ds_inc_outbound_order_etl_data(ti=MockTaskInstance())
+```
+
+**Trade-offs**:
+
+| | Pro | Con |
+|---|---|---|
+| Stub approach | Zero Airflow dependency, instant F5 debug | Does not test Airflow scheduling, retries, or sensor behavior |
+| Full install | Tests real Airflow behavior | Complex setup, Docker required, slow iteration |
+| Deploy-and-check | Real environment | Slow feedback loop, no breakpoints |
+
+**Decision Rule**:
+```
+IF debugging ETL business logic (transforms, queries, DB writes) → use debug runner (P27)
+IF testing Airflow task dependencies, XCom flow, retries        → use Airflow standalone
+IF verifying prod environment behavior                           → deploy to staging Airflow
+```
+
+**Your Stack (Python / Airflow)**:
+```python
+# Snippet:
+# launch.json entry — Windows Thai locale machines
+{
+    "name": "Debug DAG",
+    "type": "debugpy",
+    "request": "launch",
+    "program": "${workspaceFolder}/ds_outbound_order/debug_runner.py",
+    "console": "integratedTerminal",
+    "stopOnEntry": false,
+    "env": {
+        "PYTHONIOENCODING": "utf-8"
+    }
+}
+```
+

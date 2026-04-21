@@ -38,12 +38,13 @@ except ImportError:
 
 ROOT         = Path(__file__).parent.parent
 CONFIG_PATH  = Path(__file__).parent / "config.json"
-KOS_SD_PATH      = ROOT / "skills/software-architecture-specialist/references/kos-system-design.md"
-KOS_KNOWLEDGE    = ROOT / "skills/software-architecture-specialist/references/kos-knowledge.md"
-KOS_PATTERNS     = ROOT / "skills/software-architecture-specialist/references/kos-patterns.md"
-KOS_DECISIONS    = ROOT / "skills/software-architecture-specialist/references/kos-decisions.md"
-KOS_TECH_ASSETS  = ROOT / "skills/software-architecture-specialist/references/kos-tech-assets.md"
-INCIDENT_PATH    = ROOT / "skills/software-architecture-specialist/references/kos-incident.md"
+_SKILL_BASE  = ROOT / ".claude/skills/software-architecture-specialist/references"
+KOS_SD_PATH      = _SKILL_BASE / "kos-system-design.md"
+KOS_KNOWLEDGE    = _SKILL_BASE / "kos-knowledge.md"
+KOS_PATTERNS     = _SKILL_BASE / "kos-patterns.md"
+KOS_DECISIONS    = _SKILL_BASE / "kos-decisions.md"
+KOS_TECH_ASSETS  = _SKILL_BASE / "kos-tech-assets.md"
+INCIDENT_PATH    = _SKILL_BASE / "kos-incident.md"
 KOS_SPLIT_PATHS  = [KOS_KNOWLEDGE, KOS_PATTERNS, KOS_DECISIONS, KOS_TECH_ASSETS, INCIDENT_PATH]
 
 # ── Config ───────────────────────────────────────────────────────────────────

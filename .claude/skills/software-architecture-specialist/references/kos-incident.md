@@ -1030,3 +1030,136 @@ internal async ValueTask<bool> CheckPendingAsync(long lastId, CancellationToken 
 | TX hold per batch | 28–40s (CRIT alert) | ~14s (28% of MySQL limit) |
 | Timeout risk | Present (Batch 1: 40s) | Eliminated (10K = 14s) |
 
+
+### I7: Airflow DAG Local Debug Setup — Multi-Layer Bug Discovery (ds_outbound_order)
+
+```
+Title:               Airflow DAG Local Debug Setup — Multi-Layer Bug Discovery
+Severity:            Medium
+System:              ds_outbound_order ETL Pipeline (Airflow + Python + .NET)
+Status:              All bugs fixed 2026-04-21. Debug environment stable.
+Date:                2026-04-21
+Problem:             Engineer setting up local VS Code debugger for Airflow DAG
+                     (ds_inc_outbound_order) encountered 6 layered bugs: 3 environment
+                     issues blocking debugpy startup, 3 code bugs in production DAG logic.
+Root Cause:          (1) Windows Thai locale (cp874) → KeyboardInterrupt in platform._syscmd_ver()
+                     blocking debugpy init. (2) PYTHONUTF8=1 fix breaks pandas import via
+                     _path_join in SQLAlchemy 1.4 venv. (3) SQLAlchemy 1.x engine.connect()
+                     has no conn.commit() — production code written for 2.x. (4) str.join()
+                     on list[int] in xcom_push → TypeError. (5) INSERT/UPDATE silently skipped
+                     after .NET job — guard (if not dih_batch_id: return) placed after dotnet
+                     ran, spc_batch_id already incremented. (6) Subprocess not killed on
+                     AirflowTaskTimeout — .NET process leaks on server.
+Lesson Learned:      Airflow DAG code is not independently testable without a stub layer.
+                     Local debug environments on Windows with non-English locale need
+                     PYTHONIOENCODING=utf-8 (not PYTHONUTF8=1 which breaks venv path handling).
+                     SQLAlchemy future=True enables 2.0-style Connection.commit() on 1.4.x
+                     without version upgrade. Guard position matters: check input early,
+                     before side effects (batch ID increment, subprocess launch).
+Prevention:          Use debug runner stub pattern (→ P27, TA23) for all Airflow DAGs.
+                     PYTHONIOENCODING=utf-8 in launch.json for Windows Thai locale machines.
+                     future=True on create_engine() in debug venv (→ D19).
+                     Guard dih_batch_id at top of function, before any side effects.
+                     try/except/finally around subprocess.Popen — kill on any exception.
+Related Knowledge:   → K34
+Related Pattern:     → P27
+Related Decisions:   → D19
+Related Tech Assets: → TA23
+```
+
+#### Symptoms
+
+- debugpy fails to start: `KeyboardInterrupt` at `platform.py:284 _syscmd_ver()` → `cp874.py:22`
+- After fix 1: pandas import fails at `_path_join` in frozen importlib
+- After fix 2: `AttributeError: 'Connection' object has no attribute 'commit'` at `_insert_chunks` line 75
+- After fix 3: `TypeError: sequence item 0: expected str instance, int found` at `xcom_push` for `total_outbound_order_success`
+- Production: INSERT into `wms_staging.st_control_table` and UPDATE `st_control_table` not executing after .NET job — intermittent (once)
+- Production: .NET subprocess continues running on server after Airflow marks task FAILED/timeout
+
+#### Root Cause — Each Bug
+
+**Bug 1 — Windows cp874 Thai locale blocks debugpy**
+```
+platform._syscmd_ver() runs subprocess(['ver']) to get Windows version.
+Output decoded with system codepage cp874 (Thai). Hangs on read → KeyboardInterrupt.
+Fix: PYTHONIOENCODING=utf-8 in launch.json — overrides stdin/stdout/stderr encoding only.
+```
+
+**Bug 2 — PYTHONUTF8=1 breaks pandas import**
+```
+PYTHONUTF8=1 (attempted fix for Bug 1) enables UTF-8 mode globally including
+import system path handling. In SQLAlchemy 1.4 venv, cache_from_source() calls
+_path_join() which fails. PYTHONUTF8 scope is too broad — breaks venv bootstrap.
+Fix: revert to PYTHONIOENCODING=utf-8 (I/O only, does not touch import machinery).
+```
+
+**Bug 3 — SQLAlchemy 1.x conn.commit() missing**
+```python
+# Production code (written for SQLAlchemy 2.x):
+with engine.connect() as conn:
+    df.to_sql(table, conn, if_exists='append', index=False)
+    conn.commit()  # AttributeError on SQLAlchemy 1.4
+
+# Debug fix (no production change):
+return create_engine(url, future=True)  # enables 2.0-style Connection on 1.4.x
+```
+
+**Bug 4 — str.join() on list[int]**
+```python
+# BEFORE (production bug):
+ti.xcom_push(key='total_outbound_order_success',
+             value=str(','.join(total_outbound_order_success)))  # list[int] → TypeError
+
+# AFTER:
+ti.xcom_push(key='total_outbound_order_success',
+             value=','.join(str(x) for x in total_outbound_order_success))
+```
+
+**Bug 5 — Guard placed after side effects (intermittent)**
+```
+spc_to_wms runs: increment spc_batch_id → launch .NET → read dih_batch_id → if empty: return
+When CO has no pending batch, dih_batch_id='' → early return silently skips INSERT/UPDATE
+but spc_batch_id was already incremented and .NET already launched = wasted work + wrong state.
+Fix: check dih_batch_id at TOP of function before any side effects.
+```
+
+**Bug 6 — Subprocess not killed on AirflowTaskTimeout**
+```python
+# BEFORE: .NET keeps running after Python thread killed by Airflow
+result = subprocess.Popen(...)
+for line in result.stdout:
+    print(line, end="")
+exit_code = result.wait()
+
+# AFTER: kill on any exception including AirflowTaskTimeout
+try:
+    for line in result.stdout: print(line, end="")
+    exit_code = result.wait()
+    if exit_code != 0: raise Exception(f"exit code {exit_code}")
+except Exception:
+    if result.poll() is None:
+        result.kill(); result.wait()
+    raise
+finally:
+    if result.poll() is None:
+        result.kill(); result.wait()
+```
+
+#### Architecture Changes Made
+
+1. **Per-CO XCom keys** — replaced comma-joined `dih_batch_id='id1,id2'` with `dih_batch_id_CDS='id1'`, `dih_batch_id_RBS='id2'` — each CO chain gets its own isolated values
+2. **Sequential per-CO chain** — `prev_task` pointer pattern generates `extract >> staging_cds >> wms_cds >> staging_rbs >> wms_rbs` from `CO_LIST` loop
+3. **execution_timeout** — `TIMEOUT_EXTRACT=1h`, `TIMEOUT_STAGING_SPC=2h`, `TIMEOUT_SPC_WMS=2h` on all operators
+4. **MS Teams on_failure_callback** — wired to `default_args` + `DAG.on_failure_callback` via `MsTeamsHook.send_failure()` in all 3 DAGs
+
+#### Results
+
+| Bug | Status | Fix Location |
+|---|---|---|
+| cp874 locale debugpy crash | Fixed | launch.json: `PYTHONIOENCODING=utf-8` |
+| PYTHONUTF8=1 pandas import | Fixed | launch.json: removed PYTHONUTF8 |
+| SQLAlchemy conn.commit() | Fixed | debug_runner.py: `future=True` |
+| str.join() on int list | Fixed | ds_outbound_order.py: `str(x) for x in` |
+| Silent early return guard | Fixed | ds_spc_order_outbound_jda_spc_to_wms.py: guard at top |
+| Subprocess not killed | Fixed | Both net DAG files: try/except/finally + kill |
+

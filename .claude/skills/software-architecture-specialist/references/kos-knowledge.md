@@ -1976,3 +1976,133 @@ grep -n "SpcJdaProductStaging" SyncProductBarcodeJda.cs
 
 After cloning any EF Core ETL service, audit **every DbSet reference** independently — staging query, `CheckPendingAsync`, and any other `AnyAsync`/`CountAsync`/`FirstOrDefaultAsync` call. See → P26 for full clone checklist.
 
+
+### K34: Airflow DAG Local Debugging — Stub-Based Runner Pattern
+
+```
+Title:       Airflow DAG Local Debugging — Stub-Based Runner Pattern
+Type:        Technique
+Domain:      ETL / Airflow / Python
+Stack:       Python, Apache Airflow, SQLAlchemy, pymysql
+Summary:     Airflow DAG files import airflow.* at module level and call
+             MySqlHook, BaseHook, Variable at runtime. Running them locally
+             requires either a full Airflow installation (complex) or a
+             stub layer that replaces airflow.* modules in sys.modules before
+             import, substituting real DB connections for Airflow hooks.
+             This enables full VS Code debugger support — breakpoints,
+             variable inspection, step-through — with zero Airflow dependency.
+When It Applies:
+             → Debugging ETL logic in Airflow PythonOperator tasks locally
+             → Reproducing production bugs without deploying to Airflow server
+             → Testing DAG task functions with controlled input data
+             → Debugging triggered child DAGs by mocking dag_run.conf (XCom values
+               are baked into conf by TriggerDagRunOperator before child DAG receives them)
+Related Incident: → I7
+Related Pattern:  → P27
+Related Decision: → D19
+Related TA:       → TA23
+```
+
+#### Core Technique
+
+**Step 1 — Stub airflow modules before import**
+```python
+# # Snippet:
+import sys, types
+
+def _stub(name):
+    mod = types.ModuleType(name)
+    sys.modules[name] = mod
+    return mod
+
+for name in ["airflow", "airflow.models.dag", "airflow.operators.python",
+             "airflow.providers.mysql.hooks.mysql", "airflow.hooks.base"]:
+    _stub(name)
+
+# Attach no-op classes to DAG/Operator stubs
+class _NoOp:
+    def __init__(self, *a, **kw): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def __rshift__(self, other): return other
+
+sys.modules["airflow.models.dag"].DAG = _NoOp
+sys.modules["airflow.operators.python"].PythonOperator = _NoOp
+```
+
+**Step 2 — Replace MySqlHook with real pymysql**
+```python
+# # Snippet:
+import pymysql, pandas as pd
+from sqlalchemy import create_engine
+
+CONNECTIONS = {
+    "spc_mysql_ds": {"host": "localhost", "port": 3306,
+                     "user": "root", "password": "", "database": "spc_ds"},
+}
+
+class _RealMySqlHook:
+    def __init__(self, mysql_conn_id=None):
+        self._cfg = CONNECTIONS[mysql_conn_id]
+    def _connect(self):
+        return pymysql.connect(**self._cfg, charset="utf8mb4", autocommit=False)
+    def get_first(self, sql, parameters=None):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, parameters)
+                return cur.fetchone()
+    def get_pandas_df(self, sql, parameters=None):
+        with self._connect() as conn:
+            return pd.read_sql(sql, conn, params=parameters)
+    def run(self, sql, parameters=None):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, parameters)
+            conn.commit()
+    def get_sqlalchemy_engine(self):
+        c = self._cfg
+        url = f"mysql+pymysql://{c['user']}:{c['password']}@{c['host']}:{c['port']}/{c['database']}?charset=utf8mb4"
+        return create_engine(url, future=True)  # future=True: enables conn.commit() on SQLAlchemy 1.4.x
+
+sys.modules["airflow.providers.mysql.hooks.mysql"].MySqlHook = _RealMySqlHook
+```
+
+**Step 3 — Mock TaskInstance (parent DAG) or dag_run.conf (child DAG)**
+```python
+# # Snippet:
+# For PythonOperator tasks (parent DAG) — mock ti.xcom_push
+class _MockTaskInstance:
+    def xcom_push(self, key, value):
+        print(f"  [XCom] {key!r} = {value!r}")
+
+# For triggered child DAGs — mock dag_run.conf
+# (TriggerDagRunOperator resolves XCom and bakes values into conf)
+class _MockDagRun:
+    def __init__(self, conf):
+        self.conf = conf
+
+MOCK_CONF = {
+    "dih_batch_id": "spcmock26042001",
+    "total_outbound_order_success": "10",
+    "owner_id": "CDS-CDS",
+}
+```
+
+#### Windows Environment Rules
+
+| Issue | Wrong fix | Correct fix |
+|---|---|---|
+| Thai locale (cp874) crashes debugpy | `PYTHONUTF8=1` | `PYTHONIOENCODING=utf-8` in launch.json |
+| Why PYTHONUTF8 wrong | Breaks venv path handling in importlib._bootstrap_external._path_join | PYTHONIOENCODING only affects stdin/stdout/stderr |
+
+#### SQLAlchemy Version Compatibility
+
+```
+flask-appbuilder 4.6.3 pins SQLAlchemy<1.5 → cannot upgrade to 2.x
+Production Airflow 3.x runs SQLAlchemy 2.x → conn.commit() works there
+
+Local debug fix: create_engine(url, future=True)
+→ SQLAlchemy 1.4 "future" mode exposes Connection.commit() / Connection.rollback()
+→ No version conflict, no production code change needed
+```
+

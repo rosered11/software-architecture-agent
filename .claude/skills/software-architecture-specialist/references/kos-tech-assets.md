@@ -1236,3 +1236,228 @@ grep -n "$SOURCE_SYNCNAME" "$CLONE_FILE" && echo "BUG: old SyncName found!" || e
 
 Expected output: both checks return `PASS`. Any `BUG:` line = fix before merge.
 
+
+
+---
+
+### TA23: Airflow DAG Local Debug Runner Template
+
+```
+Name:       Airflow DAG Local Debug Runner Template
+Type:       Python template
+Language:   Python
+Stack:      Airflow, pymysql, SQLAlchemy, pandas
+Tags:       airflow, debug, local, stub, mysql, xcom, dag_run
+Related:    I7, K34, P27, D19
+```
+
+Reusable template for running Airflow DAG tasks locally in VS Code debugpy without an Airflow installation.
+Covers two variants: **parent DAG** (XCom via MockTaskInstance) and **child DAG** (dag_run.conf via MockDagRun).
+
+#### Variant A — Parent DAG debug runner
+
+```python
+# Snippet: ds_outbound_order/debug_runner.py
+from __future__ import annotations
+import os, sys, types
+
+# 1. Stub all airflow.* modules before importing the DAG
+_AIRFLOW_MODS = [
+    "airflow", "airflow.models", "airflow.models.dag", "airflow.models.variable",
+    "airflow.operators", "airflow.operators.python", "airflow.operators.trigger_dagrun",
+    "airflow.hooks", "airflow.hooks.base",
+    "airflow.providers", "airflow.providers.mysql", "airflow.providers.mysql.hooks",
+    "airflow.providers.mysql.hooks.mysql",
+    "pendulum",
+]
+for mod in _AIRFLOW_MODS:
+    sys.modules[mod] = types.ModuleType(mod)
+
+import pymysql
+import pandas as pd
+from sqlalchemy import create_engine
+
+# 2. Connection registry (mirrors Airflow connection store)
+CONNECTIONS = {
+    'spc_mysql_ds': {
+        'host': os.environ.get('SPC_DS_HOST', 'localhost'),
+        'port': int(os.environ.get('SPC_DS_PORT', 3306)),
+        'user': os.environ.get('SPC_DS_USER', 'root'),
+        'password': os.environ.get('SPC_DS_PASSWORD', ''),
+        'database': os.environ.get('SPC_DS_DB', 'spc_ds'),
+    },
+}
+
+# 3. MySqlHook replacement
+class _RealMySqlHook:
+    def __init__(self, mysql_conn_id='default'):
+        self._cfg = CONNECTIONS[mysql_conn_id]
+
+    def _connect(self):
+        return pymysql.connect(**self._cfg, charset='utf8mb4',
+                               cursorclass=pymysql.cursors.DictCursor)
+
+    def get_first(self, sql, parameters=None):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, parameters)
+                row = cur.fetchone()
+                return tuple(row.values()) if row else None
+
+    def get_pandas_df(self, sql, parameters=None):
+        with self._connect() as conn:
+            return pd.read_sql(sql, conn, params=parameters)
+
+    def run(self, sql, parameters=None):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, parameters)
+            conn.commit()
+
+    def get_sqlalchemy_engine(self):
+        cfg = self._cfg
+        url = (f"mysql+pymysql://{cfg['user']}:{cfg['password']}"
+               f"@{cfg['host']}:{cfg['port']}/{cfg['database']}?charset=utf8mb4")
+        return create_engine(url, future=True)  # future=True -> SQLAlchemy 2.x API on 1.4.x
+
+# 4. Patch stubs
+sys.modules['airflow.providers.mysql.hooks.mysql'].MySqlHook = _RealMySqlHook
+
+class _MockVariable:
+    @staticmethod
+    def get(key, default_var=None): return default_var
+sys.modules['airflow.models.variable'].Variable = _MockVariable
+
+class _MockTaskInstance:
+    def xcom_push(self, key, value): print(f"  XCOM PUSH  {key} = {value!r}")
+    def xcom_pull(self, task_ids=None, key=None): return None
+
+# 5. Import and run the task function
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ds_outbound_order import ds_inc_outbound_order_etl_data
+
+ds_inc_outbound_order_etl_data(ti=_MockTaskInstance())
+```
+
+#### Variant B — Child DAG debug runner (dag_run.conf)
+
+```python
+# Snippet: ds_outbound_order/net/debug_runner.py
+from __future__ import annotations
+import os, sys, types
+
+_AIRFLOW_MODS = [
+    "airflow", "airflow.models", "airflow.models.dag", "airflow.models.variable",
+    "airflow.operators", "airflow.operators.python", "airflow.operators.trigger_dagrun",
+    "airflow.hooks", "airflow.hooks.base",
+    "airflow.providers", "airflow.providers.mysql", "airflow.providers.mysql.hooks",
+    "airflow.providers.mysql.hooks.mysql",
+]
+for mod in _AIRFLOW_MODS:
+    sys.modules[mod] = types.ModuleType(mod)
+
+import pymysql
+import subprocess
+
+# Simulate TriggerDagRunOperator-resolved conf.
+# In production, XCom is resolved before child DAG receives conf.
+MOCK_CONF = {
+    'parent_dag_id':                'ds_inc_outbound_order',
+    'parent_run_id':                'manual__2026-04-21T00:00:00',
+    'dih_batch_id':                 '12345',
+    'total_outbound_order_success': '10',
+    'owner_id':                     'CDS-CDS',
+}
+
+SKIP_DOTNET = True   # set False to actually run the .NET app
+
+DB_CONNECTIONS = {
+    'spc_order_mysql': {'host': os.environ.get('SPC_ORDER_HOST', 'localhost'),
+                        'schema': os.environ.get('SPC_ORDER_DB', 'spc_order'),
+                        'login': os.environ.get('SPC_ORDER_USER', 'root'),
+                        'password': os.environ.get('SPC_ORDER_PASSWORD', '')},
+    'spc_mysql_ds':    {'host': os.environ.get('SPC_DS_HOST', 'localhost'),
+                        'schema': os.environ.get('SPC_DS_DB', 'spc_ds'),
+                        'login': os.environ.get('SPC_DS_USER', 'root'),
+                        'password': os.environ.get('SPC_DS_PASSWORD', '')},
+}
+MYSQL_CONNECTIONS = {
+    'spc_mysql_ds': {'host': os.environ.get('SPC_DS_HOST', 'localhost'),
+                     'port': int(os.environ.get('SPC_DS_PORT', 3306)),
+                     'user': os.environ.get('SPC_DS_USER', 'root'),
+                     'password': os.environ.get('SPC_DS_PASSWORD', ''),
+                     'database': os.environ.get('SPC_DS_DB', 'spc_ds')},
+}
+
+class _FakeConn:
+    def __init__(self, cfg):
+        self.host = cfg['host']; self.schema = cfg['schema']
+        self.login = cfg['login']; self.password = cfg['password']
+
+class _MockBaseHook:
+    @staticmethod
+    def get_connection(conn_id): return _FakeConn(DB_CONNECTIONS[conn_id])
+sys.modules['airflow.hooks.base'].BaseHook = _MockBaseHook
+
+class _RealMySqlHook:
+    def __init__(self, mysql_conn_id='default'):
+        self._cfg = MYSQL_CONNECTIONS[mysql_conn_id]
+    def _connect(self):
+        return pymysql.connect(**self._cfg, charset='utf8mb4',
+                               cursorclass=pymysql.cursors.DictCursor)
+    def get_first(self, sql, parameters=None):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, parameters)
+                row = cur.fetchone()
+                return tuple(row.values()) if row else None
+    def run(self, sql, parameters=None):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, parameters)
+            conn.commit()
+sys.modules['airflow.providers.mysql.hooks.mysql'].MySqlHook = _RealMySqlHook
+
+if SKIP_DOTNET:
+    def _stub_popen(cmd, **kwargs):
+        print(f"[STUB] subprocess.Popen skipped: {cmd}")
+        class _FakeProc:
+            stdout = iter(["[STUB] dotnet output\n"])
+            def wait(self): return 0
+            def poll(self): return 0
+            def kill(self): pass
+        return _FakeProc()
+    subprocess.Popen = _stub_popen
+
+class _MockVariable:
+    @staticmethod
+    def get(key, default_var=None): return default_var
+sys.modules['airflow.models.variable'].Variable = _MockVariable
+
+class _MockDagRun:
+    def __init__(self, conf): self.conf = conf; self.dag_id = 'debug'; self.run_id = 'debug_run'
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ds_spc_order_outbound_jda_staging_to_spc import run_dotnet_exe
+
+run_dotnet_exe(dag_run=_MockDagRun(MOCK_CONF))
+```
+
+#### launch.json entries
+
+```json
+// Snippet: .vscode/launch.json — PYTHONIOENCODING=utf-8 fixes Windows Thai locale (cp874) in debugpy
+{
+    "name": "Debug ds_outbound_order DAG",
+    "type": "debugpy", "request": "launch",
+    "program": "${workspaceFolder}/ds_outbound_order/debug_runner.py",
+    "console": "integratedTerminal", "stopOnEntry": false, "justMyCode": false,
+    "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "SPC_DS_HOST": "localhost", "SPC_DS_PORT": "3306",
+        "SPC_DS_USER": "root", "SPC_DS_PASSWORD": "", "SPC_DS_DB": "spc_ds"
+    }
+}
+```
+
+**When to reuse:** Any Airflow DAG that needs local F5 debugging. Adapt `CONNECTIONS`/`MOCK_CONF` per DAG. Set `SKIP_DOTNET=True` to stub out external process calls during development.

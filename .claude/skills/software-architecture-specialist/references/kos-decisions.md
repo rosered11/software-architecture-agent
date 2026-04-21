@@ -1731,3 +1731,55 @@ BatchSize = 10000 in appsettings.json. Not a code change — config entry read b
 ConfigurationHelper.GetBatchSize(configuration). Never increase without re-running BotE
 formula against current observed avg_write_ms from Prometheus etl_sync_batch_duration_seconds.
 
+
+### D19: Local Debug SQLAlchemy Compatibility — future=True vs Version Upgrade
+
+```
+Title:       Local Debug SQLAlchemy Compatibility — future=True vs Version Upgrade
+Context:     debug_runner.py for Airflow DAG uses get_sqlalchemy_engine() which returns
+             a SQLAlchemy engine. Production DAG code uses engine.connect() + conn.commit()
+             (SQLAlchemy 2.x style). Local venv has SQLAlchemy 1.4.x pinned by
+             flask-appbuilder 4.6.3 (SQLAlchemy<1.5). Upgrading SQLAlchemy breaks venv
+             due to dependency conflict.
+Options:
+             A. Upgrade SQLAlchemy to 2.x — breaks flask-appbuilder 4.6.3 constraint
+             B. Change production code to engine.begin() — works on both 1.x and 2.x,
+                but changes production code to match debug limitation
+             C. future=True on create_engine() in debug runner only — enables 2.0-style
+                Connection.commit() on 1.4.x without version upgrade, no production change
+Decision:    Option C — future=True in debug_runner.py only.
+             Production code stays unchanged (conn.commit() works on Airflow server
+             which runs SQLAlchemy 2.x). Debug runner gets 2.0-style API via future=True.
+Expected Outcome:
+             → No dependency conflict in local venv
+             → No production code change
+             → conn.commit() works identically locally and on Airflow server
+             → future=True removed automatically when venv eventually upgrades to 2.x
+Watch Out For:
+             → future=True in SQLAlchemy 1.4 also enables stricter 2.0 behavior on other
+               Connection methods — test if any other engine.connect() usage breaks
+             → If flask-appbuilder updates to support SQLAlchemy 2.x, remove future=True
+               and just upgrade the package
+Related Incident: → I7
+Related Pattern:  → P27
+Related Knowledge:→ K34
+```
+
+## DECISION RULES
+
+### D19 — SQLAlchemy Local Debug Compatibility
+
+```
+IF local venv has SQLAlchemy 1.4.x (flask-appbuilder constraint) AND production uses conn.commit():
+  → Add future=True to create_engine() in debug runner only
+  → Never change production code to accommodate local debug limitations
+
+IF flask-appbuilder constraint is removed (venv upgrade to SQLAlchemy 2.x available):
+  → Remove future=True, upgrade SQLAlchemy directly
+  → Verify all engine.connect() usages still work (2.x is stricter on autocommit behavior)
+
+IF production code must also run on SQLAlchemy 1.4.x (same venv as debug):
+  → Change to engine.begin() instead of engine.connect() + conn.commit()
+  → engine.begin() auto-commits on exit — works on both 1.x and 2.x with no extra flag
+```
+
