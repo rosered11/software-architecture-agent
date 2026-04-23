@@ -850,19 +850,52 @@ Related Checklist:  → review-checklists.md: Checklist: Test Coverage (.NET / x
 
 ```
 Name:             C# EF Core Per-Batch Commit Template with Polly Timeout Policy
-Type:             Pattern Implementation
+Type:             Code Snippet
 Language:         C#
 Stack:            .NET 8, EF Core 8, Pomelo.EntityFrameworkCore.MySql, Polly v7+
 Usage:            Drop-in replacement for ProcessSyncLoopAsync() that wraps a while(true) batch
-                  loop in a single TX. Requires monotonic source cursor (WHERE Id > lastId).
-                  Fill in GetProductStaging(), SyncProductMasterAsync() with your types.
-Snippet:          See sections below — ProcessSyncLoopAsync (per-batch TX + Polly retry/timeout),
-                  DbContext registration (CommandTimeout), Airflow DAG timeout fix.
+                  loop with per-batch TX. Read batch BEFORE opening TX to minimize hold to
+                  write-only duration (~200ms). Fill in GetProductStaging() / SyncProductMasterAsync()
+                  with your types. CommandTimeout(120) on DbContext registration as a safety net.
 Related Knowledge:  → K30
 Related Pattern:    → P24, P25
 Related Decisions:  → D16, D17
 Related Incidents:  → I3, I4, I5, I6
 Related Tech Assets:→ TA20 (observability instrumentation)
+
+// Snippet:
+long lastProcessedId = startingId;
+int round = 1;
+
+while (true)
+{
+    cancellationToken.ThrowIfCancellationRequested();
+
+    // Read BEFORE TX — holds connection only for writes (~200ms vs full batch)
+    var batch = await GetProductStaging(lastProcessedId, cancellationToken);
+    if (batch.Count == 0) break;
+
+    await batchPolicy.ExecuteAsync(async ct =>
+    {
+        await using var tx = await context.Database.BeginTransactionAsync(ct);
+        try
+        {
+            await SyncProductMasterAsync(batch, activityTracking, ct);
+            await tx.CommitAsync(ct);
+            lastProcessedId = batch.Last().Id;
+            logger.LogInformation("[{Sync}] Batch {Round}: {Count} records", SyncName, round, batch.Count);
+            round++;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[{Sync}] Batch {Round} FAILED", SyncName, round);
+            try { await tx.RollbackAsync(ct); } catch { /* dead connection — swallow */ }
+            throw;
+        }
+    }, cancellationToken);
+
+    await stagingContext.SaveChangesAsync(cancellationToken);
+}
 ```
 
 #### Per-Batch Commit Loop
@@ -990,20 +1023,58 @@ execution_timeout=timedelta(hours=3),
 
 ```
 Name:             ETL Batch Resource Tracking — Prometheus + Stopwatch + GC
-Type:             Pattern Implementation
+Type:             Code Snippet
 Language:         C#
 Stack:            .NET 8, Prometheus-net, EF Core 8
-Usage:            Drop-in instrumentation block for any ETL batch loop with DB writes.
-                  Provides 6 Prometheus metrics + Stopwatch + GC allocation + heap delta tracking.
-                  Includes ChangeTracker.Clear() + tracking dictionary clear after each commit.
-                  Copy static field declarations + batch block into sync class.
-Snippet:          See sections below — static Prometheus field declarations (Histogram, Counter,
-                  Gauge, Summary) + per-batch instrumentation block with Stopwatch, GC tracking,
-                  ChangeTracker.Clear(), and tracking dictionary reset.
+Usage:            Drop-in instrumentation for any ETL batch loop with DB writes. Tracks
+                  TX hold time (Histogram), records (Counter), round (Gauge), GC alloc (Summary)
+                  + structured log per batch. Always call ChangeTracker.Clear() + tracking
+                  dict.Clear() after commit — prevents linear heap growth across batches.
+                  Copy static field declarations (see below) + per-batch block into sync class.
 Related Knowledge:  → K31, K32
 Related Pattern:    → P25
 Related Decisions:  → D17
 Related Incidents:  → I3, I4, I5
+
+// Snippet:
+// ── Per-batch instrumentation block (inside while loop, after ReadBatch) ──
+long gcBefore = GC.GetTotalAllocatedBytes(precise: false);
+var batchSw   = Stopwatch.StartNew();
+var readSw    = Stopwatch.StartNew();
+var batch     = await GetProductStaging(lastId, cancellationToken);
+readSw.Stop();
+StagingReadDuration.WithLabels(labels).Observe(readSw.Elapsed.TotalSeconds);
+
+if (batch.Count == 0) break;
+
+await using var tx = await context.Database.BeginTransactionAsync(cancellationToken);
+try
+{
+    await SyncProductMasterAsync(batch, activityTracking, cancellationToken);
+    await tx.CommitAsync(cancellationToken);
+    batchSw.Stop();
+
+    BatchDuration.WithLabels(labels).Observe(batchSw.Elapsed.TotalSeconds);
+    RecordsProcessed.WithLabels(labels).Inc(batch.Count);
+    CurrentBatchRound.WithLabels(labels).Set(round);
+    BatchMemoryAlloc.WithLabels(labels).Observe(GC.GetTotalAllocatedBytes(precise: false) - gcBefore);
+
+    // Prevent linear heap growth — detach committed entities + clear tracking dict
+    context.ChangeTracker.Clear();
+    activityTracking.Clear();
+
+    logger.LogInformation(
+        "[{SyncName}] Batch {Round}: {Count} records, TX {TxMs}ms, read {ReadMs}ms",
+        SyncName, round, batch.Count, batchSw.ElapsedMilliseconds, readSw.ElapsedMilliseconds);
+    round++;
+}
+catch (Exception ex)
+{
+    batchSw.Stop();
+    logger.LogError(ex, "[{SyncName}] Batch {Round} FAILED after {TxMs}ms", SyncName, round, batchSw.ElapsedMilliseconds);
+    try { await tx.RollbackAsync(cancellationToken); } catch { }
+    throw;
+}
 ```
 
 #### Static Prometheus Field Declarations
@@ -1128,6 +1199,25 @@ Usage:            Guarantees the child .NET process (or any subprocess) is kille
                   Wrap the Popen streaming loop in try/finally — the finally block always runs.
 Related Knowledge:  → K30
 Related Incidents:  → I3, I4, I5
+
+# Snippet:
+def run_dotnet_exe():
+    proc = subprocess.Popen([...], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+        exit_code = proc.wait()
+        if exit_code != 0:
+            raise Exception(f".NET job failed with exit code {exit_code}")
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        if proc.poll() is None:   # safety net — always kills on any exit
+            proc.kill()
+            proc.wait()
 ```
 
 #### Pattern
@@ -1184,6 +1274,25 @@ Related Knowledge:   → K33
 Related Patterns:    → P26
 Related Decisions:   → D18
 Date:             2026-04-08
+
+// Snippet:
+// TOUCH POINT 1 — Class name
+// public sealed class SyncProductBarcodeJda(...)  ← update class name
+
+// TOUCH POINT 2 — Staging DbSet in GetProductStaging()
+// stagingContext.SpcJdaBarcodeStaging  ← MUST update
+
+// TOUCH POINT 3 — Staging DbSet in CheckPendingAsync()  ← MOST COMMONLY MISSED
+// stagingContext.SpcJdaBarcodeStaging.AnyAsync(x => x.Id > lastId, ...)
+
+// TOUCH POINT 4 — serviceType property
+// protected override string serviceType => "JdaProductBarcode";
+
+// TOUCH POINT 5 — SyncName / tracker key
+// SyncName = "SyncProductBarcodeJda"
+
+// TOUCH POINT 6 — BatchSize config value (re-run BotE if write volume differs)
+// tx_hold = (batch_size/10K) x 14s < 25s
 ```
 
 Use this as a PR diff checklist when creating a new SyncProduct*Jda service by cloning
@@ -1461,3 +1570,218 @@ run_dotnet_exe(dag_run=_MockDagRun(MOCK_CONF))
 ```
 
 **When to reuse:** Any Airflow DAG that needs local F5 debugging. Adapt `CONNECTIONS`/`MOCK_CONF` per DAG. Set `SKIP_DOTNET=True` to stub out external process calls during development.
+
+---
+
+### TA24: OrderJda Two-Pass Per-Batch Commit Template (.NET EF Core)
+
+```
+Name:        OrderJda Two-Pass Per-Batch Commit Template
+Type:        Code Snippet
+Language:    C#
+Stack:       .NET 8, EF Core 8, PostgreSQL
+Usage:       Two-pass per-batch commit for EF Core ETL where child entities FK on a DB-generated
+             parent ID (IDENTITY/SEQUENCE). Pass 1: save headers → EF populates headerActivity.Id.
+             Pass 2: batch all item activities using now-real parent IDs → one save.
+             Total: 2 SaveChangesAsync per batch regardless of batch_size.
+             Copy into SyncXxx concrete class. Replace OrderOutbound* types with your entities.
+Related Knowledge:   → K35: Two-Pass EF Core Batch Pattern for FK-Dependent Inserts
+Related Pattern:     → P28: Two-Pass Batch Commit
+Related Decision:    → D20: ETL Transaction Scope — Per-Batch vs Single TX for PostgreSQL
+Related Incident:    → I8: OrderJda ETL — N+1 SELECT + SaveChanges-in-Loop
+
+// Snippet:
+// Pass 1: collect all headers, save once → DB generates headerActivity.Id
+var headerState = new Dictionary<string, (OrderOutboundActivityTb Activity, OrderOutboundTb Order)>();
+foreach (var header in orderHeaders)
+{
+    context.OrderOutboundActivityTb.Add(headerActivity);
+    context.OrderOutboundTb.Add(order);
+    headerState[header.OrderNo] = (headerActivity, order);
+}
+await context.SaveChangesAsync(ct);  // ← headerActivity.Id now a real DB value
+
+// Pass 2: collect all children using populated parent IDs, save once
+var activityTracking = new Dictionary<string, OrderOutboundItemActivityTb>();
+foreach (var header in orderHeaders)
+{
+    if (!headerState.TryGetValue(header.OrderNo, out var state)) continue;
+    CollectOrderActivities(stagings, header, activityTracking, state.Order, orderItems, state.Activity);
+}
+context.OrderOutboundItemActivityTb.AddRange(activityTracking.Values);
+ApplyItemMasterChanges(context, headerState, itemMasterDict);
+await context.SaveChangesAsync(ct);  // ← all items + master changes in one save
+
+await tx.CommitAsync(ct);
+await orderSyncTrackerService.CheckpointAsync(tracker, lastProcessedId, ct);
+activityTracking.Clear();
+```
+
+**Full template** (outer loop + metrics + TX) — see below.
+
+```csharp
+// ─── Outer loop setup ──────────────────────────────────────────────────────
+var batchId = Environment.GetEnvironmentVariable("ETLNETJOB_DIH_BATCH_ID");
+int round = 1;
+var syncTag = new KeyValuePair<string, object?>("sync_name", SyncName);
+
+while (true)
+{
+    cancellationToken.ThrowIfCancellationRequested();
+
+    var orderHeaders = await GetOrderHeaderAsync(lastProcessedId, batchId, cancellationToken);
+    if (orderHeaders.Count == 0) { logger.LogInformation("...end batch"); break; }
+
+    var batchSw = Stopwatch.StartNew();
+
+    // ── Pre-materialize master lookups (2 queries, no N+1) ──────────────────
+    HashSet<string> orderNos = new(orderHeaders.Select(x => x.OrderNo));
+    var headerMasterDict = await context.OrderOutboundTb
+        .Where(x => orderNos.Contains(x.OrderNo))
+        .ToDictionaryAsync(x => x.OrderNo, cancellationToken);
+    var itemMasterDict = await context.OrderOutboundItemTb
+        .Where(x => orderNos.Contains(x.OrderNo))
+        .GroupBy(x => x.OrderNo)
+        .ToDictionaryAsync(x => x.Key, x => x.ToList(), cancellationToken);
+
+    var stagingAllOrders = await GetDataStaging(orderHeaders, cancellationToken);
+    var stagingByKey = stagingAllOrders
+        .GroupBy(x => (x.OrderNo, x.JdaBatchId, x.DihBatchId))
+        .ToDictionary(x => x.Key, x => x.OrderBy(y => y.Id).ToList());
+
+    await using var tx = await context.Database.BeginTransactionAsync(cancellationToken);
+    try
+    {
+        // ── Pass 1: parents → save once to get DB-generated IDs ─────────────
+        var headerState = new Dictionary<string, (OrderOutboundActivityTb Activity, OrderOutboundTb Order)>();
+        foreach (var header in orderHeaders)
+        {
+            var stagings = stagingByKey.TryGetValue((header.OrderNo, header.JdaBatchId, header.DihBatchId), out var s) ? s : [];
+            // ... determine action, create activity + order master ...
+            context.OrderOutboundActivityTb.Add(headerActivity);
+            headerState[header.OrderNo] = (headerActivity, order);
+        }
+        var dbSw = Stopwatch.StartNew();
+        await context.SaveChangesAsync(cancellationToken);  // ← Pass 1: headerActivity.Id populated
+        metrics.DbWriteDurationMs.Record(dbSw.Elapsed.TotalMilliseconds, syncTag, new("pass", 1));
+
+        // ── Pass 2: children (uses headerActivity.Id from Pass 1) ───────────
+        var activityTracking = new Dictionary<string, OrderOutboundItemActivityTb>();
+        foreach (var header in orderHeaders)
+        {
+            if (!headerState.TryGetValue(header.OrderNo, out var state)) continue;
+            var stagings = stagingByKey.TryGetValue((header.OrderNo, header.JdaBatchId, header.DihBatchId), out var s) ? s : [];
+            var orderItems = itemMasterDict.TryGetValue(header.OrderNo, out var items) ? items : [];
+            CollectOrderActivities(stagings, header, activityTracking, state.Order, orderItems, state.Activity);
+        }
+        if (activityTracking.Count > 0)
+        {
+            StageItemInserts(activityTracking.Values.ToList());
+            var activitiesByOrderNo = activityTracking.Values.GroupBy(x => x.OrderNo)
+                .ToDictionary(x => x.Key, x => x.ToList());
+            foreach (var (orderNo, acts) in activitiesByOrderNo)
+            {
+                if (!headerState.TryGetValue(orderNo, out var state)) continue;
+                var orderItems = itemMasterDict.TryGetValue(orderNo, out var items) ? items : [];
+                var (ins, upd, del) = orderBulkService.ApplyActivities(acts, orderItems, state.Order);
+                totalInsert += ins; totalUpdate += upd; totalDelete += del;
+            }
+            activityTracking.Clear();
+        }
+        dbSw = Stopwatch.StartNew();
+        await context.SaveChangesAsync(cancellationToken);  // ← Pass 2: all items in one save
+        metrics.DbWriteDurationMs.Record(dbSw.Elapsed.TotalMilliseconds, syncTag, new("pass", 2));
+
+        lastProcessedId = orderHeaders.Last().Id;
+        await tx.CommitAsync(cancellationToken);
+
+        // ── Checkpoint after commit (Airflow restart safety) ────────────────
+        await orderSyncTrackerService.CheckpointAsync(tracker, lastProcessedId, cancellationToken);
+
+        batchSw.Stop();
+        metrics.BatchDurationMs.Record(batchSw.Elapsed.TotalMilliseconds, syncTag, new("round", round));
+        metrics.RecordsProcessed.Add(orderHeaders.Count, syncTag);
+        metrics.Inserts.Add(totalInsert, syncTag);
+        metrics.Updates.Add(totalUpdate, syncTag);
+        metrics.Deletes.Add(totalDelete, syncTag);
+        round++;
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "...", SyncName);
+        await tx.RollbackAsync(cancellationToken);
+        metrics.Errors.Add(1, syncTag);
+        throw;
+    }
+}
+
+---
+
+### TA25: Airflow PythonOperator — Thread-Based Subprocess with Hard Timeout
+
+```
+Name:             Airflow PythonOperator — Thread-Based Subprocess with Hard Timeout
+Type:             Code Snippet
+Language:         Python
+Stack:            Apache Airflow 2.x, subprocess.Popen, threading
+Usage:            Use when PythonOperator calls a long-running subprocess (dotnet, java, binary),
+                  live stdout streaming to Airflow logs is required, AND a hard wall-clock kill
+                  is needed before Airflow's execution_timeout fires.
+                  Set TIMEOUT_SUBPROCESS = execution_timeout_seconds - 120 (2-min buffer).
+                  daemon=True on the stream thread means no cleanup needed when main thread exits.
+                  proc.wait(timeout=N) in a nested try catches subprocess.TimeoutExpired before
+                  the outer except Exception swallows it.
+Related Knowledge:   → K36: Python sys.path — Nested Package Resolution
+Related Incident:    → I9: Airflow DAG — Dead subprocess.TimeoutExpired Branch
+Related Pattern:     → P29: Subprocess Timeout via Daemon Thread + proc.wait
+Related Decision:    → D21: Airflow Subprocess Hard Kill — Thread Model vs communicate
+
+# Snippet:
+TIMEOUT_EXTRACT    = timedelta(minutes=30)
+TIMEOUT_SUBPROCESS = int(TIMEOUT_EXTRACT.total_seconds()) - 120  # 28-min hard kill; 2-min buffer
+
+def run_subprocess_with_timeout(cmd, cwd, env):
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+
+    def _stream_output():
+        for line in proc.stdout:
+            print(line, end="")
+
+    stream_thread = threading.Thread(target=_stream_output, daemon=True)
+
+    try:
+        print("=== Subprocess Logging Start ===")
+        stream_thread.start()
+
+        try:
+            proc.wait(timeout=TIMEOUT_SUBPROCESS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise Exception(
+                f"Subprocess exceeded {TIMEOUT_SUBPROCESS // 60}-minute hard limit and was killed"
+            )
+
+        stream_thread.join(timeout=5)
+        print("=== Subprocess Logging End ===")
+
+        exit_code = proc.returncode
+        print("Exit code:", exit_code)
+        if exit_code != 0:
+            raise Exception(f"Subprocess failed with exit code {exit_code}")
+
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+```
+

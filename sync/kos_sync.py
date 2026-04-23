@@ -4,12 +4,15 @@ KOS → Notion Real-Time Sync
 Parses KOS markdown files and upserts records into Notion databases.
 
 Usage:
-  python sync/kos_sync.py              # full sync all databases
-  python sync/kos_sync.py --db k       # sync Knowledge only
-  python sync/kos_sync.py --db p       # sync Patterns only
-  python sync/kos_sync.py --db d       # sync Decision Log only
-  python sync/kos_sync.py --db ta      # sync Tech Assets only
-  python sync/kos_sync.py --db i       # sync Incidents only
+  python sync/kos_sync.py                    # full sync all databases
+  python sync/kos_sync.py --db k             # sync Knowledge only
+  python sync/kos_sync.py --db p             # sync Patterns only
+  python sync/kos_sync.py --db d             # sync Decision Log only
+  python sync/kos_sync.py --db ta            # sync Tech Assets only
+  python sync/kos_sync.py --db i             # sync Incidents only
+  python sync/kos_sync.py --id I9            # sync I9 + all its related records
+  python sync/kos_sync.py --id I9,K36,P29   # sync listed IDs + all their related records
+  python sync/kos_sync.py --id I9 --rebuild-body  # same, with page body rebuild
 
 Triggered automatically by Claude Code hook on every KOS file edit.
 """
@@ -307,6 +310,51 @@ def _relation(page_ids: list[str]) -> dict:
 def extract_kos_ids(text: str) -> list[str]:
     """Extract all KOS IDs (K1, P10, TA3, D2, etc.) from a text value."""
     return re.findall(r"\b(TA\d+|[KPDI]\d+)\b", text)
+
+
+_ALL_RELATION_FIELDS = [
+    "Based on Knowledge",
+    "Related Knowledge",
+    "Related Patterns",
+    "Related Pattern",
+    "Related Decisions",
+    "Related Tech Assets",
+    "Related Incidents",
+]
+
+
+def collect_related_ids(
+    seed_ids: set[str],
+    records_map: dict[str, list[dict]],
+) -> set[str]:
+    """
+    Expand seed KOS IDs to include every ID they directly reference.
+
+    Scans all relation fields (Related Knowledge, Related Pattern, etc.) in
+    each seed record and unions the found IDs into the result set. Only one
+    level of expansion — does not recurse into related records' relations.
+
+    Returns the seed IDs plus all directly referenced IDs.
+    """
+    all_records: dict[str, dict] = {
+        r["_id"]: r
+        for recs in records_map.values()
+        for r in recs
+    }
+
+    result: set[str] = set()
+    for kos_id in seed_ids:
+        uid = kos_id.upper()
+        record = all_records.get(uid)
+        if not record:
+            print(f"  ⚠  KOS ID not found in parsed records: {uid}")
+            continue
+        result.add(uid)
+        for field in _ALL_RELATION_FIELDS:
+            for rid in extract_kos_ids(record.get(field, "")):
+                result.add(rid)
+
+    return result
 
 
 def build_id_map(notion: Client, db_id: str) -> dict[str, str]:
@@ -960,6 +1008,9 @@ def main():
     parser = argparse.ArgumentParser(description="Sync KOS → Notion")
     parser.add_argument("--db", choices=list(DB_KEYS.keys()),
                         help="Sync only this database (default: all)")
+    parser.add_argument("--id", dest="kos_ids", metavar="ID[,ID...]",
+                        help="Sync one or more KOS IDs and their directly related records "
+                             "(e.g. I9  or  I9,K36,P29). Combine with --rebuild-body as needed.")
     parser.add_argument("--rebuild-body", action="store_true",
                         help="Clear and rebuild page body blocks (for formatting updates)")
     args = parser.parse_args()
@@ -988,6 +1039,14 @@ def main():
         "incidents":   kos_data["incidents"],
     }
 
+    # Expand --id seeds to include all directly related IDs
+    id_filter: set[str] | None = None
+    if args.kos_ids:
+        seed_ids = {s.strip().upper() for s in args.kos_ids.split(",") if s.strip()}
+        id_filter = collect_related_ids(seed_ids, records_map)
+        print(f"   Seed IDs:    {', '.join(sorted(seed_ids))}")
+        print(f"   Syncing IDs: {', '.join(sorted(id_filter))}")
+
     # id_maps accumulates as each DB syncs: {db_name: {kos_id: page_id}}
     id_maps: dict[str, dict] = {}
 
@@ -1002,11 +1061,20 @@ def main():
         db_id = dbs.get(db_key)
         records = records_map[db_key]
 
+        # Apply ID filter — only sync records in the expanded set
+        if id_filter:
+            records = [r for r in records if r["_id"] in id_filter]
+
         if not db_id:
             print(f"\n⚠  Skipping {db_key} — no database ID in config.json")
             continue
         if not records:
-            print(f"\n⚠  Skipping {db_key} — no records parsed")
+            # Still build id_map so downstream relations wire correctly
+            id_maps[db_key] = build_id_map(notion, db_id)
+            if id_filter:
+                print(f"\n   (no matching IDs in {db_key} — id_map built for relations)")
+            else:
+                print(f"\n⚠  Skipping {db_key} — no records parsed")
             continue
 
         try:
@@ -1019,6 +1087,8 @@ def main():
     if not target or target == "knowledge":
         k_db_id = dbs.get("knowledge")
         k_records = records_map["knowledge"]
+        if id_filter:
+            k_records = [r for r in k_records if r["_id"] in id_filter]
         if k_db_id and k_records and id_maps.get("patterns"):
             print("\n🔁 Knowledge (pass 2) — wiring Related Patterns...")
             try:
@@ -1033,6 +1103,8 @@ def main():
     if not target or target == "patterns":
         p_db_id = dbs.get("patterns")
         p_records = records_map["patterns"]
+        if id_filter:
+            p_records = [r for r in p_records if r["_id"] in id_filter]
         if p_db_id and p_records and id_maps.get("tech_assets"):
             print("\n🔁 Patterns (pass 3) — wiring Related Tech Assets...")
             try:

@@ -40,6 +40,7 @@ Related Tech Assets:→ Redis INCR + EXPIRE pattern
 
 **Your Stack (Redis + .NET or Go)**:
 ```lua
+-- Snippet:
 -- Redis Lua script (atomic token bucket check)
 local tokens = tonumber(redis.call('GET', KEYS[1])) or tonumber(ARGV[1])
 if tokens >= 1 then
@@ -94,6 +95,7 @@ Related Tech Assets:→ Sorted map / BST implementation of ring
 
 **Your Stack (Go)**:
 ```go
+// Snippet:
 type Ring struct {
     nodes   []int            // sorted hash positions
     nodeMap map[int]string
@@ -255,6 +257,7 @@ Related Tech Assets:→ Append-only event table schema
 
 **Your Stack (PostgreSQL)**:
 ```sql
+-- Snippet:
 -- Event store table (append-only, never UPDATE or DELETE)
 CREATE TABLE domain_events (
     id             BIGSERIAL PRIMARY KEY,
@@ -354,6 +357,7 @@ Based on Knowledge:  → Event Sourcing (K10)
 
 **Your Stack (Go + file-based)**:
 ```go
+// Snippet:
 // Write entry to WAL before applying to in-memory state
 func (w *WAL) Append(entry []byte) error {
     _, err := w.file.Write(entry)       // sequential append — fast
@@ -409,6 +413,7 @@ Based on Knowledge:  → Geospatial Indexing (K9)
 
 **Your Stack (PostgreSQL)**:
 ```sql
+-- Snippet:
 -- Store and index geohash
 ALTER TABLE businesses ADD COLUMN geohash_6 CHAR(6);
 CREATE INDEX idx_biz_geohash ON businesses(geohash_6);
@@ -476,6 +481,7 @@ Related Patterns:    → P15: Idempotency Key (Snowflake IDs pair well as idempo
 
 **Your Stack (Go)**:
 ```go
+// Snippet:
 func (s *Snowflake) NextID() int64 {
     s.mu.Lock(); defer s.mu.Unlock()
     now := time.Now().UnixMilli()
@@ -606,6 +612,7 @@ Source:           Financial consumer pattern, Go + Kafka stack
 
 **Your Stack (Go + Kafka)**:
 ```go
+// Snippet:
 const maxRetries = 3
 
 func processWithDLQ(msg kafka.Message) {
@@ -738,6 +745,7 @@ Based on Knowledge:  → Message Queue Internals — WAL, Partitions, ISR (K18)
 
 **Your Stack (PostgreSQL + Kafka)**:
 ```sql
+-- Snippet:
 -- outbox table
 CREATE TABLE outbox_events (
     id UUID PRIMARY KEY,
@@ -808,6 +816,7 @@ Based on Knowledge:  → Idempotency in Distributed Systems (K20)
 
 **Your Stack (PostgreSQL)**:
 ```sql
+-- Snippet:
 CREATE TABLE idempotency_keys (
     key VARCHAR(255) PRIMARY KEY,
     result JSONB,
@@ -1009,6 +1018,7 @@ Source:           incident2.cs Phase 2, 2026-03-27
 
 **Your Stack (.NET + EF Core)**:
 ```csharp
+// Snippet:
 // Before (N+1)
 foreach (var item in items)
 {
@@ -1085,6 +1095,7 @@ Source:           incident2.cs Phase 1, 2026-03-27
 
 **Your Stack (.NET + EF Core)**:
 ```csharp
+// Snippet:
 // BEFORE: bare load + lazy loads per item inside loop
 SubOrderModel subOrderModel = _context.SubOrder
     .Include(s => s.Items).ThenInclude(i => i.Amount)
@@ -1176,6 +1187,7 @@ Source:           incident2.cs Phase 1, 2026-03-27
 
 **Your Stack (.NET + EF Core)**:
 ```csharp
+// Snippet:
 // BEFORE (target.cs:55-57): each sub-call resolves IsExistOrderReference independently
 // GetOrderHeader calls IsExistOrderReference internally (line 479)
 // GetOrderMessagePayments calls IsExistOrderReference internally (line 131)
@@ -1241,6 +1253,7 @@ Source:           incident2.cs Phase 3, 2026-03-27
 
 **Your Stack (.NET + EF Core)**:
 ```csharp
+// Snippet:
 // BEFORE: N outer-loop calls, each with ~44 sequential queries
 foreach (var subOrder in subOrders)
 {
@@ -1339,8 +1352,8 @@ Source:           stockadjustments incident, spc_inventory, 2026-03-30
 | Non-blocking — VACUUM and REINDEX CONCURRENTLY don't lock table | Requires DBA access to ALTER TABLE |
 
 **Your Stack (PostgreSQL)**:
-
 ```sql
+-- Snippet:
 -- Step 1: Detect tables with dead tuple problem
 SELECT
   relname AS table_name,
@@ -1461,6 +1474,7 @@ Source:           Order.API-3.dmp + Order.API-11.dmp load test analysis, 2026-03
 
 **Your Stack (.NET + EF Core)**:
 ```csharp
+// Snippet:
 // BEFORE: new expression tree compiled on every call (per unique parameter set)
 public async Task<List<SubOrderModel>> GetSubOrdersAsync(string[] ids)
 {
@@ -1659,12 +1673,12 @@ When NOT to Use:  All-or-nothing atomicity required across entire dataset
 Complexity:       Low — structural refactor / no new infrastructure
 Based on Knowledge:  → K30, K32
 Related Decisions:   → D16, D17
-Related Incidents:   → I3, I4, I5, I6
+Related Incidents:   → I3, I4, I5, I6, I8
 Related Tech Assets: → TA19, TA20
-Related Patterns:    → P25 (observability follow-up)
+Related Patterns:    → P25 (observability follow-up), P28 (FK-safe two-pass variant for EF Core identity PKs)
 ```
 
-#### Commit Strategy Decision Tree
+**Commit Strategy Decision Tree:**
 
 ```
 BotE: batch_count × avg_batch_latency = ?
@@ -1674,7 +1688,7 @@ BotE: batch_count × avg_batch_latency = ?
   > 30,000ms → per-batch commit mandatory
 ```
 
-#### Structure
+**Structure:**
 
 ```
 BEFORE (anti-pattern):              AFTER (per-batch commit):
@@ -1691,7 +1705,7 @@ Commit()  ← single failure point       WriteBatch(batch)
                                     }
 ```
 
-#### Trade-offs
+**Trade-offs**:
 
 | Dimension | Per-Batch Commit | Single TX |
 |---|---|---|
@@ -1701,17 +1715,31 @@ Commit()  ← single failure point       WriteBatch(batch)
 | Partial visibility | Yes — records appear during sync | No |
 | Restart capability | Idempotent from cursor | Full re-run |
 
-#### Airflow Hardening (complementary)
+**Decision Rule**:
+```
+IF batch_count × avg_batch_latency > 10s  → per-batch commit mandatory
+IF while(true) loop with DB writes        → TX must be INSIDE loop
+IF BeginTransaction() before while(true)  → architectural bug, fix immediately
+IF parent PK is DB-generated (IDENTITY)   → combine with P28 Two-Pass inside same TX
+```
 
-```python
-PythonOperator(
-    task_id='run_dotnet_job',
-    retries=2,
-    retry_delay=timedelta(minutes=5),
-    execution_timeout=timedelta(hours=3),
-)
-# Inside callable:
-exit_code = result.wait(timeout=7200)   # 2h subprocess hard ceiling
+**Your Stack (.NET / EF Core / Airflow)**:
+```csharp
+// Snippet:
+// .NET: per-batch TX inside while(true) loop
+while (true)
+{
+    var batch = await ReadBatchAsync(lastId, ct);
+    if (!batch.Any()) break;
+
+    await using var tx = await context.Database.BeginTransactionAsync(ct);
+    try {
+        await WriteBatchAsync(batch, ct);
+        await tx.CommitAsync(ct);
+        lastId = batch.Last().Id;
+        await CheckpointAsync(lastId, ct);
+    } catch { await tx.RollbackAsync(ct); throw; }
+}
 ```
 
 ---
@@ -1741,43 +1769,7 @@ Related Incidents:   → I3, I4, I5
 Related Tech Assets: → TA20, TA21
 ```
 
-#### Structure
-
-```
-// ── Declare static Prometheus fields ──
-static Histogram BatchDuration = ...;     // TX hold per batch
-static Histogram StagingReadDuration = ...; // staging read per batch
-static Counter RecordsProcessed = ...;     // cumulative records
-static Gauge CurrentBatchRound = ...;      // current round
-static Summary BatchMemoryAlloc = ...;     // GC alloc per batch
-
-// ── Inside batch loop ──
-var readSw = Stopwatch.StartNew();
-var batch = await ReadBatch(lastId);
-readSw.Stop();
-StagingReadDuration.Observe(readSw.Elapsed.TotalSeconds);
-
-long gcBefore = GC.GetTotalAllocatedBytes(precise: false);
-var batchSw = Stopwatch.StartNew();
-
-await using var tx = await BeginTransactionAsync();
-await WriteBatch(batch);
-await tx.CommitAsync();
-
-batchSw.Stop();
-long gcAfter = GC.GetTotalAllocatedBytes(precise: false);
-
-BatchDuration.Observe(batchSw.Elapsed.TotalSeconds);
-RecordsProcessed.Inc(batch.Count);
-CurrentBatchRound.Set(round);
-BatchMemoryAlloc.Observe(gcAfter - gcBefore);
-
-logger.LogInformation("[{Sync}] Batch {R}: {N} rows, TX {TxMs}ms, read {ReadMs}ms, alloc {MB:F1}MB",
-    SyncName, round, batch.Count, batchSw.ElapsedMilliseconds,
-    readSw.ElapsedMilliseconds, (gcAfter - gcBefore) / 1_048_576.0);
-```
-
-#### Trade-offs
+**Trade-offs**:
 
 | Dimension | With Tracking | Without Tracking |
 |---|---|---|
@@ -1786,6 +1778,38 @@ logger.LogInformation("[{Sync}] Batch {R}: {N} rows, TX {TxMs}ms, read {ReadMs}m
 | Dashboard / alert capability | Full Grafana + Prometheus | None |
 | Debugging failed batches | Exact metrics in log | Only "batch N failed" |
 | Code complexity | +15 lines | Simpler but opaque |
+
+**Decision Rule**:
+```
+IF ETL batch loop with DB writes AND total records > 10K  → Prometheus Histogram on TX hold mandatory
+IF job runs unattended on Airflow                         → alerting required (P95 > 5s = WARN, > 30s = CRIT)
+IF overhead > 0.1% of batch duration                     → remove instrument
+```
+
+**Your Stack (.NET + EF Core)**:
+```csharp
+// Snippet:
+long gcBefore = GC.GetTotalAllocatedBytes(precise: false);
+var batchSw   = Stopwatch.StartNew();
+var readSw    = Stopwatch.StartNew();
+var batch     = await ReadBatch(lastId, ct);
+readSw.Stop();
+StagingReadDuration.WithLabels(labels).Observe(readSw.Elapsed.TotalSeconds);
+
+if (batch.Count == 0) break;
+
+await using var tx = await context.Database.BeginTransactionAsync(ct);
+await WriteBatch(batch, ct);
+await tx.CommitAsync(ct);
+batchSw.Stop();
+
+BatchDuration.WithLabels(labels).Observe(batchSw.Elapsed.TotalSeconds);
+RecordsProcessed.WithLabels(labels).Inc(batch.Count);
+CurrentBatchRound.WithLabels(labels).Set(round);
+BatchMemoryAlloc.WithLabels(labels).Observe(GC.GetTotalAllocatedBytes(precise: false) - gcBefore);
+context.ChangeTracker.Clear();
+activityTracking.Clear();
+```
 
 ---
 
@@ -1838,16 +1862,19 @@ grep -n "JdaProductMaster"     SyncProductBarcodeJda.cs
 - Clones that share the same staging table intentionally — skip touch point 1 and 2, but verify the rest.
 - New services built from scratch (not clones) — use as a final review checklist, not a replacement for proper design.
 
-#### Trade-offs
+**Trade-offs**:
 
 | | Pro | Con |
 |---|---|---|
 | Checklist enforcement | Catches silent data-skip bugs before prod | Adds review step to clone process |
 | Grep verification | Zero cost, runs in 1 second | Must be added to PR checklist / CI |
 
-#### Decision Rule
-
-> If you cloned an EF Core ETL sync service → run this checklist before merging. Every touch point must be independently verified — the compiler will not catch a valid DbSet call on the wrong table.
+**Decision Rule**:
+```
+IF EF Core ETL service was created by cloning another → run all 6 touch points before merging
+IF compiler shows no error but job processes no data  → CheckPendingAsync() DbSet is wrong table
+IF grep finds source service name in cloned file      → unreplaced copy-paste — fix before merge
+```
 
 ---
 
@@ -1938,5 +1965,130 @@ IF verifying prod environment behavior                           → deploy to s
         "PYTHONIOENCODING": "utf-8"
     }
 }
+```
+
+---
+
+### P28: Two-Pass Batch Commit (FK-Safe ETL)
+
+```
+ID:          P28
+Problem:     ETL inserts children (item activities) that require a DB-generated parent ID (FK).
+             SaveChangesAsync-in-loop fixes FK but creates N write round-trips per batch.
+Solution:    Split into two passes per batch: Pass 1 saves only parents to get DB-generated IDs;
+             Pass 2 adds all children (now with valid parent IDs) and saves once.
+When to USE: EF Core ETL; DB-generated PK (IDENTITY/SEQUENCE) used as FK by children;
+             children volume is large (many items per header).
+When NOT to: Parent ID is application-assigned (Guid.NewGuid()); use single-pass instead.
+             Children don't FK on parent; single-pass with everything in one AddRange.
+Complexity:  Medium
+Related:     I8, K35, D20, TA24, P24
+```
+
+**Trade-offs**:
+
+| | Two-Pass Batch | Single-Pass (Guid) | N+1 Save-in-Loop |
+|---|---|---|---|
+| DB round-trips per batch | 2 | 1 | N (batch_size) |
+| FK safety | ✓ | ✓ | ✓ |
+| Code complexity | Medium | Low | Low |
+| Requires application-assigned PK | No | Yes | No |
+| Pool pressure | Low | Lowest | High |
+
+**Decision Rule**:
+```
+IF parent PK = DB-generated IDENTITY/SEQUENCE AND children FK on parent.Id
+  → use Two-Pass Batch (P28): save parents first, then batch all children
+IF parent PK = application-assigned Guid
+  → use Single-Pass: Add(parent) + AddRange(children) → one SaveChangesAsync
+IF already using SaveChangesAsync per header to get FK
+  → migrate to Two-Pass: extract pass 1 (parents only), collect all children, save once
+```
+
+**Your Stack (.NET / EF Core / PostgreSQL)**:
+```csharp
+// Snippet:
+// Pass 1: collect all parents, save once to get DB-generated IDs
+var headerStateByOrderNo = new Dictionary<string, (OrderOutboundActivityTb Activity, OrderOutboundTb Order)>();
+foreach (var orderHeader in orderHeaders)
+{
+    var headerActivity = mapper.CreateActivity(orderHeader, action, SourceType.External);
+    var order = mapper.MapNewMaster(orderHeader);
+    context.OrderOutboundTb.Add(order);
+    context.OrderOutboundActivityTb.Add(headerActivity);
+    headerStateByOrderNo[orderHeader.OrderNo] = (headerActivity, order);
+}
+await context.SaveChangesAsync(ct);  // ← headerActivity.Id populated by DB
+
+// Pass 2: collect all children using now-populated parent IDs, save once
+var orderActivityTracking = new Dictionary<string, OrderOutboundItemActivityTb>();
+foreach (var orderHeader in orderHeaders)
+{
+    if (!headerStateByOrderNo.TryGetValue(orderHeader.OrderNo, out var state)) continue;
+    CollectOrderActivities(stagings, orderHeader, orderActivityTracking, state.Order, orderItems, state.Activity);
+}
+context.OrderOutboundItemActivityTb.AddRange(orderActivityTracking.Values);
+// Apply item master mutations (EF tracked, no save here)
+ApplyItemMasterChanges(...);
+await context.SaveChangesAsync(ct);  // ← all items + master changes in one save
+```
+
+---
+
+### P29: Subprocess Timeout via Daemon Thread + proc.wait
+
+```
+Name:             Subprocess Timeout via Daemon Thread + proc.wait
+Category:         Resilience / Process Management
+Problem:          Need to enforce a hard wall-clock kill on a child process while preserving
+                  live log streaming. `for line in proc.stdout` blocks the main thread, making
+                  `proc.wait(timeout=N)` unreachable dead code.
+Solution:         Move stdout reading to a daemon thread. The main thread calls
+                  proc.wait(timeout=N) and catches subprocess.TimeoutExpired to kill the process.
+When to Use:      - Airflow PythonOperator calling a subprocess (dotnet, java, go binary)
+                  - execution_timeout set, but a separate subprocess hard kill is also needed
+                  - Live log streaming is required (not just capturing output at the end)
+When NOT to Use:  - Output does not need streaming (use proc.communicate(timeout=N) instead — simpler)
+                  - Subprocess is guaranteed to self-terminate within Airflow's task timeout
+Complexity:       Low
+Related Incident: → I9: Airflow DAG — Dead subprocess.TimeoutExpired Branch
+Related Decision: → D21: Airflow Subprocess Hard Kill — Thread Model vs communicate(timeout=)
+Related TA:       → TA25: Airflow PythonOperator — Thread-Based Subprocess with Hard Timeout
+```
+
+**Trade-offs**:
+
+| | Thread Model | communicate(timeout=) |
+|---|---|---|
+| Live streaming | Yes | No — buffers all output |
+| Hard timeout | Yes | Yes |
+| Complexity | Low (1 daemon thread) | Lower (no thread) |
+| Use when | Streaming required | Streaming not required |
+
+**Decision Rule**:
+```
+IF live log streaming required AND hard timeout required  → Daemon Thread + proc.wait (P29 / TA25)
+IF no streaming needed                                    → proc.communicate(timeout=N)
+IF subprocess self-terminates within Airflow timeout      → for-loop + finally kill only
+```
+
+**Your Stack (Python / Airflow)**:
+```python
+# Snippet:
+TIMEOUT_SUBPROCESS = int(TIMEOUT_EXTRACT.total_seconds()) - 120  # 28 min (2-min buffer)
+
+def _stream_output():
+    for line in proc.stdout:
+        print(line, end="")
+
+stream_thread = threading.Thread(target=_stream_output, daemon=True)
+stream_thread.start()
+
+try:
+    proc.wait(timeout=TIMEOUT_SUBPROCESS)   # hard kill at 28 min
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    raise Exception(f"Subprocess exceeded {TIMEOUT_SUBPROCESS // 60}-minute hard limit")
 ```
 

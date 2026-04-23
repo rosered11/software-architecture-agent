@@ -1643,8 +1643,9 @@ Rules:
   Airflow retries on .NET subprocess job?  → add retries=2, retry_delay=5min, subprocess timeout = BotE_realistic × 3
 Related Knowledge:  → K30, K32
 Related Pattern:    → P24, P25
-Related Incidents:  → I3, I4, I5, I6
-Related Tech Assets:→ TA19, TA20
+Related Incidents:  → I3, I4, I5, I6, I8 (PostgreSQL OrderJda — same rule applied)
+Related Tech Assets:→ TA19, TA20, TA24
+Extended by:        → D20 (PostgreSQL + two-pass FK constraint variant)
 Date:             2026-04-07
 ```
 
@@ -1765,7 +1766,108 @@ Related Pattern:  → P27
 Related Knowledge:→ K34
 ```
 
+---
+
+### D20: ETL Transaction Scope — Per-Batch vs Single TX for PostgreSQL OrderJda
+
+```
+Title:       ETL Transaction Scope — Per-Batch vs Single TX for PostgreSQL OrderJda
+Context:     SyncOrderOutboundStagingToSpcJda and SyncOrderOutboundSpcToWmsJda process
+             batches of 500 headers in a while(true) loop. D16 established per-batch TX
+             as the standard for MySQL ETL. This decision confirms same rule for PostgreSQL
+             and adds two-pass batch constraint (FK-dependent item activities).
+Options:
+             A. Single TX wrapping entire while(true) loop — one atomic operation, but
+                TX hold = sum of all batch durations (minutes). PostgreSQL lock escalation
+                risk. On Airflow retry, reprocesses from zero.
+             B. Per-batch TX inside while(true) loop — TX hold = one batch duration (~60ms).
+                CheckpointAsync persists cursor after each commit. Airflow retry resumes
+                from last checkpoint, not from zero.
+Decision:    Option B — Per-batch TX + CheckpointAsync after each commit.
+             D16 rule extended to PostgreSQL: same reasoning, same threshold (TX hold > 5s → BLOCK).
+             Two-pass constraint applies: Pass 1 SaveChangesAsync inside TX for FK population,
+             Pass 2 SaveChangesAsync inside same TX for items.
+Expected Outcome:
+             → TX hold: from job-duration (minutes) to ~120ms per batch
+             → Pool utilization: from near-exhaustion (60,000ms) to <1% (400ms)
+             → Airflow retry: resumes from last checkpoint, no full reprocess
+Watch Out For:
+             → CheckpointAsync uses same DbContext as main data — ensure it is outside the
+               main data TX (tracker context vs data context are separate save boundaries)
+             → Two TX per batch if tracker lives in same context as data — avoid this by
+               using a shared context with a separate SaveChanges after tx.CommitAsync
+Related Incident:  → I8
+Related Pattern:   → P24, P28
+Related Knowledge: → K32, K35
+Related Decision:  → D16 (extends)
+```
+
 ## DECISION RULES
+
+### D20 — ETL Transaction Scope (PostgreSQL + EF Core)
+
+```
+IF ETL processes batches in a while(true) loop AND batch_count > 1:
+  → TX must be INSIDE the loop (per-batch), never outside (D16 + D20)
+  → TX hold threshold: > 5s per batch = BLOCK (pool exhaustion risk at 5 concurrent tasks)
+
+IF child entities FK on DB-generated parent ID within same TX:
+  → Use Two-Pass: save parents (Pass 1) → collect all children → save children (Pass 2)
+  → Both passes within the same per-batch TX
+
+IF Airflow task restarts mid-job:
+  → CheckpointAsync must be called after tx.CommitAsync — not inside the TX
+  → Ensures cursor is persisted even if tracker save fails (data is already committed)
+
+IF unsure whether TX is too long:
+  → Measure: batch_size × avg_query_ms × save_count. If > 5,000ms → per-batch TX required
+```
+
+### D21: Airflow Subprocess Hard Kill — Daemon Thread vs communicate(timeout=)
+
+```
+Title:       Airflow Subprocess Hard Kill — Daemon Thread vs communicate(timeout=)
+Context:     Airflow PythonOperator runs a .NET ETL binary via subprocess.Popen.
+             execution_timeout=30min is set. Live log streaming is required (operators read
+             logs in real-time). The process must be hard-killed before Airflow's task timeout.
+Problem:     `for line in proc.stdout` blocks the main thread. `proc.wait(timeout=N)` placed
+             after the loop is unreachable dead code. No independent subprocess hard kill exists.
+Options Considered:
+  A. proc.communicate(timeout=N)
+     Pros: Simple — one call, buffers stdout, raises subprocess.TimeoutExpired on timeout
+     Cons: Buffers all output — nothing printed until process exits. No live streaming.
+  B. Daemon Thread + proc.wait(timeout=N)
+     Pros: Live streaming preserved. Hard timeout enforced via proc.wait. subprocess.TimeoutExpired
+           is now reachable (raised by proc.wait, not by Airflow). 2-min safety buffer before
+           Airflow's task kill.
+     Cons: One extra threading.Thread — low complexity, daemon=True means no cleanup needed.
+Decision:    B — Daemon Thread + proc.wait
+Why:         Live log streaming is a hard requirement (Airflow operators watch logs during run).
+             communicate() buffers output — unacceptable for a 28-min job.
+Expected Outcome:
+  - proc.wait(timeout=1680) fires at 28 min if .NET hangs
+  - proc.kill() runs immediately → process dead
+  - Airflow task fails with clear message "exceeded 28-minute hard limit"
+  - 2-min buffer remains before Airflow's 30-min execution_timeout fires
+Risks:       dotnet binary ignoring SIGKILL (Windows-style process; Linux container). In practice,
+             proc.kill() sends SIGKILL (not SIGTERM) on Linux — process cannot ignore it.
+Related Incident:  → I9: Airflow DAG — Dead subprocess.TimeoutExpired Branch
+Related Pattern:   → P29: Subprocess Timeout via Daemon Thread + proc.wait
+Related TA:        → TA25: Airflow PythonOperator — Thread-Based Subprocess with Hard Timeout
+```
+
+**Decision Rule:**
+
+```
+IF live streaming required AND hard subprocess timeout required
+  → Daemon Thread + proc.wait(timeout=N)
+
+IF live streaming NOT required (batch output acceptable)
+  → proc.communicate(timeout=N)  — simpler, no thread
+
+IF subprocess is guaranteed fast (< execution_timeout)
+  → for line in proc.stdout + finally kill  — simplest, no timeout needed
+```
 
 ### D19 — SQLAlchemy Local Debug Compatibility
 

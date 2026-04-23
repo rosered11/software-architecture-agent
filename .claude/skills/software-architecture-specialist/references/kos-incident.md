@@ -666,7 +666,7 @@ Related Knowledge:   → K30, K32
 Related Pattern:     → P24, P25
 Related Decisions:   → D16, D17
 Related Tech Assets: → TA19, TA20
-Related Incidents:   → I4, I5, I6 (follow-ups: observability, OOM, copy-paste bug + batch size)
+Related Incidents:   → I4, I5, I6 (follow-ups: observability, OOM, copy-paste bug + batch size), I8 (same root cause on PostgreSQL OrderJda)
 ```
 
 #### Symptoms
@@ -1162,4 +1162,181 @@ finally:
 | str.join() on int list | Fixed | ds_outbound_order.py: `str(x) for x in` |
 | Silent early return guard | Fixed | ds_spc_order_outbound_jda_spc_to_wms.py: guard at top |
 | Subprocess not killed | Fixed | Both net DAG files: try/except/finally + kill |
+
+---
+
+### I8: OrderJda ETL — N+1 SELECT + SaveChanges-in-Loop + Long Transaction on PostgreSQL
+
+```
+ID:              I8
+Date:            2026-04-21
+System:          ETLCronjob / OrderJda (.NET EF Core → PostgreSQL)
+Symptom:         ETL batch degrades under concurrency; potential Airflow task timeout; pool exhaustion risk
+Root Cause:      Three compounding anti-patterns: N+1 SELECT per header, SaveChangesAsync inside foreach, transaction held across entire while(true) loop
+Fix:             Pre-materialize dicts before loop; two-pass EF Core batch (Pass 1: headers+activities → save; Pass 2: items → save); TX per-batch inside loop; CheckpointAsync after each commit
+Before:          5 tasks × 600 queries × 20ms = 60,000ms hold → pool exhaustion; TX spans entire job duration
+After:           5 tasks × 4 queries × 20ms = 400ms → 0.4% pool; TX = one batch (~60ms)
+Lesson:          FK-dependent children (item activities need headerActivity.Id) require two-pass approach — you cannot avoid the first save, but you CAN batch everything else into a single second save
+Related Pattern: P24, P28
+Related Decisions: D16, D20
+Related Knowledge: K32, K35
+```
+
+#### Root Cause (mechanism)
+
+Three patterns compounded in `SyncOrderOutboundStagingToSpcJda` and `SyncOrderOutboundSpcToWmsJda`:
+
+**1. N+1 SELECT** — `context.OrderOutboundTb.FirstOrDefaultAsync(x => x.OrderNo == orderHeader.OrderNo)` and `context.OrderOutboundItemTb.Where(x => x.OrderNo == ...).ToListAsync()` called inside `foreach (var orderHeader in orderHeaders)`. With batch_size=500, this is 1,000 queries per batch.
+
+**2. SaveChangesAsync inside foreach** — `await context.SaveChangesAsync()` called per header → 2–4 round-trips per header = N×batch_size DB writes per batch. Each `SaveChangesAsync` holds a transaction briefly, causing rapid connection churn.
+
+**3. Transaction held across entire while(true) loop** — `await using var tx = await context.Database.BeginTransactionAsync(...)` was placed OUTSIDE the batch loop in the original design pattern. TX hold = sum of all batch latencies = minutes.
+
+**Cross-product filter bug (bonus):** `GetDataStaging` used `jdaBatchIds.Contains() && dihBatchIds.Contains()` which returns items from wrong batch ID combinations (set-level OR, not tuple-level AND). Fetched rows for `(OrderNo=A, JdaBatchId=X, DihBatchId=Y)` might include staging rows from `(OrderNo=A, JdaBatchId=Y, DihBatchId=X)`.
+
+#### Fix
+
+**SyncOrderOutboundStagingToSpcJda — Two-Pass Approach:**
+```csharp
+// BEFORE: inside foreach per orderHeader
+var order = await context.OrderOutboundTb.FirstOrDefaultAsync(x => x.OrderNo == orderHeader.OrderNo, ct);
+var orderItems = await context.OrderOutboundItemTb.Where(x => x.OrderNo == orderHeader.OrderNo).ToListAsync(ct);
+// ... mutate ...
+await context.SaveChangesAsync(ct);  // N saves
+
+// AFTER: 2 queries before loop
+var orderHeaderMasterDict = await context.OrderOutboundTb
+    .Where(x => orderNos.Contains(x.OrderNo))
+    .ToDictionaryAsync(x => x.OrderNo, ct);
+
+var orderDetailMasterDict = await context.OrderOutboundItemTb
+    .Where(x => orderNos.Contains(x.OrderNo))
+    .GroupBy(x => x.OrderNo)
+    .ToDictionaryAsync(x => x.Key, x => x.ToList(), ct);
+
+// Pass 1: foreach headers → add to EF tracker (no save yet)
+// ONE save: populates headerActivity.Id (FK for items)
+await context.SaveChangesAsync(ct);  // ← required for FK: headerActivity.Id
+
+// Pass 2: CollectOrderActivities into shared dict → StageItemInserts (AddRange)
+// ONE save: all item activities + item master changes
+await context.SaveChangesAsync(ct);
+```
+
+**GetDataStaging — composite-key in-memory filter:**
+```csharp
+// BEFORE: cross-product false positives
+.Where(x => orderNos.Contains(x.OrderNo)
+         && jdaBatchIds.Contains(x.JdaBatchId)
+         && dihBatchIds.Contains(x.DihBatchId))
+
+// AFTER: fetch broad by OrderNo, filter precise composite key in-memory
+var compositeKeys = headers.Select(x => (x.OrderNo, x.JdaBatchId, x.DihBatchId)).ToHashSet();
+var stagings = await stagingContext.SpcJdaOutboundDetailStaging
+    .Where(x => orderNos.Contains(x.OrderNo)).ToListAsync(ct);
+return stagings
+    .Where(x => compositeKeys.Contains((x.OrderNo, x.JdaBatchId ?? "", x.DihBatchId ?? "")))
+    .Select(mapper.Mapping).ToList();
+```
+
+**Per-batch transaction (both sync classes):**
+```csharp
+// BEFORE: tx outside while loop
+await using var tx = await context.Database.BeginTransactionAsync(ct);
+while (true) { /* process all batches */ }
+
+// AFTER: tx inside while loop
+while (true)
+{
+    var orderHeaders = await GetOrderHeaderAsync(...);
+    await using var tx = await context.Database.BeginTransactionAsync(ct);
+    try {
+        // ... two-pass saves ...
+        await tx.CommitAsync(ct);
+        await orderSyncTrackerService.CheckpointAsync(tracker, lastProcessedId, ct);
+    } catch { await tx.RollbackAsync(ct); throw; }
+}
+```
+
+#### Results
+
+| Metric | Before | After |
+|---|---|---|
+| Queries per batch (500 headers) | ~1,000 SELECT | 4 SELECT |
+| SaveChangesAsync calls per batch | ~500–2,000 | 2 |
+| DB connection hold per batch | ~10,000ms | ~120ms |
+| Pool utilization (5 tasks) | Near exhaustion | <1% |
+| TX hold duration | Job duration (minutes) | One batch (~60ms) |
+| Airflow restart recovery | From zero | From last batch checkpoint |
+
+---
+
+### I9: Airflow DAG — Dead subprocess.TimeoutExpired Branch + No Hard Subprocess Timeout
+
+```
+ID:              I9
+Date:            2026-04-22
+System:          Airflow DAG / PythonOperator (Python → .NET ETL subprocess)
+Symptom:         .NET process can run indefinitely; Airflow task timeout does not kill the subprocess cleanly; dead except branch gives false confidence of timeout handling
+Root Cause:      `for line in proc.stdout` blocks the main thread until stdout closes (process exits).
+                 `proc.wait(timeout=...)` placed after the loop is unreachable while the process hangs.
+                 `except subprocess.TimeoutExpired` is dead code — Airflow raises AirflowTaskTimeout
+                 (BaseException), not subprocess.TimeoutExpired. No independent subprocess wall-clock kill.
+Fix:             Move stdout reading to a daemon thread. Main thread calls proc.wait(timeout=TIMEOUT_SUBPROCESS).
+                 Real subprocess.TimeoutExpired catch added around proc.wait — now reachable and correct.
+                 TIMEOUT_SUBPROCESS = TIMEOUT_EXTRACT.total_seconds() - 120 (28-min hard kill, 2-min buffer).
+Before:          No subprocess hard kill. If .NET hangs: for-loop blocks → Airflow SIGALRM eventually fires
+                 → finally kills → but subprocess may linger if dotnet ignores SIGTERM.
+After:           proc.wait(timeout=1680) fires at 28 min → proc.kill() → process guaranteed dead before
+                 Airflow's 30-min task timeout triggers.
+Lesson:          `for line in proc.stdout` and `proc.wait(timeout=...)` cannot coexist in the same thread.
+                 Streaming + hard timeout requires a daemon thread. Airflow raises AirflowTaskTimeout, not
+                 subprocess.TimeoutExpired — exception branches must match the actual raiser.
+Related Knowledge:   → K36: Python sys.path.insert — Nested Package Module Resolution
+Related Pattern:     → P29: Subprocess Timeout via Daemon Thread + proc.wait
+Related Decision:    → D21: Airflow Subprocess Hard Kill — Thread Model vs communicate(timeout=)
+Related TA:          → TA25: Airflow PythonOperator — Thread-Based Subprocess with Hard Timeout
+```
+
+#### Root Cause Chain
+
+```
+Airflow execution_timeout=30min
+    └─ raises AirflowTaskTimeout (BaseException) — NOT subprocess.TimeoutExpired
+           └─ except subprocess.TimeoutExpired  ← DEAD — never matches
+           └─ except Exception                  ← catches it, kills proc via poll()+kill()
+           └─ finally                           ← safety net
+
+BUT: for line in proc.stdout  ← blocks main thread
+     proc.wait(timeout=1680)  ← unreachable while process is running
+     = no independent subprocess kill for a hanging .NET process
+```
+
+#### Fix — Before / After
+
+```python
+# BEFORE: dead except branch, no hard kill
+try:
+    for line in proc.stdout:          # blocks forever if .NET hangs
+        print(line, end="")
+    exit_code = proc.wait()           # only reached if .NET exits on its own
+except subprocess.TimeoutExpired:     # DEAD CODE — Airflow never raises this
+    proc.kill()
+    raise Exception("...2 hours...")
+
+# AFTER: daemon thread frees main thread to enforce timeout
+def _stream_output():
+    for line in proc.stdout:
+        print(line, end="")
+
+stream_thread = threading.Thread(target=_stream_output, daemon=True)
+stream_thread.start()
+
+try:
+    proc.wait(timeout=TIMEOUT_SUBPROCESS)   # 28-min hard kill — NOW REACHABLE
+except subprocess.TimeoutExpired:           # NOW reachable — proc.wait() raises it
+    proc.kill()
+    proc.wait()
+    raise Exception(f".NET job exceeded {TIMEOUT_SUBPROCESS // 60}-minute hard limit")
+```
 

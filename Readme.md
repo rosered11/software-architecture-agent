@@ -76,6 +76,18 @@ Sync all 5 DBs with body rebuild:
   python sync/kos_sync.py --db d --rebuild-body    # Decisions
   python sync/kos_sync.py --db ta --rebuild-body   # Tech Assets
 
+  # Sync only I9 and all records it references (K36, P29, D21, TA25)
+  python sync/kos_sync.py --id I9
+
+  # Sync I9 + specific additional IDs
+  python sync/kos_sync.py --id I9,K36,P29
+
+  # Sync I9 and its related, with page body rebuild
+  python sync/kos_sync.py --id I9 --rebuild-body
+
+  # Combine with --db to limit to a single database (e.g. only sync TA25)
+  python sync/kos_sync.py --id I9 --db ta
+
   Without --rebuild-body (default): upserts properties only — page body blocks are not touched.
 
   With --rebuild-body: clears the existing body blocks on each Notion page and rewrites them from the rich markdown in

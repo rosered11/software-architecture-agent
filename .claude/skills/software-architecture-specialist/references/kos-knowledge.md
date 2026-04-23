@@ -1815,10 +1815,10 @@ Summary:          In a per-batch commit loop, EF Core's ChangeTracker accumulate
 Decision Rule:    After tx.CommitAsync() in a batch loop → always call context.ChangeTracker.Clear()
                   Activity tracking Dictionary passed across batches → call .Clear() after each commit
                   Heap delta > 200MB per batch → investigate ChangeTracker accumulation first
-Related Patterns: → P24, P25
-Related Incidents:→ I3, I4, I5
-Related Decisions:→ D16
-Related Tech Assets: → TA20
+Related Patterns: → P24, P25, P28
+Related Incidents:→ I3, I4, I5, I8
+Related Decisions:→ D16, D20
+Related Tech Assets: → TA20, TA24
 Source:           SyncProductMasterJda live production incident, 2026-04-08
 ```
 
@@ -2104,5 +2104,109 @@ Production Airflow 3.x runs SQLAlchemy 2.x → conn.commit() works there
 Local debug fix: create_engine(url, future=True)
 → SQLAlchemy 1.4 "future" mode exposes Connection.commit() / Connection.rollback()
 → No version conflict, no production code change needed
+```
+
+---
+
+### K35: Two-Pass EF Core Batch Pattern for FK-Dependent Inserts
+
+```
+Title:            Two-Pass EF Core Batch Pattern for FK-Dependent Inserts
+Type:             Framework Knowledge
+Domain:           EF Core / Data Access
+Difficulty:       Intermediate
+Summary:          When child entities need a DB-generated parent ID (IDENTITY/SEQUENCE) as a foreign
+                  key, you cannot batch both parent and child inserts into a single SaveChangesAsync.
+                  EF Core only populates entity.Id after the DB returns the generated identity value
+                  from INSERT. Two-pass approach: save parents first (Pass 1) to get real Ids, then
+                  batch all children using those Ids (Pass 2). Total: 2 SaveChangesAsync per batch
+                  regardless of batch_size — replaces N saves (one per header).
+Deep Dive:        Pass 1: foreach headers → context.Add(headerActivity) + context.Add(order)
+                           → await context.SaveChangesAsync()  ← headerActivity.Id now real DB value
+                  Pass 2: foreach headers → CollectOrderActivities(... headerActivity ...)
+                           → context.AddRange(allItemActivities)
+                           → context.AddRange / update / delete item masters
+                           → await context.SaveChangesAsync()  ← all items in one batch
+                  Boundary: if parent PK is application-assigned Guid, skip two-pass — use single-pass.
+Related Patterns: → P28: Two-Pass Batch Commit
+Related Incidents:→ I8: OrderJda ETL — N+1 SELECT + SaveChanges-in-Loop
+Related Tech Assets: → TA24: OrderJda Two-Pass Per-Batch Commit Template
+```
+
+#### Why You Cannot Do It in One Pass
+
+EF Core populates `entity.Id` from the DB-generated identity value only AFTER `SaveChangesAsync` commits the INSERT and the DB returns the identity. If you add both parent and child to the change tracker before saving, EF Core will attempt to SET FOREIGN KEY for child rows using `0` (default int) — causing a constraint violation or silent data corruption.
+
+#### The Two-Pass Invariant
+
+```
+Pass 1: foreach headers → context.Add(headerActivity) + context.Add(order)
+        → await context.SaveChangesAsync()   ← headerActivity.Id is now a real DB value
+Pass 2: foreach headers → CollectOrderActivities(... headerActivity ...)
+        → context.AddRange(allItemActivities)
+        → context.AddRange / update / delete item masters
+        → await context.SaveChangesAsync()   ← all items saved in one batch
+```
+
+Total: **2 SaveChangesAsync per batch** regardless of batch_size. This replaces `N` saves (one per header) = 2 vs N×batch_size writes.
+
+#### When NOT to Use Two-Pass
+
+- Children do NOT reference a DB-generated parent ID (e.g., GUID keys set by application) → single-pass is fine
+- Parent IDs are application-assigned before insert → single-pass with `Add(parent)` + `Add(child)` works
+- EF Core shadow properties or owned entities handle FK → EF resolves automatically in single pass
+
+#### Boundary Condition
+
+If `headerActivity.Id` is a Guid set by the application (`Guid.NewGuid()`), EF Core does NOT need a DB round-trip. Use single-pass and add everything before the single `SaveChangesAsync`.
+
+---
+
+### K36: Python sys.path and Nested Package Module Resolution
+
+```
+Title:         Python sys.path and Nested Package Module Resolution
+Type:          Language Mechanics
+Domain:        Python / Airflow DAG Authoring
+Difficulty:    Beginner
+Summary:       Python resolves `import` statements by searching directories listed in sys.path
+               in order. When a DAG file lives inside a sub-package, its parent is not
+               automatically on sys.path, so cross-package imports fail unless the correct
+               ancestor is inserted.
+Deep Dive:
+  sys.path is a list of directory strings Python searches left-to-right for module names.
+  `sys.path.insert(0, path)` prepends path so it is checked before everything else.
+
+  The idiom:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+  decodes as:
+    __file__                          → absolute path to current .py file
+    os.path.abspath(__file__)         → resolve symlinks / relative refs
+    os.path.dirname(...)  (1st call)  → parent directory (the DAG's own folder)
+    os.path.dirname(...)  (2nd call)  → grandparent directory (the package root)
+    sys.path.insert(0, grandparent)   → make grandparent the priority import root
+
+  Example layout:
+    /airflow/dags/                           ← grandparent inserted into sys.path
+        common/
+            team_notification_operator.py    ← resolved as dags.common.team_notification_operator
+        spc_order_inbound/
+            dags.py                          ← __file__
+
+  Without the insert: Python searches only spc_order_inbound/ → dags.common not found →
+    ModuleNotFoundError: No module named 'dags'
+
+When to Apply:
+  - DAG file is nested two or more levels below the Airflow dags root.
+  - Cross-package import from a sibling sub-package (e.g. dags.common.*).
+  - No pip-installed shared package available.
+
+Better Alternatives (in priority order):
+  1. Install common/ as a pip package in the Airflow worker venv.
+  2. Set AIRFLOW__CORE__DAGS_FOLDER or PYTHONPATH env var to the parent.
+  3. Use sys.path.insert as a last resort — fragile if the file moves.
+
+Related Incident:    → I9: Airflow DAG — Dead subprocess.TimeoutExpired Branch
+Related TA:          → TA25: Airflow PythonOperator — Thread-Based Subprocess with Hard Timeout
 ```
 
